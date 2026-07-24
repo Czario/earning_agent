@@ -105,3 +105,13 @@ class EarningsAgentState(TypedDict):
     # ``"quarterly"`` otherwise (default).  Drives which normalized_concepts_*
     # collection is queried for targeted extraction.
     detected_period_type: NotRequired[Optional[str]]  # "annual" | "quarterly"
+    # ── Deferred replace (internal) ─────────────────────────────────────────
+    # Set by _resolve_8k_skip_guard when the period already exists in
+    # normalize_data.  mongodb_save_node deletes old data before upserting
+    # fresh data, ensuring no data loss if the pipeline fails mid-run.
+    _pending_replace: NotRequired[Optional[dict]]  # {"cik", "fiscal_year", "quarter"}
+    _replace_period_label: NotRequired[Optional[str]]  # human-readable period label
+    # ── SEC accession number ────────────────────────────────────────────────
+    # Set from the EDGAR submissions API (CLI path) or Redis payload (worker).
+    # Stored with every concept value for exact-filing dedup in the skip guard.
+    accession_number: NotRequired[Optional[str]]

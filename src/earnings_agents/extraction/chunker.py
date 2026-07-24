@@ -99,6 +99,12 @@ _PRESCAN_PERIOD_RX = re.compile(
     r"(?:March|June|September|December|Jan(?:uary)?|Feb(?:ruary)?"
     r"|Apr(?:il)?|May|Jul(?:y)?|Aug(?:ust)?|Oct(?:ober)?|Nov(?:ember)?)\s+"
     r"\d{1,2},\s*\d{4}"
+    # Week-based periods: "Thirteen Weeks Ended May 2, 2026",
+    # "Twenty-Six Weeks Ended Aug 31, 2025", etc.
+    r"|(?:Thirteen|Twenty-Six|Thirty-Nine|Fifty-Two|Fifty-Three|13|26|39|52|53)\s+Weeks?\s+Ended\s+"
+    r"(?:March|June|September|December|Jan(?:uary)?|Feb(?:ruary)?"
+    r"|Apr(?:il)?|May|Jul(?:y)?|Aug(?:ust)?|Oct(?:ober)?|Nov(?:ember)?)\s+"
+    r"\d{1,2},\s*\d{4}"
     # Q-style: Q1 2026, Q1-2026, Q1'26 (used by Netflix, Tesla, etc.)
     r"|Q[1-4][\s\-](?:20\d{2})"
     # Spelled-out quarter: "First Quarter 2026", "First Quarter Fiscal 2026"

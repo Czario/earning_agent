@@ -28,13 +28,8 @@ from bson import ObjectId
 from pymongo import MongoClient
 from redis import Redis
 
-from earnings_agents.cli.earnings import (
-    _has_existing_period_data,
-    _resolve_8k_skip_guard,
-)
 from earnings_agents.config import REDIS_URL
 from earnings_agents.hooks import set_call_callback, set_detail_callback, set_node_callback
-from earnings_agents.tools.edgar_client import get_latest_earnings_url
 from earnings_agents.tools.redis_queue import get_redis_client, serialize_message
 from earnings_agents.worker_progress import WorkerProgressPublisher, make_call_callback, make_node_callback, WorkerHeartbeat
 from earnings_agents.workflow import build_graph
@@ -93,74 +88,56 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     cik = payload.get("cik") or ""
     accession = payload.get("accession_number") or ""
     label = payload.get("company_name") or ticker or cik or "?"
-    period = payload.get("period_of_report") or ""
 
     # Create publisher immediately so every exit path can report status.
     redis_url = os.getenv("REDIS_URL", REDIS_URL)
     pub = WorkerProgressPublisher(redis_url, ticker or cik, payload.get("load_request_id"))
 
-    # ── 1. Resolve Exhibit 99.1 + corrected period end date ──────────────────
+    # ── 1. Validate message ───────────────────────────────────────────────
     if not cik:
         pub.publish("skip", "message missing cik — cannot look up filing")
         pub.close()
         logger.warning("8-K message for %s missing cik — skipping", label)
         return True
 
-    filing_url, supplemental_urls, period = get_latest_earnings_url(cik)
+    # ── 2. Build state via shared function (identical to CLI path) ──────────
+    # _build_8k_state handles EVERYTHING: existing-data check, skip guard,
+    # EDGAR URL resolution, session_number threading, deferred replace,
+    # _extract_period_from_exhibit fallback — exactly the same as
+    # _build_initial_state on the CLI.  No pre-resolution needed.
+    from earnings_agents.cli.earnings import _build_8k_state
 
-    if not filing_url:
-        pub.publish("skip", "no Exhibit 99.1 on EDGAR — not an earnings release")
-        pub.close()
-        logger.info(
-            "8-K for %s has no Exhibit 99.1 on EDGAR — not an earnings release, skipping",
-            label,
+    state = _build_8k_state(
+        ticker=ticker,
+        company_name=label,
+        cik=cik,
+        accession=accession or None,
+    )
+
+    # Store corrected period on payload so the main loop can use it for
+    # the MongoDB status update.
+    if state.get("sec_report_date"):
+        payload["sec_report_date"] = state["sec_report_date"]
+
+    # Report replace action (if any) for UI visibility.
+    if state.get("_pending_replace"):
+        pub.publish(
+            "progress",
+            f"re-extracting {state.get('_replace_period_label', '?')} "
+            f"— existing data will be replaced after successful save",
         )
-        return True  # graceful skip — not every 8-K is an earnings press release
 
-    # ── 2. Guard: skip if no prior normalize_data period data for this ticker ─
-    if ticker and not _has_existing_period_data(ticker):
-        pub.publish("skip", f"skipped — no existing normalize_data period data for {ticker}")
+    # _build_8k_state already set status — honour skip/already_stored/failed.
+    if state.get("status") in ("skipped", "already_stored", "failed"):
+        reason = state.get("error") or state.get("status")
+        pub.publish("skip", f"skipped — {reason}")
         pub.close()
-        logger.info("8-K skipped for %s — no existing normalize_data period data", label)
         return True
 
-    # ── 3. Replace guard: delete existing data if this period is already ─────
-    # stored, then re-extract fresh.  _resolve_8k_skip_guard deletes any
-    # existing concept values for the same fiscal period and returns a dict
-    # with action="deleted" and counts, or None when nothing was deleted.
-    if ticker and cik:
-        deleted_info = _resolve_8k_skip_guard(ticker, cik)
-        if deleted_info and deleted_info.get("action") == "deleted":
-            pub.publish(
-                "progress",
-                f"deleted {deleted_info['deleted_count']} existing value(s) "
-                f"for {deleted_info['period_label']} — re-extracting",
-            )
+    # Inject worker-only fields (not in the shared state builder).
+    state["company_cik"] = cik or None
 
-    # ── 4. Run the pipeline ───────────────────────────────────────────────────
-    # State mirrors CLI's _build_initial_state SEC path exactly.
-    # period comes from get_latest_earnings_url (inferred, not raw RSS date).
-    logger.info("Processing 8-K for %s  url=%s  period=%s", label, filing_url, period)
-
-    # State mirrors CLI's _build_initial_state SEC path exactly — no extra keys.
-    # company_cik is set so load_company_concepts skips its own CIK resolution.
-    state = {
-        "ticker": ticker or cik,
-        "company_name": label,
-        "company_cik": cik or None,
-        "discovered_file_url": filing_url,
-        "supplemental_file_urls": supplemental_urls,
-        "sec_report_date": period or None,
-        "file_type": None,
-        "raw_text": None,
-        "metrics": None,
-        "error": None,
-        "extraction_attempts": 0,
-        "extraction_notes": None,
-        "needs_reextract": False,
-        "previous_high_finding_keys": None,
-        "status": "discovered",
-    }
+    logger.info("Processing 8-K for %s  url=%s  period=%s", label, state.get("discovered_file_url"), state.get("sec_report_date"))
 
     # ── Set up progress callbacks using the shared worker_progress module ────────
     # make_node_callback fires on both start (▶ stage) and end (step summary),
@@ -385,8 +362,8 @@ def main(argv: list[str] | None = None) -> None:
             # raw EDGAR date if it wasn't computable.
             _period = (
                 payload.pop("_sec_period_label", None)
-                or payload.get("sec_report_date")
-                or payload.get("period_of_report")
+                or payload.get("sec_report_date")  # set by _process_payload (corrected)
+                or ""
             )
             _update_load_request_status(payload, "completed", period_of_report=_period)
         else:

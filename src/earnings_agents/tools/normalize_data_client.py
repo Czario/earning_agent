@@ -315,8 +315,9 @@ def get_calculated_concepts(
 # ── Period helpers ───────────────────────────────────────────────────────────
 
 _MONTH_NAME_RE = re.compile(
-    r"(January|February|March|April|May|June|July|August|September|October|November|December)"
-    r"\s+(\d{1,2}),?\s+(\d{4})",
+    r"(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"[.]?\s+(\d{1,2}),?\s+(\d{4})",
     re.IGNORECASE,
 )
 
@@ -438,16 +439,19 @@ def detect_period_type(period_str: str) -> str:
 def parse_period_end_date(period_str: str) -> date | None:
     """Extract a ``date`` from a period string like "Three Months Ended March 31, 2026".
 
+    Handles both full month names ("March") and abbreviated forms ("Mar").
     Returns ``None`` when no recognisable date pattern is found.
     """
     m = _MONTH_NAME_RE.search(period_str)
     if m:
-        try:
-            return datetime.strptime(
-                f"{m.group(1)} {m.group(2)} {m.group(3)}", "%B %d %Y"
-            ).date()
-        except ValueError:
-            pass
+        month_name = m.group(1)
+        date_str = f"{month_name} {m.group(2)} {m.group(3)}"
+        # Try full month name first ("March"), then abbreviated ("Mar").
+        for fmt in ("%B %d %Y", "%b %d %Y"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
     return None
 
 
@@ -793,6 +797,7 @@ def upsert_concept_values(
     report_date: date | None = None,
     period_type_override: str | None = None,
     derived_concept_ids: set[str] | None = None,
+    accession_number: str | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
@@ -926,6 +931,8 @@ def upsert_concept_values(
             "dimension_value": False,
             "calculated": concept_id_str in (derived_concept_ids or set()),
         }
+        if accession_number:
+            doc["accession_number"] = accession_number
         filter_doc: dict[str, Any] = {
             "concept_id": concept_oid,
             "reporting_period.end_date": end_datetime,

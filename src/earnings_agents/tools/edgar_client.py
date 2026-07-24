@@ -12,6 +12,7 @@ import logging
 import os
 import threading as _th
 import time as _time
+from datetime import date
 from typing import Optional
 
 import requests
@@ -316,12 +317,43 @@ def _infer_period_end(
     return estimated.isoformat()
 
 
+def _extract_period_from_exhibit(url: str) -> date | None:
+    """Fetch exhibit HTML and regex-extract the period-end date.
+
+    Earnings press releases (EX-99.1) always declare the reporting period near
+    the top — e.g. *"Three Months Ended March 31, 2026"* or *"Year Ended
+    December 31, 2025"*.  This function fetches the first ~50 KB of the
+    exhibit (the period header is always early in the document) and runs the
+    same ``parse_period_end_date`` regex used by the extraction pipeline — no
+    LLM call, one HTTP request.
+
+    Returns ``None`` when the URL is unreachable or no recognisable date is
+    found.
+    """
+    from earnings_agents.tools.normalize_data_client import parse_period_end_date
+
+    try:
+        resp = _edgar_get(url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        text = resp.text[:50000]
+    except requests.RequestException:
+        logger.debug("_extract_period_from_exhibit: fetch failed for %s", url)
+        return None
+
+    return parse_period_end_date(text)
+
+
 def _infer_8k_fiscal_period(
     recent: dict,
     filing_date_str: str | None,
     fiscal_year_end_month: int | None,
 ) -> tuple[int, int, str] | None:
     """Return ``(fiscal_year, quarter, period_type)`` for the 8-K filing.
+
+    **DEPRECATED for skip-guard use** — prefer
+    :func:`_extract_period_from_exhibit` which reads the actual period from
+    the exhibit HTML.  This heuristic is retained as a fallback when the
+    exhibit cannot be fetched.
 
     Uses the most-recent 10-Q/10-K in *recent* to determine which fiscal
     period the 8-K reports on.  This is the **same data the DB stores**

@@ -118,6 +118,31 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
     detected_period_type: str | None = state.get("detected_period_type")  # type: ignore[assignment]
 
     if concept_metrics and cik and fy_end_month and (period_str or sec_rd):
+        # ── Deferred replace: delete old data for this period BEFORE upsert ──
+        # _pending_replace is set by _resolve_8k_skip_guard (CLI) or the
+        # worker when the period already exists in normalize_data.  Deleting
+        # here (inside the save node) guarantees we only purge old data after
+        # the pipeline has produced valid concept_metrics — if the pipeline
+        # fails earlier, nothing was deleted.
+        pending = state.get("_pending_replace") or {}
+        if pending.get("cik") and pending.get("fiscal_year"):
+            from earnings_agents.tools.normalize_data_client import delete_fiscal_period
+            pd_cik = pending["cik"]
+            pd_fy = pending["fiscal_year"]
+            pd_q = pending.get("quarter")
+            n_del = delete_fiscal_period(pd_cik, pd_fy, pd_q)
+            if n_del:
+                period_label = (
+                    f"FY{pd_fy} Q{pd_q}" if pd_q is not None else f"FY{pd_fy} (annual)"
+                )
+                report_call(
+                    f"  [save]  deleted {n_del} stale concept(s) for {period_label}"
+                )
+                logger.info(
+                    "mongodb_save: deleted %d stale concept(s) for CIK %s %s",
+                    n_del, pd_cik, period_label,
+                )
+
         from earnings_agents.tools.normalize_data_client import upsert_concept_values
         n_mapped = len(concept_metrics) - len(derived_ids)
         n_derived = len(derived_ids)
@@ -136,6 +161,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 report_date=sec_rd,
                 period_type_override=detected_period_type,
                 derived_concept_ids=derived_ids,
+                accession_number=state.get("accession_number"),
             )
             report_call(f"  [save]  ✓ {n} concept value(s) upserted")
             logger.info(

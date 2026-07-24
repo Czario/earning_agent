@@ -428,16 +428,28 @@ def _has_existing_period_data(ticker: str) -> bool:
         return False
 
 
-def _build_initial_state(info: dict, printer=print, dry_run: bool = False) -> dict:
-    """Build the LangGraph initial state for one company.
+def _build_8k_state(
+    ticker: str,
+    company_name: str,
+    cik: str,
+    *,
+    filing_url: str | None = None,
+    supplemental_urls: list[str] | None = None,
+    sec_report_date_str: str | None = None,
+    accession: str | None = None,
+    printer=print,
+    dry_run: bool = False,
+) -> dict:
+    """Build the initial state for an 8-K pipeline run — shared by CLI and worker.
 
-    Queries SEC EDGAR for the latest 8-K Exhibit 99.1 URL and injects it
-    directly into the state so the pipeline starts at load_company_concepts.
+    Both the CLI (``_build_initial_state``) and the Redis worker
+    (``_process_payload``) call this function so period detection, skip logic,
+    and state construction are identical in every code path.
+
+    When *filing_url* is not provided, the function fetches the latest 8-K
+    from SEC EDGAR (CLI path).  When it IS provided (worker path), the
+    function skips the EDGAR lookup and uses the pre-resolved URL.
     """
-    ticker = info.get("ticker") or ""
-    company_name = info["company_name"]
-    cik = info["cik"]
-
     _base = {
         "ticker": ticker or cik,
         "company_name": company_name,
@@ -463,14 +475,25 @@ def _build_initial_state(info: dict, printer=print, dry_run: bool = False) -> di
         }
 
     # ── Skip guard: check if the 8-K's fiscal period is already stored ──────
-    # Uses fiscal_year_end_month + SEC submissions API to determine
-    # (fiscal_year, quarter) and checks concept_values_quarterly / _annual.
     skip_state = _resolve_8k_skip_guard(ticker, cik, printer=printer, dry_run=dry_run)
     if skip_state is not None and skip_state.get("action") == "skip":
         return skip_state
 
-    printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
-    filing_url, supplemental_urls, sec_report_date = get_latest_earnings_url(cik)
+    # ── Replace guard: period exists; defer deletion until after save ─────
+    if skip_state is not None and skip_state.get("action") == "replace":
+        _base["_pending_replace"] = skip_state["pending_delete"]
+        _base["_replace_period_label"] = skip_state.get("period_label", "")
+
+    # Capture accession from skip guard result (both skip and replace have it).
+    _acc = accession or (skip_state or {}).get("accession_number")
+    if _acc:
+        _base["accession_number"] = _acc
+
+    # ── Resolve filing URL + period date ────────────────────────────────────
+    if not filing_url:
+        printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
+        filing_url, supplemental_urls, sec_report_date_str = get_latest_earnings_url(cik)
+
     if not filing_url:
         return {
             **_base,
@@ -479,15 +502,44 @@ def _build_initial_state(info: dict, printer=print, dry_run: bool = False) -> di
             "status": "failed",
             "error": f"No 8-K earnings filing found on SEC EDGAR for CIK {cik}",
         }
+
     if supplemental_urls:
-        printer(f"  [EDGAR]  +{len(supplemental_urls)} supplemental exhibit(s): {[u.rsplit('/', 1)[-1] for u in supplemental_urls]}")
+        printer(
+            f"  [EDGAR]  +{len(supplemental_urls)} supplemental exhibit(s): "
+            f"{[u.rsplit('/', 1)[-1] for u in supplemental_urls]}"
+        )
+
+    # ── Period fallback: if EDGAR reportDate couldn't be corrected ─────────
+    # (e.g. IPO company, no prior 10-Q/10-K), extract directly from EX-99.1
+    # HTML — same regex the skip guard and LLM use.
+    if not sec_report_date_str:
+        from earnings_agents.tools.edgar_client import _extract_period_from_exhibit
+        exhibit_date = _extract_period_from_exhibit(filing_url)
+        if exhibit_date:
+            sec_report_date_str = exhibit_date.isoformat()
+
     return {
         **_base,
         "discovered_file_url": filing_url,
-        "supplemental_file_urls": supplemental_urls,
-        "sec_report_date": sec_report_date,
+        "supplemental_file_urls": supplemental_urls or [],
+        "sec_report_date": sec_report_date_str,
         "status": "discovered",
     }
+
+
+def _build_initial_state(info: dict, printer=print, dry_run: bool = False) -> dict:
+    """Build the LangGraph initial state for one company (CLI path).
+
+    Thin wrapper around :func:`_build_8k_state` — resolves the filing URL
+    from SEC EDGAR and delegates all period detection to the shared function.
+    """
+    return _build_8k_state(
+        ticker=info.get("ticker") or "",
+        company_name=info["company_name"],
+        cik=info["cik"],
+        printer=printer,
+        dry_run=dry_run,
+    )
 
 
 def _run_company(graph, info: dict, printer=print) -> dict:
@@ -627,33 +679,44 @@ def _resolve_8k_skip_guard(
 ) -> dict | None:
     """Check whether the latest 8-K's fiscal period is already stored in the DB.
 
-    Fetches the SEC submissions API once and:
-      1. Gets ``fiscal_year_end_month`` from normalize_data.
-      2. Finds the latest 8-K's ``filingDate``.
-      3. Uses ``_infer_8k_fiscal_period`` to determine ``(fiscal_year, quarter)``.
-      4. Checks ``concept_values_quarterly`` / ``concept_values_annual``.
+    1. Gets ``fiscal_year_end_month`` from normalize_data.
+    2. Fetches SEC submissions, finds the latest 8-K Item 2.02 and its
+       accession number.
+    3. **Primary path**: fetches the EX-99.1 exhibit HTML and regex-extracts
+       the actual period-end date from the document (same date the LLM will
+       later read as ``__period__``).  Uses ``compute_fiscal_period`` to
+       derive ``(fiscal_year, quarter, period_type)``.  Zero guesswork.
+    4. **Fallback**: if the exhibit fetch fails, uses
+       ``_infer_8k_fiscal_period`` (10-Q/10-K proximity heuristic).
+    5. **Last resort**: uses ``get_latest_period`` from the DB.
+    6. Checks both period existence AND accession-number existence.
 
-    When *dry_run* is True and the period already exists, returns a state dict
-    with ``status="already_stored"`` (read-only — no data is modified).
+    When *dry_run* is True and the period already exists, returns a skip dict.
 
-    When *dry_run* is False and the period exists, the existing data is
-    **deleted** and the function returns ``None`` so the pipeline proceeds to
-    re-extract and re-insert fresh data.
+    When *dry_run* is False and the period exists, returns a *replace* dict
+    with ``pending_delete`` info — **the actual deletion is deferred** to
+    after the pipeline saves successfully, preventing data loss if the
+    pipeline fails mid-run.
 
-    Returns ``None`` on any error (fail-safe: never skips on ambiguity).
+    Returns ``None`` on any error or when the period is not already stored
+    (fail-safe: never skips on ambiguity).
     """
     if not ticker or not cik:
         return None
     try:
         from earnings_agents.tools.normalize_data_client import (
+            compute_fiscal_period,
             delete_fiscal_period,
             fiscal_period_exists,
             get_company_by_ticker,
             get_latest_period,
         )
         from earnings_agents.tools.edgar_client import (
+            _EDGAR_ARCHIVES_BASE,
             _EDGAR_SUBMISSIONS,
             _edgar_get,
+            _extract_period_from_exhibit,
+            _find_all_ex_99_urls,
             _infer_8k_fiscal_period,
             normalize_cik,
         )
@@ -668,6 +731,7 @@ def _resolve_8k_skip_guard(
 
         # 2. Fetch SEC submissions (one HTTP call).
         cik_padded = normalize_cik(cik)
+        cik_int = str(int(cik_padded))
         sub_url = _EDGAR_SUBMISSIONS.format(cik=cik_padded)
         from earnings_agents.config import HTTP_TIMEOUT
         try:
@@ -681,27 +745,106 @@ def _resolve_8k_skip_guard(
         forms: list[str] = recent.get("form", [])
         filing_dates: list[str] = recent.get("filingDate", [])
         items_list: list[str] = recent.get("items", [])
+        accessions: list[str] = recent.get("accessionNumber", [])
 
-        # Find latest 8-K (Item 2.02) filing_date.
+        # Find latest 8-K (Item 2.02) — capture filing_date AND accession.
         filing_date_str: str | None = None
+        accession: str | None = None
         for i, form in enumerate(forms):
             if form != "8-K":
                 continue
             item_str = items_list[i] if i < len(items_list) else ""
             if "2.02" in item_str:
                 fd = filing_dates[i] if i < len(filing_dates) else ""
+                acc = accessions[i] if i < len(accessions) else ""
                 if fd:
                     filing_date_str = fd
+                if acc:
+                    accession = acc
                 break
 
+        # ── Accession-level dedup (infallible) ──────────────────────────
+        if accession:
+            acc_exists = _accession_already_stored(cik, accession)
+            if acc_exists:
+                if dry_run:
+                    printer(
+                        f"  [UP TO DATE] accession {accession} already stored — skipping"
+                    )
+                    return {
+                        "action": "skip",
+                        "status": "already_stored",
+                        "ticker": ticker,
+                        "company_name": company.get("name", ticker),
+                        "accession_number": accession,
+                        "discovered_file_url": None,
+                        "file_type": None,
+                        "raw_text": None,
+                        "metrics": None,
+                        "error": None,
+                        "extraction_attempts": 0,
+                        "extraction_notes": None,
+                        "needs_reextract": False,
+                        "previous_high_finding_keys": None,
+                    }
+                # Live run: accession already stored → skip silently.
+                # (The period-level check below would handle this too, but
+                #  accession dedup catches the exact-filing-already-processed
+                #  case even if period inference is off.)
+                printer(
+                    f"  [UP TO DATE] accession {accession} already stored — skipping"
+                )
+                return {
+                    "action": "skip",
+                    "status": "already_stored",
+                    "ticker": ticker,
+                    "company_name": company.get("name", ticker),
+                    "accession_number": accession,
+                    "discovered_file_url": None,
+                    "file_type": None,
+                    "raw_text": None,
+                    "metrics": None,
+                    "error": None,
+                    "extraction_attempts": 0,
+                    "extraction_notes": None,
+                    "needs_reextract": False,
+                    "previous_high_finding_keys": None,
+                }
+
         # 3. Determine (fiscal_year, quarter) the 8-K reports on.
+        #    PRIMARY: extract period date from the actual EX-99.1 HTML.
+        #    FALLBACK: heuristic from nearby 10-Q/10-K filings.
+        #    LAST RESORT: latest stored period from DB.
         fp = None
-        if filing_date_str:
+
+        # ── Primary: document-based extraction (zero guesswork) ─────────
+        if accession:
+            acc_nodash = accession.replace("-", "")
+            ex99_urls = _find_all_ex_99_urls(cik_int, accession, acc_nodash)
+            if ex99_urls:
+                period_end_date = _extract_period_from_exhibit(ex99_urls[0])
+                if period_end_date is not None:
+                    fy, q = compute_fiscal_period(
+                        period_end_date, fy_end_month, ""
+                    )
+                    pt = (
+                        "annual"
+                        if period_end_date.month == fy_end_month
+                        else "quarterly"
+                    )
+                    fp = (fy, q if pt == "quarterly" else None, pt)
+                    logger.debug(
+                        "_resolve_8k_skip_guard: exhibit date %s → FY%d %s",
+                        period_end_date,
+                        fy,
+                        f"Q{q}" if pt == "quarterly" else "(annual)",
+                    )
+
+        # ── Fallback: 10-Q/10-K proximity heuristic ─────────────────────
+        if fp is None and filing_date_str:
             fp = _infer_8k_fiscal_period(recent, filing_date_str, fy_end_month)
 
-        # 4. Fallback: if SEC data can't determine the period, use the latest
-        #    stored period from the DB directly (covers the case where no
-        #    reference 10-Q/10-K exists yet in SEC submissions).
+        # ── Last resort: latest stored period from DB ───────────────────
         if fp is None:
             latest = get_latest_period(cik)
             if latest is not None:
@@ -711,6 +854,7 @@ def _resolve_8k_skip_guard(
                     latest.get("period_type", "quarterly"),
                 )
 
+        # 4. Check period existence — return skip or pending_replace.
         if fp is not None:
             fy, q, pt = fp
             q_arg = q if pt == "quarterly" else None
@@ -727,6 +871,7 @@ def _resolve_8k_skip_guard(
                         "status": "already_stored",
                         "ticker": ticker,
                         "company_name": company.get("name", ticker),
+                        "accession_number": accession,
                         "discovered_file_url": None,
                         "file_type": None,
                         "raw_text": None,
@@ -737,22 +882,44 @@ def _resolve_8k_skip_guard(
                         "needs_reextract": False,
                         "previous_high_finding_keys": None,
                     }
-                n_deleted = delete_fiscal_period(cik, fy, q_arg)
+                # Live run: return replace info — deletion deferred to
+                # after pipeline save (prevents data loss on pipeline failure).
                 printer(
-                    f"  [DELETE]  period {period_label} — "
-                    f"removed {n_deleted} existing value(s), re-extracting"
+                    f"  [REPLACE] period {period_label} — will re-extract, "
+                    f"existing data removed after successful save"
                 )
                 return {
-                    "action": "deleted",
-                    "deleted_count": n_deleted,
+                    "action": "replace",
+                    "pending_delete": {
+                        "cik": cik,
+                        "fiscal_year": fy,
+                        "quarter": q_arg,
+                    },
                     "period_label": period_label,
                     "ticker": ticker,
                     "company_name": company.get("name", ticker),
+                    "accession_number": accession,
                 }
 
         return None
     except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
+        logger.debug("_resolve_8k_skip_guard: unexpected error", exc_info=True)
         return None
+
+
+def _accession_already_stored(cik: str, accession: str) -> bool:
+    """Return True when *accession* already exists for *cik* in normalize_data."""
+    try:
+        from earnings_agents.tools.normalize_data_client import _get_client, _NORMALIZE_DB
+        db = _get_client()[_NORMALIZE_DB]
+        for col_name in ("concept_values_quarterly", "concept_values_annual"):
+            if db[col_name].count_documents(
+                {"company_cik": cik, "accession_number": accession}, limit=1
+            ):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _run_company_parallel(args: tuple) -> dict:
