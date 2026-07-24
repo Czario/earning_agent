@@ -903,7 +903,7 @@ def _resolve_8k_skip_guard(
 
         return None
     except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
-        logger.debug("_resolve_8k_skip_guard: unexpected error", exc_info=True)
+        _logger.debug("_resolve_8k_skip_guard: unexpected error", exc_info=True)
         return None
 
 
