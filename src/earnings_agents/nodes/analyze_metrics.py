@@ -58,23 +58,130 @@ def _apply_identity_corrections(
 
     _out_findings: list[Finding] = [f for f in findings]
 
-    # ── Concept-level identity corrections ───────────────────────────────
-    # Check identities directly on concept_metrics (concept_id → value),
-    # not on raw metric keys.  The LLM may use different labels and Tier 2
-    # mapping may assign a wrong key to a concept — the concept_metrics
-    # dict is the final truth from extraction + mapping.
+    # ── Helpers: find metric keys in raw metrics by regex ──────────────────
+    def _find_key(pattern: str) -> str | None:
+        for key in metrics:
+            if _re.search(pattern, key, _re.I):
+                return key
+        return None
+
+    def _find_concept_id(label_pattern: str) -> str | None:
+        for c in (state.get("target_concepts") or []):
+            if _re.search(label_pattern, c.get("label", ""), _re.I):
+                return c.get("_id")
+        return None
+
+    def _apply_correction(metric_key: str | None, computed_val: float,
+                          label_regex: str, method: str) -> None:
+        """Update both raw ``metrics`` and ``concept_metrics`` with corrected value."""
+        _old_val = None
+        if metric_key:
+            _old_val = metrics.get(metric_key)
+            metrics[metric_key] = computed_val
+        _cm: dict[str, Any] | None = state.get("concept_metrics")  # type: ignore[assignment]
+        _cid = _find_concept_id(label_regex) if label_regex else None
+        if _cm and _cid and _cid in _cm:
+            _cm[_cid] = computed_val
+            _derived: list[str] = list(state.get("derived_concept_ids") or [])
+            if _cid not in _derived:
+                _derived.append(_cid)
+                state["derived_concept_ids"] = _derived  # type: ignore[typeddict-unknown-key]
+        logger.info(
+            "analyze_metrics %s: corrected %s %s → %.0f (%s)",
+            state.get("ticker", "?"),
+            metric_key or label_regex or "?",
+            f"{_old_val:,.0f}" if isinstance(_old_val, (int, float)) else "missing",
+            computed_val, method,
+        )
+        _out_findings.append(
+            Finding(
+                type="auto_corrected",
+                severity="low",
+                message=f"{metric_key or label_regex or 'metric'} corrected to {computed_val:,.0f} ({method}).",
+                keys=(metric_key,) if metric_key else (),
+                evidence={"corrected_value": computed_val, "method": method},
+            )
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # A. RAW METRICS CORRECTION — regex-based (pre-industry, general path)
+    #    Searches the raw LLM-extracted keys for GP/OI/NI patterns and
+    #    corrects both metrics and concept_metrics.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── A1. Gross Profit = Revenue − Cost of Revenue ──────────────────────
+    _gp_key = _find_key(r"^(?:gross (?:margin|profit))")
+    _rev_key = _find_key(r"^(?:(?:total|net)\s+)?(?:revenue|sales)")
+    _cor_key = _find_key(r"^cost\s+of\s+(?:revenue|sales|goods)")
+    if _gp_key and _rev_key and _cor_key:
+        _rev = metrics.get(_rev_key)
+        _cor = metrics.get(_cor_key)
+        _gp = metrics.get(_gp_key)
+        if isinstance(_rev, (int, float)) and isinstance(_cor, (int, float)):
+            _computed = _rev - _cor
+            if not isinstance(_gp, (int, float)) or abs(_gp - _computed) > 1.0:
+                _apply_correction(_gp_key, _computed, r"gross.profit",
+                                  "Revenue − Cost of Revenue")
+                _out_findings = [
+                    f for f in _out_findings
+                    if not (f.type == "identity_violation"
+                            and "gross_profit" in (f.evidence or {}))
+                ]
+
+    # ── A2. Operating Income = Gross Profit − Total OpEx ───────────────────
+    _oi_key = _find_key(r"^(?:income\s+from\s+operations|operating\s+(?:income|profit|loss))")
+    _opex_key = _find_key(r"(?:total\s+)?operating\s+(?:expenses?|costs?)")
+    _gp_key2 = _find_key(r"^(?:gross (?:margin|profit))")
+    if _oi_key and _opex_key and _gp_key2:
+        _gp2 = metrics.get(_gp_key2)
+        _opex = metrics.get(_opex_key)
+        _oi = metrics.get(_oi_key)
+        if isinstance(_gp2, (int, float)) and isinstance(_opex, (int, float)):
+            _computed = _gp2 - _opex
+            if not isinstance(_oi, (int, float)) or abs(_oi - _computed) > 1.0:
+                _apply_correction(_oi_key, _computed, r"operat(?:ing|ional)\s+income",
+                                  "Gross Profit − Total Operating Expenses")
+                _out_findings = [
+                    f for f in _out_findings
+                    if not (f.type == "suspect_value"
+                            and any("operating" in k.lower()
+                                    for k in (f.keys or ())))
+                ]
+
+    # ── A3. Net Income = Pre-tax Income − Tax Expense ─────────────────────
+    _ni_key = _find_key(r"^net\s+(?:income|earnings|loss)\s*$")
+    _pt_key = _find_key(r"(?:income\s+before.*tax|pre.?tax\s+income)")
+    _tax_key = _find_key(
+        r"(?:provision\s+for\s+income\s+tax"
+        r"|income\s+tax\s+(?:expense|provision)"
+        r")"
+    )
+    if _ni_key and _pt_key and _tax_key:
+        _pt = metrics.get(_pt_key)
+        _tax = metrics.get(_tax_key)
+        _ni = metrics.get(_ni_key)
+        if isinstance(_pt, (int, float)) and isinstance(_tax, (int, float)):
+            _computed = _pt - _tax
+            if not isinstance(_ni, (int, float)) or abs(_ni - _computed) > 1.0:
+                _apply_correction(_ni_key, _computed, r"net.income",
+                                  "Pre-tax Income − Tax Expense")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # B. CONCEPT-LEVEL CORRECTION — role-based (industry-aware path)
+    #    Checks identities on concept_metrics (concept_id → value), catching
+    #    cases where Tier 2 mapping assigned a wrong key to a concept.
+    # ═══════════════════════════════════════════════════════════════════════
     _cm: dict[str, Any] | None = state.get("concept_metrics")  # type: ignore[assignment]
     _targets = state.get("target_concepts") or []
 
-    # Build concept_id → role lookup from target_concepts.
     _cid_to_role: dict[str, str] = {}
     for c in _targets:
-        role = _identify_concept_role(c.get("label", ""), c.get("taxonomy_key") or c.get("concept") or "")
+        role = _identify_concept_role(
+            c.get("label", ""), c.get("taxonomy_key") or c.get("concept") or "")
         if role:
             _cid_to_role[c["_id"]] = role
 
     def _cm_val(role: str) -> float | None:
-        """Return the first concept_metrics value for *role*, or None."""
         for cid, r in _cid_to_role.items():
             if r == role and cid in (_cm or {}):
                 v = _cm[cid]
@@ -83,7 +190,7 @@ def _apply_identity_corrections(
         return None
 
     if _cm:
-        # ── 1. Gross Profit = Revenue − Cost of Revenue ──────────────────
+        # ── B1. Gross Profit = Revenue − Cost of Revenue ──────────────────
         _rev = _cm_val("revenue")
         _cor = _cm_val("cost_of_revenue")
         if _rev is not None and _cor is not None:
@@ -93,31 +200,22 @@ def _apply_identity_corrections(
                     _gp_current = _cm[cid]
                     if not isinstance(_gp_current, (int, float)) or abs(_gp_current - _gp_computed) > 1.0:
                         _cm[cid] = _gp_computed
-                        # Also update raw metrics if we can find the key
-                        for key in metrics:
-                            if _re.search(r"^(?:gross (?:margin|profit)|income\s+from\s+operations|operating\s+(?:income|profit|loss))", key, _re.I):
-                                if abs(metrics.get(key, 0) - (_gp_current or 0)) < 100:
-                                    metrics[key] = _gp_computed
                         _derived = list(state.get("derived_concept_ids") or [])
                         if cid not in _derived:
                             _derived.append(cid)
                             state["derived_concept_ids"] = _derived  # type: ignore[typeddict-unknown-key]
                         logger.info(
-                            "analyze_metrics %s: corrected GP in concept_metrics %.0f → %.0f (Revenue − CoR)",
-                            state.get("ticker", "?"),
-                            _gp_current or 0, _gp_computed,
-                        )
+                            "analyze_metrics %s: corrected GP (concept) %.0f → %.0f (Revenue − CoR)",
+                            state.get("ticker", "?"), _gp_current or 0, _gp_computed)
                         _out_findings.append(
                             Finding(
-                                type="auto_corrected",
-                                severity="low",
+                                type="auto_corrected", severity="low",
                                 message=f"Gross Profit corrected to {_gp_computed:,.0f} (Revenue − Cost of Revenue).",
                                 evidence={"corrected_value": _gp_computed, "method": "Revenue − Cost of Revenue"},
-                            )
-                        )
+                            ))
                     break
 
-        # ── 2. Operating Income = Gross Profit − Total OpEx ──────────────
+        # ── B2. Operating Income = Gross Profit − Total OpEx ──────────────
         _gp2 = _cm_val("gross_profit")
         _opex = _cm_val("total_opex")
         if _gp2 is not None and _opex is not None:
@@ -132,21 +230,17 @@ def _apply_identity_corrections(
                             _derived.append(cid)
                             state["derived_concept_ids"] = _derived  # type: ignore[typeddict-unknown-key]
                         logger.info(
-                            "analyze_metrics %s: corrected OI in concept_metrics %.0f → %.0f (GP − OpEx)",
-                            state.get("ticker", "?"),
-                            _oi_current or 0, _oi_computed,
-                        )
+                            "analyze_metrics %s: corrected OI (concept) %.0f → %.0f (GP − OpEx)",
+                            state.get("ticker", "?"), _oi_current or 0, _oi_computed)
                         _out_findings.append(
                             Finding(
-                                type="auto_corrected",
-                                severity="low",
+                                type="auto_corrected", severity="low",
                                 message=f"Operating Income corrected to {_oi_computed:,.0f} (Gross Profit − OpEx).",
                                 evidence={"corrected_value": _oi_computed, "method": "Gross Profit − Total OpEx"},
-                            )
-                        )
+                            ))
                     break
 
-        # ── 3. Net Income = Pre-tax Income − Tax Expense ─────────────────
+        # ── B3. Net Income = Pre-tax Income − Tax Expense ─────────────────
         _pt = _cm_val("pretax_income")
         _tax = _cm_val("tax_expense")
         if _pt is not None and _tax is not None:
@@ -161,26 +255,23 @@ def _apply_identity_corrections(
                             _derived.append(cid)
                             state["derived_concept_ids"] = _derived  # type: ignore[typeddict-unknown-key]
                         logger.info(
-                            "analyze_metrics %s: corrected NI in concept_metrics %.0f → %.0f (Pre-tax − Tax)",
-                            state.get("ticker", "?"),
-                            _ni_current or 0, _ni_computed,
-                        )
+                            "analyze_metrics %s: corrected NI (concept) %.0f → %.0f (Pre-tax − Tax)",
+                            state.get("ticker", "?"), _ni_current or 0, _ni_computed)
                         _out_findings.append(
                             Finding(
-                                type="auto_corrected",
-                                severity="low",
+                                type="auto_corrected", severity="low",
                                 message=f"Net Income corrected to {_ni_computed:,.0f} (Pre-tax Income − Tax Expense).",
                                 evidence={"corrected_value": _ni_computed, "method": "Pre-tax Income − Tax Expense"},
-                            )
-                        )
+                            ))
                     break
 
-    # ── 4. Industry-specific identity checks ─────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # C. INDUSTRY-SPECIFIC CHECKS
+    # ═══════════════════════════════════════════════════════════════════════
     _ind = state.get("company_industry") or {}
     _cat = _ind.get("category", "general") if isinstance(_ind, dict) else "general"
 
-    # Banking: Net Interest Income / Gross Profit should be
-    # Interest Income − Interest Expense (banks use NII as "GP").
+    # Banking: NII = Interest Income − Interest Expense
     if _cat == "banking" and _cm:
         _int_inc = _cm_val("interest_income")
         _int_exp = _cm_val("interest_expense")
@@ -196,22 +287,17 @@ def _apply_identity_corrections(
                             _derived.append(cid)
                             state["derived_concept_ids"] = _derived  # type: ignore[typeddict-unknown-key]
                         logger.info(
-                            "analyze_metrics %s: corrected NII/Gross Profit %.0f → %.0f "
-                            "(Interest Income − Interest Expense, banking)",
-                            state.get("ticker", "?"),
-                            _gp_current or 0, _nii_computed,
-                        )
+                            "analyze_metrics %s: corrected NII/GP %.0f → %.0f (Interest Income − Interest Expense, banking)",
+                            state.get("ticker", "?"), _gp_current or 0, _nii_computed)
                         _out_findings.append(
                             Finding(
-                                type="auto_corrected",
-                                severity="low",
-                                message=f"Gross Profit corrected to {_nii_computed:,.0f} "
-                                f"(Interest Income − Interest Expense — banking).",
-                                evidence={"corrected_value": _nii_computed,
-                                          "method": "Interest Income − Interest Expense"},
-                            )
-                        )
+                                type="auto_corrected", severity="low",
+                                message=f"Gross Profit corrected to {_nii_computed:,.0f} (Interest Income − Interest Expense — banking).",
+                                evidence={"corrected_value": _nii_computed, "method": "Interest Income − Interest Expense"},
+                            ))
                     break
+
+    # ── Cleanup: demote high findings for identities we just corrected ────
     _corrected_roles: set[str] = set()
     for f in _out_findings:
         if f.type == "auto_corrected":

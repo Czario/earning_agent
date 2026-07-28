@@ -845,24 +845,31 @@ def upsert_concept_values(
 
     # Resolve the period end date.
     #
-    # The LLM's __period__ label (e.g. "Three Months Ended May 31, 2026") is
-    # read directly from the document and is consistent across re-runs.  The
-    # SEC reportDate on 8-Ks is company-set and may differ between runs
-    # (e.g. June 1 vs May 31), causing duplicate documents when the upsert
-    # filter uses exact end_date matching.
-    #
-    # Prefer the LLM's date when both are available — it is the stable source
-    # of truth for dedup.  Fall back to SEC reportDate only when the LLM
-    # provides no parseable date.
+    # Hybrid approach:
+    #   1. SEC reportDate — authoritative, declared by the company to the SEC
+    #      at filing time.  Does not change across re-runs.  Prevents the
+    #      LLM from reading a prior-period comparison column and labelling the
+    #      stored data with the wrong period.
+    #   2. LLM __period__ — fallback when SEC reportDate is unavailable.
+    #      The LLM reads the period label directly from the document and
+    #      is consistent across re-runs for the same document.
+    #   3. When both are available but differ by >1 day, log a warning
+    #      (possible column-mixup by the LLM) but use the SEC date.
     parsed = parse_period_end_date(period_str)
-    if parsed is not None:
-        end_date = parsed
-    elif report_date is not None:
+    if report_date is not None:
         end_date = report_date
+        if parsed is not None and abs((report_date - parsed).days) > 1:
+            logger.warning(
+                "upsert_concept_values: SEC reportDate %s differs from "
+                "LLM __period__ %s by %d days — using SEC date",
+                report_date, parsed, abs((report_date - parsed).days),
+            )
+    elif parsed is not None:
+        end_date = parsed
         logger.debug(
-            "upsert_concept_values: using SEC reportDate %s "
-            "(period_str %r had no parseable date)",
-            report_date, period_str,
+            "upsert_concept_values: using LLM __period__ %s "
+            "(no SEC reportDate available)",
+            parsed,
         )
     else:
         logger.warning(

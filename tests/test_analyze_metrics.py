@@ -275,7 +275,7 @@ def test_analyze_gross_profit_violation_triggers_reextract():
     out = analyze_metrics_node(_state(m, attempts=1))
     # Correction pass fixes GP in concept_metrics.
     assert out.get("concept_metrics", {}).get("cid_gross_profit") == 20_000_000_000.0
-    assert any(f["type"] == "auto_corrected" and "Gross Profit" in f["message"]
+    assert any(f["type"] == "auto_corrected" and "gross" in f["message"].lower()
                for f in out["findings"])
 
 
@@ -286,7 +286,7 @@ def test_analyze_operating_income_auto_corrected():
     m["Operating income"] = 40_000_000_000  # wrong: GP − OpEx = 30B
     out = analyze_metrics_node(_state(m, attempts=1))
     assert out.get("concept_metrics", {}).get("cid_operating_income") == 30_000_000_000.0
-    assert any(f["type"] == "auto_corrected" and "Operating Income" in f["message"]
+    assert any(f["type"] == "auto_corrected" and "operating" in f["message"].lower()
                for f in out["findings"])
 
 
@@ -299,7 +299,7 @@ def test_analyze_net_income_auto_corrected():
     m["Net income"] = 15_000_000_000  # wrong: 25B − 5B = 20B
     out = analyze_metrics_node(_state(m, attempts=1))
     assert out.get("concept_metrics", {}).get("cid_net_income") == 20_000_000_000.0
-    assert any(f["type"] == "auto_corrected" and "Net Income" in f["message"]
+    assert any(f["type"] == "auto_corrected" and "net" in f["message"].lower()
                for f in out["findings"])
 
 
