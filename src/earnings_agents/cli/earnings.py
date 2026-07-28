@@ -746,10 +746,12 @@ def _resolve_8k_skip_guard(
         filing_dates: list[str] = recent.get("filingDate", [])
         items_list: list[str] = recent.get("items", [])
         accessions: list[str] = recent.get("accessionNumber", [])
+        report_dates: list[str] = recent.get("reportDate", [])
 
-        # Find latest 8-K (Item 2.02) — capture filing_date AND accession.
+        # Find latest 8-K (Item 2.02) — capture filing_date, accession, and report_date.
         filing_date_str: str | None = None
         accession: str | None = None
+        sec_report_date: str | None = None
         for i, form in enumerate(forms):
             if form != "8-K":
                 continue
@@ -757,15 +759,18 @@ def _resolve_8k_skip_guard(
             if "2.02" in item_str:
                 fd = filing_dates[i] if i < len(filing_dates) else ""
                 acc = accessions[i] if i < len(accessions) else ""
+                rd = report_dates[i] if i < len(report_dates) else ""
                 if fd:
                     filing_date_str = fd
                 if acc:
                     accession = acc
+                if rd:
+                    sec_report_date = rd
                 break
 
-        # ── Accession-level dedup (infallible) ──────────────────────────
+        # ── Accession-level dedup (scoped to period) ──────────────────────
         if accession:
-            acc_exists = _accession_already_stored(cik, accession)
+            acc_exists = _accession_already_stored(cik, accession, sec_report_date)
             if acc_exists:
                 if dry_run:
                     printer(
@@ -907,15 +912,33 @@ def _resolve_8k_skip_guard(
         return None
 
 
-def _accession_already_stored(cik: str, accession: str) -> bool:
-    """Return True when *accession* already exists for *cik* in normalize_data."""
+def _accession_already_stored(cik: str, accession: str, sec_report_date: str | None = None) -> bool:
+    """Return True when *accession* already exists for *cik* in normalize_data.
+
+    When *sec_report_date* is provided, only matches documents whose
+    ``reporting_period.end_date`` matches — preventing a stale accession
+    from a different period (cached from a later SEC 8-K) from blocking
+    re-extraction of the current period.
+    """
     try:
         from earnings_agents.tools.normalize_data_client import _get_client, _NORMALIZE_DB
         db = _get_client()[_NORMALIZE_DB]
         for col_name in ("concept_values_quarterly", "concept_values_annual"):
-            if db[col_name].count_documents(
-                {"company_cik": cik, "statement_type": "income_statement", "accession_number": accession}, limit=1
-            ):
+            filt: dict[str, Any] = {
+                "company_cik": cik,
+                "statement_type": "income_statement",
+                "accession_number": accession,
+            }
+            if sec_report_date:
+                from datetime import date as _date, datetime, timezone
+                try:
+                    rd = _date.fromisoformat(sec_report_date)
+                    filt["reporting_period.end_date"] = datetime(
+                        rd.year, rd.month, rd.day, tzinfo=timezone.utc,
+                    )
+                except (ValueError, TypeError):
+                    pass
+            if db[col_name].count_documents(filt, limit=1):
                 return True
         return False
     except Exception:  # noqa: BLE001
