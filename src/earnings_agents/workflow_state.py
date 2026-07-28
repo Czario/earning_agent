@@ -80,6 +80,7 @@ class EarningsAgentState(TypedDict):
     # CLI SEC path; absent (None) on the IR path.  Used as the authoritative
     # end date for normalize_data upserts and for the extraction period hint.
     sec_report_date: NotRequired[Optional[str]]
+    sec_quarter: NotRequired[Optional[int]]  # explicit quarter from EX-99.1 header
     # ── Table-aware HTML extraction ─────────────────────────────────────────
     # Populated by extract_html_text_node when GAAP tables are classified.
     # Maps section type ('income_statement', 'balance_sheet', 'cash_flow',

@@ -459,10 +459,15 @@ def compute_fiscal_period(
     period_end_date: date,
     fiscal_year_end_month: int,
     period_str: str = "",
+    sec_quarter: int | None = None,
 ) -> tuple[int, int]:
     """Return ``(fiscal_year, quarter)`` for a period end date.
 
     ``fiscal_year_end_month``: 1-12 (e.g. 6 for June, 12 for December).
+    ``sec_quarter``: explicit quarter extracted from the EX-99.1 document
+    header (e.g. "Second Quarter 2026" → 2).  When present, this is used
+    as the authoritative quarter — it comes from the company's own filing
+    text and is always correct.
 
     *Fiscal year* is determined by comparing the period-end month against
     ``fiscal_year_end_month``.  *Quarter* uses the company's
@@ -496,18 +501,25 @@ def compute_fiscal_period(
     m = period_end_date.month
     y = period_end_date.year
 
-    # When period_str carries a parseable date (e.g. "Three Months Ended
-    # May 25, 2026"), use it for the calendar-month fallback.  The
-    # period_end_date argument may come from SEC EDGAR's reportDate which
-    # on 8-Ks is company-set and sometimes the announcement/filing date
-    # rather than the true fiscal period end — the LLM reads the actual
-    # column header from the document, which is more trustworthy.
+    # Explicit quarter from EX-99.1 header is authoritative — it comes
+    # from the company's own text (e.g. "Second Quarter 2026").
+    if sec_quarter is not None and 1 <= sec_quarter <= 4:
+        quarter = sec_quarter
+        # Fiscal year: same logic as calendar-math path
+        fiscal_year = y if m <= fiscal_year_end_month else y + 1
+        return fiscal_year, quarter
+
+    # The LLM's period_str date (e.g. "Three Months Ended May 25, 2026"
+    # read from the column header) may differ from SEC's reportDate when
+    # the LLM reads a comparison column by mistake.  SEC's reportDate
+    # (the *period_end_date* argument) is authoritative — only fall back
+    # to the LLM's date when no SEC date is available.
     str_date = parse_period_end_date(period_str)
-    if str_date is not None and str_date != period_end_date:
+    _has_sec_date = period_end_date is not None
+    if str_date is not None and str_date != period_end_date and not _has_sec_date:
         logger.debug(
-            "compute_fiscal_period: period_str date %s overrides "
-            "period_end_date %s for quarter calculation",
-            str_date, period_end_date,
+            "compute_fiscal_period: no SEC date — using period_str date %s",
+            str_date,
         )
         m = str_date.month
         y = str_date.year
@@ -525,6 +537,40 @@ def compute_fiscal_period(
         fy_start_month = fiscal_year_end_month % 12 + 1
         fy_month_offset = (m - fy_start_month) % 12
         quarter = fy_month_offset // 3 + 1
+
+        # Boundary tolerance (Dec FY only): dates within 3 days after a
+        # standard quarter boundary may actually belong to the PREVIOUS
+        # quarter (e.g. July 3, 3 days after June 30 → should be Q2).
+        # Only for December fiscal year because non-Dec FY boundaries
+        # are naturally offset and standard math is correct.
+        # Primary fix for non-standard boundaries is sec_quarter from
+        # the EX-99.1 document header.
+        _BOUNDARY_TOLERANCE = 3
+        if fiscal_year_end_month == 12:
+            for _q in range(1, 5):
+                _q_end_month = (fy_start_month + _q * 3 - 1) % 12 or 12
+                _boundary_years = [y]
+                if _q == 4 and m <= 3:
+                    _boundary_years.append(y - 1)
+                for _by in _boundary_years:
+                    try:
+                        if _q_end_month == 12:
+                            _boundary = date(_by, 12, 31)
+                        else:
+                            _boundary = date(_by, _q_end_month + 1, 1) - timedelta(days=1)
+                    except (ValueError, OverflowError):
+                        continue
+                    _diff_days = (period_end_date - _boundary).days
+                    if 0 <= _diff_days <= _BOUNDARY_TOLERANCE and _q != quarter:
+                        logger.debug(
+                            "compute_fiscal_period: end_date %s is %d days after "
+                            "Q%d boundary %s — snapping quarter %d → %d",
+                            period_end_date, _diff_days, _q, _boundary, quarter, _q,
+                        )
+                        quarter = _q
+                        if _q == 4 and _by == y - 1:
+                            fiscal_year = _by
+                        break
 
     return fiscal_year, quarter
 
@@ -799,7 +845,7 @@ def get_next_period_type(
 def upsert_concept_values(
     cik: str,
     company_name: str,
-    concept_metrics: dict[str, float],  # concept_id → value
+    concept_metrics: dict[str, float],
     period_str: str,
     fiscal_year_end_month: int,
     fiscal_year_end_code: str = "1231",
@@ -808,6 +854,7 @@ def upsert_concept_values(
     period_type_override: str | None = None,
     derived_concept_ids: set[str] | None = None,
     accession_number: str | None = None,
+    sec_quarter: int | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
@@ -895,7 +942,7 @@ def upsert_concept_values(
     collection_name = f"concept_values_{period_type}"
     form_type = "10-K" if period_type == "annual" else "10-Q"
 
-    fiscal_year, quarter = compute_fiscal_period(end_date, fiscal_year_end_month, period_str)
+    fiscal_year, quarter = compute_fiscal_period(end_date, fiscal_year_end_month, period_str, sec_quarter=sec_quarter)
     start_date = parse_period_start_date(period_str, end_date)
     # Store end_date as a native UTC datetime to match the existing collection schema.
     end_datetime = datetime(end_date.year, end_date.month, end_date.day, 0, 0, 0,
@@ -951,9 +998,9 @@ def upsert_concept_values(
         if accession_number:
             doc["accession_number"] = accession_number
         filter_doc: dict[str, Any] = {
+            "company_cik": cik,
             "concept_id": concept_oid,
-            "reporting_period.end_date": end_datetime,
-            "reporting_period.form_type": form_type,
+            "reporting_period.fiscal_year": fiscal_year,
         }
         if period_type == "quarterly":
             filter_doc["reporting_period.quarter"] = quarter
@@ -968,6 +1015,27 @@ def upsert_concept_values(
 
     if not ops:
         return 0
+
+    # ── Delete existing data for this period before inserting fresh ───────
+    # Avoids duplicate-key errors when the same fiscal period was previously
+    # stored with a slightly different end_date (e.g. Q3 vs Q2 reclassification
+    # of the same June 27 period).  The unique index is on {company_cik,
+    # concept_id, fiscal_year, quarter}, so deleting by these keys first
+    # guarantees clean insertion.
+    _del_filt: dict[str, Any] = {
+        "company_cik": cik,
+        "statement_type": statement_type,
+        "reporting_period.fiscal_year": fiscal_year,
+    }
+    if period_type == "quarterly":
+        _del_filt["reporting_period.quarter"] = quarter
+    _del_count = collection.delete_many(_del_filt).deleted_count
+    if _del_count:
+        logger.info(
+            "upsert_concept_values: deleted %d stale doc(s) for CIK %s FY%d %s",
+            _del_count, cik, fiscal_year,
+            f"Q{quarter}" if period_type == "quarterly" else "(annual)",
+        )
 
     from earnings_agents.hooks import report_call
     period_label = f"FY{fiscal_year} Q{quarter}" if period_type == "quarterly" else f"FY{fiscal_year}"

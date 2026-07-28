@@ -162,6 +162,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 period_type_override=detected_period_type,
                 derived_concept_ids=derived_ids,
                 accession_number=state.get("accession_number"),
+                sec_quarter=state.get("sec_quarter"),
             )
             report_call(f"  [save]  ✓ {n} concept value(s) upserted")
             logger.info(

@@ -284,37 +284,18 @@ def _infer_period_end(
     # the prior quarter end and the 8-K filing date.  It is almost certainly
     # the announcement date rather than the period end.
     #
-    # Two heuristics to estimate the true period end:
-    #
-    # (a) When the most-recent 10-Q/10-K was filed within 60 days of the 8-K
-    #     (common — companies often file both on the same day), its reportDate
-    #     is the correct period end for the 8-K as well.
-    # (b) Otherwise, estimate as filing_date − 30 days — the median delay
-    #     between quarter end and earnings announcement.
-    #
-    # These estimates feed the skip guard's FY+quarter comparison only; the
-    # upsert prefers the LLM's exact __period__ date, so an approximate date
-    # here never corrupts stored data.
-    if best_prior_rd is not None:
-        days_since_period_end = (filing_date - best_prior_rd).days
-        if days_since_period_end <= 60:
-            # 10-Q/10-K filed same day or within 60 days of 8-K — its
-            # reportDate is the same period the 8-K reports on.
-            logger.debug(
-                "_infer_period_end: using most-recent 10-Q/10-K reportDate %s "
-                "(%d days before 8-K filing) as estimated period end",
-                best_prior_rd.isoformat(), days_since_period_end,
-            )
-            return best_prior_rd.isoformat()
-
-    estimated = filing_date - timedelta(days=30)
+    # At this point we have only estimates — the prior-Q filing's reportDate
+    # (if filed within 60 days — same period) or filing_date − 30 days.
+    # Neither is reliable enough to use as the authoritative period end,
+    # so return None to fall back to the LLM's __period__ date which was
+    # read directly from the document header.
     logger.debug(
         "_infer_period_end: raw reportDate %s outside expected range "
-        "(prior period end=%s, filing=%s) — using estimated period end %s",
+        "(prior period end=%s, filing=%s) — returning None, will use LLM date",
         raw_report_date, best_prior_rd.isoformat() if best_prior_rd else "none",
-        filing_date.isoformat(), estimated.isoformat(),
+        filing_date.isoformat(),
     )
-    return estimated.isoformat()
+    return None
 
 
 def _extract_period_from_exhibit(url: str) -> date | None:
@@ -341,6 +322,55 @@ def _extract_period_from_exhibit(url: str) -> date | None:
         return None
 
     return parse_period_end_date(text)
+
+
+def _extract_quarter_from_exhibit(url: str) -> int | None:
+    """Extract the explicit fiscal quarter from an EX-99.1 document.
+
+    Earnings releases almost always include the quarter label in the
+    document header (e.g. "Second Quarter 2026", "Q2 2026", "2nd Quarter").
+    This is an authoritative signal — the company itself declares which
+    quarter the filing reports on.
+
+    Returns 1-4 or ``None``.
+    """
+    import re
+    try:
+        resp = _edgar_get(url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        text = resp.text[:50000]
+    except requests.RequestException:
+        logger.debug("_extract_quarter_from_exhibit: fetch failed for %s", url)
+        return None
+
+    # Strip HTML tags for text matching
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    _ORDINAL_MAP: dict[str, int] = {
+        "first": 1, "second": 2, "third": 3, "fourth": 4,
+        "1st": 1, "2nd": 2, "3rd": 3, "4th": 4,
+    }
+
+    for word, q in _ORDINAL_MAP.items():
+        if re.search(rf"\b{word}\s+quarter\b", text, re.I):
+            logger.debug(
+                "_extract_quarter_from_exhibit: found '%s quarter' → Q%d in %s",
+                word, q, url,
+            )
+            return q
+
+    # Q1/Q2/Q3/Q4 format
+    m = re.search(r"\bQ([1-4])\b", text)
+    if m:
+        q = int(m.group(1))
+        logger.debug(
+            "_extract_quarter_from_exhibit: found 'Q%d' in %s", q, url,
+        )
+        return q
+
+    return None
 
 
 def _infer_8k_fiscal_period(

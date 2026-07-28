@@ -371,9 +371,9 @@ def test_upsert_concept_values_separates_quarterly_and_annual_filters():
     assert len(ops) == 1
     state = ops[0].__getstate__()[1]
     assert state["_filter"] == {
+        "company_cik": "000123",
         "concept_id": ndc.ObjectId("507f1f77bcf86cd799439011"),
-        "reporting_period.end_date": ndc.datetime(2026, 3, 31, 0, 0, 0, tzinfo=ndc.timezone.utc),
-        "reporting_period.form_type": "10-Q",
+        "reporting_period.fiscal_year": 2026,
         "reporting_period.quarter": 1,
     }
     # earning_data flag must be present in the upserted document
@@ -406,7 +406,7 @@ def test_upsert_concept_values_uses_annual_collection_for_annual_periods():
     assert called_collection == "concept_values_annual"
     ops = mock_collection.bulk_write.call_args[0][0]
     state = ops[0].__getstate__()[1]
-    assert state["_filter"]["reporting_period.form_type"] == "10-K"
+    assert state["_filter"]["reporting_period.fiscal_year"] == 2025
     assert "reporting_period.quarter" not in state["_filter"]
     # earning_data flag must be present; annual reporting_period must have no start_date
     update_doc = state["_doc"]["$set"]
@@ -446,7 +446,7 @@ def test_upsert_concept_values_period_type_override_is_authoritative():
     assert called_collection == "concept_values_annual"
     ops = mock_collection.bulk_write.call_args[0][0]
     state = ops[0].__getstate__()[1]
-    assert state["_filter"]["reporting_period.form_type"] == "10-K"
+    assert state["_filter"]["reporting_period.fiscal_year"] == 2026
     assert "reporting_period.quarter" not in state["_filter"]
 
 

@@ -494,6 +494,20 @@ def _build_8k_state(
         printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
         filing_url, supplemental_urls, sec_report_date_str = get_latest_earnings_url(cik)
 
+        # ── Extract explicit quarter from EX-99.1 document header ─────────
+        # The filing itself declares "Second Quarter" or "Q2" — authoritative.
+        sec_quarter: int | None = None
+        if filing_url:
+            try:
+                from earnings_agents.tools.edgar_client import _extract_quarter_from_exhibit
+                sec_quarter = _extract_quarter_from_exhibit(filing_url)
+                if sec_quarter:
+                    printer(
+                        f"  [EDGAR]  explicit quarter from exhibit: Q{sec_quarter}"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
     if not filing_url:
         return {
             **_base,
@@ -523,6 +537,7 @@ def _build_8k_state(
         "discovered_file_url": filing_url,
         "supplemental_file_urls": supplemental_urls or [],
         "sec_report_date": sec_report_date_str,
+        "sec_quarter": sec_quarter,
         "status": "discovered",
     }
 
