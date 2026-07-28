@@ -833,7 +833,7 @@ def _resolve_8k_skip_guard(
                         else "quarterly"
                     )
                     fp = (fy, q if pt == "quarterly" else None, pt)
-                    logger.debug(
+                    _logger.debug(
                         "_resolve_8k_skip_guard: exhibit date %s → FY%d %s",
                         period_end_date,
                         fy,
@@ -914,7 +914,7 @@ def _accession_already_stored(cik: str, accession: str) -> bool:
         db = _get_client()[_NORMALIZE_DB]
         for col_name in ("concept_values_quarterly", "concept_values_annual"):
             if db[col_name].count_documents(
-                {"company_cik": cik, "accession_number": accession}, limit=1
+                {"company_cik": cik, "statement_type": "income_statement", "accession_number": accession}, limit=1
             ):
                 return True
         return False

@@ -699,7 +699,10 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             _col2 = "concept_values_quarterly" if _period_type2 == "quarterly" else "concept_values_annual"
             # Find the most recent stored period (excluding current, if already stored)
             _all_periods = sorted(
-                _db2[_col2].distinct("reporting_period.end_date", {"company_cik": _cik2}),
+                _db2[_col2].distinct(
+                    "reporting_period.end_date",
+                    {"company_cik": _cik2, "statement_type": "income_statement"},
+                ),
                 reverse=True,
             )
             _sec_date2 = state.get("sec_report_date")
@@ -715,6 +718,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 _prompt_ids = [c["_id"] for c in prompt_concepts if c.get("_id")]
                 _prior_vals = list(_db2[_col2].find({
                     "company_cik": _cik2,
+                    "statement_type": "income_statement",
                     "concept_id": {"$in": _prompt_ids},
                     "reporting_period.end_date": _prior_end,
                 }))

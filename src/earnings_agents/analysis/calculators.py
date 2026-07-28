@@ -459,7 +459,8 @@ def apply_parent_child_calculations(
 
     2. **Gross Profit** — if an extracted value exists, keep it.  Otherwise
        calculate ``Revenue − Cost of Revenue`` using the FINAL Cost of Revenue
-       from step 1.
+       from step 1.  Identity validation and correction of wrong extracted
+       values is handled by ``analyze_metrics``.
 
     3. **Operating Expenses** — if ALL direct children have values, replace
        the parent with ``sum(children)``.  Otherwise, keep the extracted parent
@@ -528,22 +529,41 @@ def apply_parent_child_calculations(
                 )
 
     # ── Step 2: Gross Profit ───────────────────────────────────────────────
+    # If the LLM extracted a GP value, keep it — analyze_metrics will verify
+    # the accounting identity and correct it if wrong.  If no GP was extracted
+    # (common for companies like Cadence that don't report a GP subtotal),
+    # derive it from Revenue − Cost of Revenue.
     _gp_val: float | None = None
     _gp_parent_id = _find_parent_concept_id(
         all_concepts, "gross_profit", parent_to_children, _overrides,
     )
-    if _gp_parent_id:
-        _gp_extracted = result.get(_gp_parent_id)
+    # Find any GP concept by role (not just parent-with-children).
+    _gp_any_id: str | None = _gp_parent_id
+    if _gp_any_id is None:
+        _, _gp_any_id = _find_value_for_role(
+            result if _gp_parent_id is None else {},
+            all_concepts, "gross_profit", _overrides,
+        ) or (None, None)
+        if _gp_any_id is None:
+            for _c in all_concepts:
+                _c_role = identify_role(
+                    _c.get("label", ""), _c.get("taxonomy_key", "")
+                ) or _overrides.get(_c["_id"])
+                if _c_role == "gross_profit":
+                    _gp_any_id = _c["_id"]
+                    break
+
+    if _gp_any_id:
+        _gp_extracted = result.get(_gp_any_id)
         if isinstance(_gp_extracted, (int, float)):
             _gp_val = float(_gp_extracted)
         elif _cor_calculated is not None:
-            # No extracted Gross Profit → calculate from Revenue − CoR
             _rev_val, _ = _find_value_for_role(
                 result, all_concepts, "revenue", _overrides,
             )
             if _rev_val is not None:
                 _gp_val = _rev_val - _cor_calculated
-                result[_gp_parent_id] = _gp_val
+                result[_gp_any_id] = _gp_val
                 logger.info(
                     "Gross Profit = Revenue − Cost of Revenue = %s − %s = %s",
                     f"{_rev_val:,.0f}", f"{_cor_calculated:,.0f}", f"{_gp_val:,.0f}",
@@ -636,7 +656,10 @@ def derive_missing_concept_metrics(
 
     # Build concept_id → label + taxonomy_key lookups for role identification.
     id_to_label: dict[str, str] = {c["_id"]: c.get("label", "") for c in all_concepts}
-    id_to_tkey: dict[str, str] = {c["_id"]: c.get("taxonomy_key", "") for c in all_concepts}
+    id_to_tkey: dict[str, str] = {
+        c["_id"]: c.get("taxonomy_key") or c.get("concept") or ""
+        for c in all_concepts
+    }
 
     # Step 1 — populate role_values from already-mapped concepts.
     # Use both label patterns AND taxonomy-key patterns so banking/fintech

@@ -33,6 +33,137 @@ from earnings_agents.workflow_state import EarningsAgentState
 logger = logging.getLogger(__name__)
 
 
+def _apply_identity_corrections(
+    findings: list[Finding],
+    metrics: dict[str, Any],
+    state: EarningsAgentState,
+) -> list[Finding]:
+    """Correct extracted values that fail accounting-identity checks.
+
+    When the LLM extracts a value that violates a deterministic accounting
+    identity, compute the correct value and update both ``metrics`` and
+    ``concept_metrics`` so the corrected value is saved.
+
+    Identities:
+        1. Gross Profit      = Revenue − Cost of Revenue
+        2. Operating Income  = Gross Profit − Total OpEx
+        3. Net Income        = Pre-tax Income − Tax Expense
+
+    Returns a new findings list with identity violations replaced by
+    ``auto_corrected`` entries.
+    """
+    import re as _re
+
+    # ── Helper: find a metric key by regex ─────────────────────────────────
+    def _find_key(pattern: str) -> str | None:
+        for key in metrics:
+            if _re.search(pattern, key, _re.I):
+                return key
+        return None
+
+    # ── Helper: find a concept_id in target_concepts by label regex ────────
+    def _find_concept_id(label_pattern: str) -> str | None:
+        for c in (state.get("target_concepts") or []):
+            if _re.search(label_pattern, c.get("label", ""), _re.I):
+                return c.get("_id")
+        return None
+
+    # ── Helper: apply a correction to both metrics and concept_metrics ─────
+    def _correct(metric_key: str, computed_val: float, label: str,
+                 method: str) -> None:
+        _old_val = metrics.get(metric_key)
+        metrics[metric_key] = computed_val
+        _cm: dict[str, Any] | None = state.get("concept_metrics")  # type: ignore[assignment]
+        _cid = _find_concept_id(label)
+        if _cm and _cid and _cid in _cm:
+            _cm[_cid] = computed_val
+            _derived: list[str] = list(state.get("derived_concept_ids") or [])
+            if _cid not in _derived:
+                _derived.append(_cid)
+                state["derived_concept_ids"] = _derived  # type: ignore[typeddict-unknown-key]
+        if isinstance(_old_val, (int, float)):
+            logger.info(
+                "analyze_metrics %s: corrected '%s' %.0f → %.0f (%s)",
+                state.get("ticker", "?"), metric_key, _old_val, computed_val, method,
+            )
+        else:
+            logger.info(
+                "analyze_metrics %s: derived '%s' = %.0f (%s)",
+                state.get("ticker", "?"), metric_key, computed_val, method,
+            )
+        _out_findings.append(
+            Finding(
+                type="auto_corrected",
+                severity="low",
+                message=f"{metric_key} corrected to {computed_val:,.0f} ({method}).",
+                keys=(metric_key,),
+                evidence={"corrected_value": computed_val, "method": method},
+            )
+        )
+
+    _out_findings: list[Finding] = [f for f in findings]
+
+    # ── 1. Gross Profit = Revenue − Cost of Revenue ──────────────────────
+    _gp_key = _find_key(r"^(?:gross (?:margin|profit))")
+    _rev_key = _find_key(r"^(?:(?:total|net)\s+)?(?:revenue|sales)")
+    _cor_key = _find_key(r"^cost\s+of\s+(?:revenue|sales|goods)")
+    if _gp_key and _rev_key and _cor_key:
+        _rev = metrics.get(_rev_key)
+        _cor = metrics.get(_cor_key)
+        _gp = metrics.get(_gp_key)
+        if isinstance(_rev, (int, float)) and isinstance(_cor, (int, float)):
+            _computed = _rev - _cor
+            # Identity is exact math — tolerance only for float precision.
+            if not isinstance(_gp, (int, float)) or abs(_gp - _computed) > 1.0:
+                _correct(_gp_key, _computed, r"gross.profit",
+                         "Revenue − Cost of Revenue")
+                _out_findings = [
+                    f for f in _out_findings
+                    if not (f.type == "identity_violation"
+                            and "gross_profit" in (f.evidence or {}))
+                ]
+
+    # ── 2. Operating Income = Gross Profit − Total OpEx ───────────────────
+    _oi_key = _find_key(r"^(?:income\s+from\s+operations|operating\s+(?:income|profit|loss))")
+    _opex_key = _find_key(r"(?:total\s+)?operating\s+(?:expenses?|costs?)")
+    _gp_key2 = _find_key(r"^(?:gross (?:margin|profit))")
+    if _oi_key and _opex_key and _gp_key2:
+        _gp2 = metrics.get(_gp_key2)
+        _opex = metrics.get(_opex_key)
+        _oi = metrics.get(_oi_key)
+        if isinstance(_gp2, (int, float)) and isinstance(_opex, (int, float)):
+            _computed = _gp2 - _opex
+            if not isinstance(_oi, (int, float)) or abs(_oi - _computed) > 1.0:
+                _correct(_oi_key, _computed, r"operat(?:ing|ional)\s+income",
+                         "Gross Profit − Total Operating Expenses")
+                _out_findings = [
+                    f for f in _out_findings
+                    if not (f.type == "suspect_value"
+                            and any("operating" in k.lower()
+                                    for k in (f.keys or ())))
+                ]
+
+    # ── 3. Net Income = Pre-tax Income − Tax Expense ─────────────────────
+    _ni_key = _find_key(r"^net\s+(?:income|earnings|loss)\s*$")
+    _pt_key = _find_key(r"(?:income\s+before.*tax|pre.?tax\s+income)")
+    _tax_key = _find_key(
+        r"(?:provision\s+for\s+income\s+tax"
+        r"|income\s+tax\s+(?:expense|provision)"
+        r")"
+    )
+    if _ni_key and _pt_key and _tax_key:
+        _pt = metrics.get(_pt_key)
+        _tax = metrics.get(_tax_key)
+        _ni = metrics.get(_ni_key)
+        if isinstance(_pt, (int, float)) and isinstance(_tax, (int, float)):
+            _computed = _pt - _tax
+            if not isinstance(_ni, (int, float)) or abs(_ni - _computed) > 1.0:
+                _correct(_ni_key, _computed, r"net.income",
+                         "Pre-tax Income − Tax Expense")
+
+    return _out_findings
+
+
 def _build_extraction_notes(
     findings: list[Finding],
     attempt_num: int,
@@ -188,7 +319,10 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
             if _ni_concept_ids:
                 # Find the most recent prior period's values
                 _periods = sorted(
-                    _db[_col_name].distinct('reporting_period.end_date', {'company_cik': _cik}),
+                    _db[_col_name].distinct(
+                        'reporting_period.end_date',
+                        {'company_cik': _cik, 'statement_type': 'income_statement'},
+                    ),
                     reverse=True,
                 )
                 if len(_periods) >= 2:
@@ -210,6 +344,7 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
                     if _prior_period:
                         _prior_vals = list(_db[_col_name].find({
                             'company_cik': _cik,
+                            'statement_type': 'income_statement',
                             'concept_id': {'$in': _ni_concept_ids},
                             'reporting_period.end_date': _prior_period,
                         }))
@@ -291,6 +426,12 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
                 "analyze_metrics %s: auto-corrected '%s' %s → %s",
                 ticker, corrected_key, old_value, corrected_value,
             )
+
+    # ── Identity-rule corrections ─────────────────────────────────────────
+    # After all observers have run, correct any values that violate basic
+    # accounting identities (e.g. GP ≠ Revenue − CoR).  The LLM may have
+    # extracted a hallucinated or misread value; the identity is unambiguous.
+    findings = _apply_identity_corrections(findings, metrics, state)
 
     # Log a compact summary.
     by_type: dict[str, int] = {}

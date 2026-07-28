@@ -581,7 +581,7 @@ def get_latest_period(cik: str) -> dict[str, Any] | None:
     for period_type in ("quarterly", "annual"):
         col = db[f"concept_values_{period_type}"]
         doc = col.find_one(
-            {"company_cik": cik},
+            {"company_cik": cik, "statement_type": "income_statement"},
             {"reporting_period.end_date": 1, "reporting_period.fiscal_year": 1,
              "reporting_period.quarter": 1},
             sort=[("reporting_period.end_date", -1)],
@@ -620,6 +620,7 @@ def fiscal_period_exists(
     )
     filt: dict[str, Any] = {
         "company_cik": cik,
+        "statement_type": "income_statement",
         "reporting_period.fiscal_year": fiscal_year,
     }
     if quarter is not None:
@@ -643,6 +644,7 @@ def count_fiscal_period_values(
     )
     filt: dict[str, Any] = {
         "company_cik": cik,
+        "statement_type": "income_statement",
         "reporting_period.fiscal_year": fiscal_year,
     }
     if quarter is not None:
@@ -668,6 +670,7 @@ def delete_fiscal_period(
     )
     filt: dict[str, Any] = {
         "company_cik": cik,
+        "statement_type": "income_statement",
         "reporting_period.fiscal_year": fiscal_year,
     }
     if quarter is not None:
@@ -709,13 +712,20 @@ def get_recently_valued_concept_ids(
     )
     db = _get_client()[_NORMALIZE_DB]
     col = db[col_name]
-    periods = col.distinct("reporting_period.end_date", {"company_cik": cik})
+    periods = col.distinct(
+        "reporting_period.end_date",
+        {"company_cik": cik, "statement_type": "income_statement"},
+    )
     periods = sorted([p for p in periods if p is not None], reverse=True)[:n_periods]
     if not periods:
         return set()
     ids = col.distinct(
         "concept_id",
-        {"company_cik": cik, "reporting_period.end_date": {"$in": periods}},
+        {
+            "company_cik": cik,
+            "statement_type": "income_statement",
+            "reporting_period.end_date": {"$in": periods},
+        },
     )
     return {str(i) for i in ids if i is not None}
 

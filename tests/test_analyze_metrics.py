@@ -235,12 +235,48 @@ def test_suspect_round_skips_megacap_totals():
 # ---------------------------------------------------------------------------
 
 def test_analyze_gross_profit_violation_triggers_reextract():
+    """GP identity violations are now auto-corrected instead of re-extracting."""
     m = _full_metrics()
-    # Break the income-statement identity: Revenue − Cost of revenue ≠ Gross profit.
     m["Cost of revenue"] = 80_000_000_000   # 100B − 80B = 20B ≠ 60B gross profit
     out = analyze_metrics_node(_state(m, attempts=1))
-    assert out["needs_reextract"] is True
-    assert any(f["type"] == "identity_violation" for f in out["findings"])
+    # Correction pass fixes GP to Revenue − CoR, so no re-extraction needed.
+    assert out["needs_reextract"] is False
+    assert any(f["type"] == "auto_corrected" for f in out["findings"])
+    # Verify the metrics dict was corrected in-place.
+    assert out["metrics"]["Gross profit"] == 20_000_000_000.0
+
+
+def test_analyze_operating_income_auto_corrected():
+    """OI identity violation: OI ≠ GP − OpEx → auto-corrected."""
+    m = _full_metrics()
+    m["Total operating expenses"] = 30_000_000_000
+    m["Operating income"] = 40_000_000_000  # wrong: GP − OpEx = 30B
+    out = analyze_metrics_node(_state(m, attempts=1))
+    assert out["needs_reextract"] is False
+    assert out["metrics"]["Operating income"] == 30_000_000_000.0
+    assert any(f["type"] == "auto_corrected" and "Operating income" in f["message"]
+               for f in out["findings"])
+
+
+def test_analyze_net_income_auto_corrected():
+    """NI identity violation: NI ≠ Pre-tax − Tax → auto-corrected."""
+    m = _full_metrics()
+    m["Total operating expenses"] = 30_000_000_000
+    m["Income before income taxes"] = 25_000_000_000
+    m["Provision for income taxes"] = 5_000_000_000
+    m["Net income"] = 15_000_000_000  # wrong: 25B − 5B = 20B
+    out = analyze_metrics_node(_state(m, attempts=1))
+    assert out["needs_reextract"] is False
+    assert out["metrics"]["Net income"] == 20_000_000_000.0
+    assert any(f["type"] == "auto_corrected" and "Net income" in f["message"]
+               for f in out["findings"])
+
+
+def test_analyze_correct_values_preserved():
+    """When all identities hold, no auto-correction happens."""
+    out = analyze_metrics_node(_state(_full_metrics(), attempts=1))
+    # No auto_corrected findings when the identity passes.
+    assert not any(f["type"] == "auto_corrected" for f in out["findings"])
 
 
 # ---------------------------------------------------------------------------
