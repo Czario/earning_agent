@@ -658,11 +658,14 @@ def test_skip_guard_deletes_and_proceeds_when_fiscal_period_exists():
         patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
         patch("earnings_agents.tools.normalize_data_client.delete_fiscal_period", return_value=5),
         patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
+        patch("earnings_agents.tools.edgar_client._find_all_ex_99_urls", return_value=[]),
     ):
         result = _resolve_8k_skip_guard("AAPL", "000123")
     assert result is not None
-    assert result["action"] == "deleted"
-    assert result["deleted_count"] == 5
+    assert result["action"] == "replace"
+    assert result["pending_delete"]["cik"] == "000123"
+    assert result["pending_delete"]["fiscal_year"] == 2025
+    assert result["pending_delete"]["quarter"] == 3
     assert result["period_label"] == "FY2025 Q3"
 
 
@@ -679,6 +682,7 @@ def test_skip_guard_skips_in_dry_run_when_fiscal_period_exists():
         patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
         patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
         patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
+        patch("earnings_agents.tools.edgar_client._find_all_ex_99_urls", return_value=[]),
     ):
         result = _resolve_8k_skip_guard("AAPL", "000123", dry_run=True)
     assert result is not None
