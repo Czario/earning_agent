@@ -204,6 +204,7 @@ segment row under Revenue and return it with that exact bracketed string as
 the JSON key.
 
 {concept_list}
+{industry_hint}
 IGNORE — do NOT extract:
   • Balance sheet items, cash flow items, non-GAAP metrics, guidance / forecasts.
   • Any table from a GAAP-to-Non-GAAP reconciliation.
@@ -241,6 +242,10 @@ INTERNAL CONSISTENCY — sanity-check before returning:
   If your chosen Cost of revenue is larger than Revenue, or this subtraction
   does not match the printed Gross profit, you have taken a value from the
   WRONG column or the wrong row — re-read the statement and correct it.
+  Interest income, Interest expense, and Other income (net) are small but
+  MANDATORY — they are needed for pre-tax and net income reconciliation.
+  Search carefully for these rows; do not skip them just because they are
+  small numbers.
 
 Return ONLY a flat JSON object — no markdown fences, no extra text.
 
@@ -647,9 +652,23 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     # prompt and are almost never in the current filing.  target_concepts stays
     # full for mapping + derivation; only the LLM prompt is trimmed.  When
     # recent_concept_ids is empty (bootstrap / disabled) the full list is used.
+    #
+    # Never prune: interest income/expense (critical for bank models),
+    # dimensional/segment concepts (supplementary by nature, pruning makes
+    # them intermittent), and system/calculated concepts (not extractable).
     recent_ids = set(state.get("recent_concept_ids") or [])
     if recent_ids:
-        prompt_concepts = [c for c in target_concepts if c.get("_id") in recent_ids]
+        prompt_concepts = [
+            c for c in target_concepts
+            if c.get("_id") in recent_ids
+            or c.get("calculated")  # system concepts never pruned
+            or "|" in (c.get("taxonomy_key") or c.get("concept") or "")  # segment dimensions
+            or re.search(  # interest income/expense — critical, often small
+                r"interest\s+(?:income|expense|revenue)",
+                (c.get("label") or "") + " " + (c.get("taxonomy_key") or c.get("concept") or ""),
+                re.I,
+            )
+        ]
         # Safety: never send an empty prompt — fall back to full list if the
         # filter would remove everything (e.g. id-format mismatch).
         if not prompt_concepts:
@@ -831,6 +850,16 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     # Source-grounding block is opt-in (SOURCE_GROUNDING): it roughly doubles
     # the LLM output size, so it is omitted by default for speed.
     sources_hint = _SOURCES_HINT_BLOCK if SOURCE_GROUNDING else ""
+
+    # Industry-aware prompt injection
+    _ind = state.get("company_industry") or {}
+    _industry_hint = ""
+    if _ind.get("category") and _ind["category"] != "general":
+        from earnings_agents.analysis.industry import get_prompt_hint
+        _industry_hint = get_prompt_hint(_ind.get("sic_code", ""))
+        if _industry_hint:
+            _industry_hint = "\n" + _industry_hint + "\n"
+
     prompts = [
         _TARGETED_PROMPT_TEMPLATE.format(
             company_name=state["company_name"],
@@ -841,6 +870,7 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
             scale_hint=chunk_scale_hints[i - 1],
             period_hint=period_hint,
             concept_list=concept_list_str,
+            industry_hint=_industry_hint,
             sources_hint=sources_hint,
             text=chunk,
         )

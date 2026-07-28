@@ -258,9 +258,25 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
                 ticker, exc,
             )
 
+    # ── Load company industry for industry-aware checks ───────────────────
+    company_industry: dict | None = None
+    try:
+        from earnings_agents.analysis.industry import load_company_industry as _lci
+        company_industry = _lci(cik)
+        if company_industry:
+            logger.info(
+                "load_company_concepts: %s industry = %s (SIC %s)",
+                ticker,
+                company_industry.get("category", "general"),
+                company_industry.get("sic_code", ""),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("load_company_concepts: industry lookup failed for %s — %s", ticker, exc)
+
     return {
         **state,
         "company_cik": cik,
+        "company_industry": company_industry,
         "target_concepts": concepts,
         "recent_concept_ids": recent_concept_ids,
         "calculated_concepts": [],
