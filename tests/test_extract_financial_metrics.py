@@ -34,11 +34,11 @@ def _base_state(**overrides):
         # match the mocked response so no Tier-2 mapping call is triggered.
         "target_concepts": [
             {"_id": "c_rev", "concept": "us-gaap:Revenues",
-             "label": "Total Net Revenue", "statement_type": "income_statement"},
+             "label": "Total Net Revenue", "statement_type": "income"},
             {"_id": "c_ni", "concept": "us-gaap:NetIncomeLoss",
-             "label": "Net Income", "statement_type": "income_statement"},
+             "label": "Net Income", "statement_type": "income"},
             {"_id": "c_eps", "concept": "us-gaap:EarningsPerShareDiluted",
-             "label": "Diluted EPS", "statement_type": "income_statement"},
+             "label": "Diluted EPS", "statement_type": "income"},
         ],
         "metrics": None,
         "error": None,
@@ -142,9 +142,9 @@ def test_first_attempt_runs_all_section_chunks(mock_llm_cls):
             file_type="html",
             target_concepts=[
                 {"_id": "c_rev", "concept": "us-gaap:Revenues",
-                 "label": "Revenues", "statement_type": "income_statement"},
+                 "label": "Revenues", "statement_type": "income"},
                 {"_id": "c_opex", "concept": "us-gaap:OperatingExpenses",
-                 "label": "Total operating expenses", "statement_type": "income_statement"},
+                 "label": "Total operating expenses", "statement_type": "income"},
             ],
             raw_sections={
                 "income_statement": ["income table"],
@@ -182,11 +182,11 @@ def test_retry_scopes_to_income_statement_and_preserves_other_sections(mock_llm_
         file_type="html",
         target_concepts=[
             {"_id": "c_rev", "concept": "us-gaap:Revenues",
-             "label": "Revenues", "statement_type": "income_statement"},
+             "label": "Revenues", "statement_type": "income"},
             {"_id": "c_cor", "concept": "us-gaap:CostOfRevenue",
-             "label": "Cost of Revenue", "statement_type": "income_statement"},
+             "label": "Cost of Revenue", "statement_type": "income"},
             {"_id": "c_gp", "concept": "us-gaap:GrossProfit",
-             "label": "Gross Profit", "statement_type": "income_statement"},
+             "label": "Gross Profit", "statement_type": "income"},
         ],
         raw_sections={
             "income_statement": ["income table"],
@@ -718,11 +718,11 @@ def _base_state(**overrides):
         # match the mocked response so no Tier-2 mapping call is triggered.
         "target_concepts": [
             {"_id": "c_rev", "concept": "us-gaap:Revenues",
-             "label": "Total Net Revenue", "statement_type": "income_statement"},
+             "label": "Total Net Revenue", "statement_type": "income"},
             {"_id": "c_ni", "concept": "us-gaap:NetIncomeLoss",
-             "label": "Net Income", "statement_type": "income_statement"},
+             "label": "Net Income", "statement_type": "income"},
             {"_id": "c_eps", "concept": "us-gaap:EarningsPerShareDiluted",
-             "label": "Diluted EPS", "statement_type": "income_statement"},
+             "label": "Diluted EPS", "statement_type": "income"},
         ],
         "metrics": None,
         "error": None,
@@ -1200,7 +1200,7 @@ class TestPerChunkScaleDetection:
             raw_sections={"income_statement": ["Net sales 478713"]},
             target_concepts=[
                 {"_id": "c_rev", "concept": "us-gaap:Revenues",
-                 "label": "Net sales", "statement_type": "income_statement"},
+                 "label": "Net sales", "statement_type": "income"},
             ],
         )
 
@@ -1287,7 +1287,7 @@ class TestTaxonomyKeyMapping:
             "label": "Net sales",
             "taxonomy_key": "us-gaap:Revenues",
             "path": "001",
-            "statement_type": "income_statement",
+            "statement_type": "income",
         },
         {
             "_id": "bbb222",
@@ -1295,7 +1295,7 @@ class TestTaxonomyKeyMapping:
             "label": "Cost of sales",
             "taxonomy_key": "us-gaap:CostOfRevenue",
             "path": "002",
-            "statement_type": "income_statement",
+            "statement_type": "income",
         },
         {
             "_id": "ccc333",
@@ -1303,7 +1303,7 @@ class TestTaxonomyKeyMapping:
             "label": "Operating income",
             "taxonomy_key": "us-gaap:OperatingIncomeLoss",
             "path": "003",
-            "statement_type": "income_statement",
+            "statement_type": "income",
         },
     ]
 

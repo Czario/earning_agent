@@ -709,18 +709,18 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
     # multi-column bank supplement tables — the current-period values should
     # be similar in magnitude to the prior period's.
     _prior_ref_str: str = ""
-    if state.get("company_cik") and state.get("target_concepts"):
+    if state.get("cik") and state.get("target_concepts"):
         try:
             from earnings_agents.tools.normalize_data_client import _get_client as _gc, _NORMALIZE_DB as _nd
             _db2 = _gc()[_nd]
-            _cik2 = state["company_cik"]
+            _cik2 = state["cik"]
             _period_type2 = state.get("detected_period_type", "quarterly")
             _col2 = "concept_values_quarterly" if _period_type2 == "quarterly" else "concept_values_annual"
             # Find the most recent stored period (excluding current, if already stored)
             _all_periods = sorted(
                 _db2[_col2].distinct(
                     "reporting_period.end_date",
-                    {"company_cik": _cik2, "statement_type": "income_statement"},
+                    {"cik": _cik2, "statement_type": "income"},
                 ),
                 reverse=True,
             )
@@ -736,8 +736,8 @@ profit, verify Revenue − Cost of revenue = Gross profit before returning JSON.
                 # Get values for the prompt concepts
                 _prompt_ids = [c["_id"] for c in prompt_concepts if c.get("_id")]
                 _prior_vals = list(_db2[_col2].find({
-                    "company_cik": _cik2,
-                    "statement_type": "income_statement",
+                    "cik": _cik2,
+                    "statement_type": "income",
                     "concept_id": {"$in": _prompt_ids},
                     "reporting_period.end_date": _prior_end,
                 }))

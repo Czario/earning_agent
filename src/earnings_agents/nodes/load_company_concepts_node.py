@@ -10,7 +10,7 @@ Period type is inferred from ``sec_report_date`` and the company's
 month the filing is treated as annual; otherwise quarterly.  When
 ``sec_report_date`` is absent (IR path) the node defaults to quarterly.
 
-Populates ``company_cik``, ``target_concepts``, ``fiscal_year_end_month``,
+Populates ``cik``, ``target_concepts``, ``fiscal_year_end_month``,
 and ``detected_period_type`` in state so ``extract_financial_metrics_node``
 can build a targeted prompt.
 
@@ -118,7 +118,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             "error": message,
             "target_concepts": [],
             "calculated_concepts": [],
-            "company_cik": None,
+            "cik": None,
             "fiscal_year_end_month": None,
             "fiscal_year_end_code": None,
             "detected_period_type": "quarterly",
@@ -198,14 +198,14 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     try:
         concepts = get_statement_concepts(
             cik,
-            statement_types=["income_statement"],
+            statement_types=["income"],
             period_type=period_type,
         )
     except Exception as exc:  # noqa: BLE001
         return _skip(
             f"No historical data for {ticker}: concept query failed ({exc}); "
             f"we don't have historical data for the company so we can't proceed.",
-            company_cik=cik,
+            cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
             detected_period_type=period_type,
@@ -228,7 +228,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         return _skip(
             f"No income-statement concepts stored for {ticker} in normalize_data — "
             f"we don't have historical data for the company so we can't proceed.",
-            company_cik=cik,
+            cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
             detected_period_type=period_type,
@@ -275,7 +275,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
 
     return {
         **state,
-        "company_cik": cik,
+        "cik": cik,
         "company_industry": company_industry,
         "target_concepts": concepts,
         "recent_concept_ids": recent_concept_ids,

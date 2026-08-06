@@ -149,7 +149,7 @@ def get_statement_concepts(
     document text exactly.
     """
     if statement_types is None:
-        statement_types = ["income_statement"]
+        statement_types = ["income"]
     collection_name = (
         "normalized_concepts_annual"
         if period_type == "annual"
@@ -160,7 +160,7 @@ def get_statement_concepts(
     _report_call(f"  [db]  query {collection_name}  concepts for CIK {cik}")
     cursor = db[collection_name].find(
         {
-            "company_cik": cik,
+            "cik": cik,
             "statement_type": {"$in": statement_types},
             "active": {"$ne": False},
             "$or": [
@@ -254,7 +254,7 @@ def get_calculated_concepts(
     be passed alongside ``target_concepts`` to ``derive_missing_concept_metrics``.
     """
     if statement_types is None:
-        statement_types = ["income_statement"]
+        statement_types = ["income"]
     collection_name = (
         "normalized_concepts_annual"
         if period_type == "annual"
@@ -265,7 +265,7 @@ def get_calculated_concepts(
     _report_call(f"  [db]  query {collection_name}  calculated concepts for CIK {cik}")
     cursor = db[collection_name].find(
         {
-            "company_cik": cik,
+            "cik": cik,
             "statement_type": {"$in": statement_types},
             "abstract": {"$ne": True},
             "hide": {"$ne": True},
@@ -617,7 +617,7 @@ def get_latest_period(cik: str) -> dict[str, Any] | None:
     for period_type in ("quarterly", "annual"):
         col = db[f"concept_values_{period_type}"]
         doc = col.find_one(
-            {"company_cik": cik, "statement_type": "income_statement"},
+            {"cik": cik, "statement_type": "income"},
             {"reporting_period.end_date": 1, "reporting_period.fiscal_year": 1,
              "reporting_period.quarter": 1},
             sort=[("reporting_period.end_date", -1)],
@@ -655,8 +655,8 @@ def fiscal_period_exists(
         "concept_values_annual" if quarter is None else "concept_values_quarterly"
     )
     filt: dict[str, Any] = {
-        "company_cik": cik,
-        "statement_type": "income_statement",
+        "cik": cik,
+        "statement_type": "income",
         "reporting_period.fiscal_year": fiscal_year,
     }
     if quarter is not None:
@@ -679,8 +679,8 @@ def count_fiscal_period_values(
         "concept_values_annual" if quarter is None else "concept_values_quarterly"
     )
     filt: dict[str, Any] = {
-        "company_cik": cik,
-        "statement_type": "income_statement",
+        "cik": cik,
+        "statement_type": "income",
         "reporting_period.fiscal_year": fiscal_year,
     }
     if quarter is not None:
@@ -705,8 +705,8 @@ def delete_fiscal_period(
         "concept_values_annual" if quarter is None else "concept_values_quarterly"
     )
     filt: dict[str, Any] = {
-        "company_cik": cik,
-        "statement_type": "income_statement",
+        "cik": cik,
+        "statement_type": "income",
         "reporting_period.fiscal_year": fiscal_year,
     }
     if quarter is not None:
@@ -750,7 +750,7 @@ def get_recently_valued_concept_ids(
     col = db[col_name]
     periods = col.distinct(
         "reporting_period.end_date",
-        {"company_cik": cik, "statement_type": "income_statement"},
+        {"cik": cik, "statement_type": "income"},
     )
     periods = sorted([p for p in periods if p is not None], reverse=True)[:n_periods]
     if not periods:
@@ -758,8 +758,8 @@ def get_recently_valued_concept_ids(
     ids = col.distinct(
         "concept_id",
         {
-            "company_cik": cik,
-            "statement_type": "income_statement",
+            "cik": cik,
+            "statement_type": "income",
             "reporting_period.end_date": {"$in": periods},
         },
     )
@@ -839,7 +839,7 @@ def upsert_concept_values(
     period_str: str,
     fiscal_year_end_month: int,
     fiscal_year_end_code: str = "1231",
-    statement_type: str = "income_statement",
+    statement_type: str = "income",
     report_date: date | None = None,
     period_type_override: str | None = None,
     derived_concept_ids: set[str] | None = None,
@@ -879,60 +879,33 @@ def upsert_concept_values(
         logger.debug("upsert_concept_values: empty concept_metrics — nothing to do")
         return 0
 
-    # Resolve the period end date.
-    #
-    # Hybrid approach:
-    #   1. SEC reportDate — authoritative, declared by the company to the SEC
-    #      at filing time.  Does not change across re-runs.  Prevents the
-    #      LLM from reading a prior-period comparison column and labelling the
-    #      stored data with the wrong period.
-    #   2. LLM __period__ — fallback when SEC reportDate is unavailable.
-    #      The LLM reads the period label directly from the document and
-    #      is consistent across re-runs for the same document.
-    #   3. When both are available but differ by >1 day, log a warning
-    #      (possible column-mixup by the LLM) but use the SEC date.
-    parsed = parse_period_end_date(period_str)
-    if report_date is not None:
-        end_date = report_date
-        if parsed is not None and abs((report_date - parsed).days) > 1:
-            logger.warning(
-                "upsert_concept_values: SEC reportDate %s differs from "
-                "LLM __period__ %s by %d days — using SEC date",
-                report_date, parsed, abs((report_date - parsed).days),
-            )
-    elif parsed is not None:
-        end_date = parsed
-        logger.debug(
-            "upsert_concept_values: using LLM __period__ %s "
-            "(no SEC reportDate available)",
-            parsed,
-        )
-    else:
+    # ── Resolve the period end date ──────────────────────────────────────
+    # LLM __period__ is the sole source — it reads the actual document header
+    # and identifies the correct column.  No SEC fallback.
+    end_date = parse_period_end_date(period_str)
+    if end_date is None:
         logger.warning(
-            "upsert_concept_values: cannot parse period end date from %r — skipping",
+            "upsert_concept_values: LLM __period__ not parseable from %r — refusing to save",
             period_str,
         )
         return 0
 
-    # Annual vs quarterly routing.  An explicit *period_type_override* from the
-    # upstream node (``detected_period_type``) is authoritative — it keeps the
-    # extraction prompt's column selection and the save collection consistent.
-    # Otherwise the company's fiscal year-end month (from the normalize_data
-    # ``companies`` collection, e.g. "0430" → April) decides: when the resolved
-    # period-end month equals the fiscal year-end month, this is the full-year
-    # (annual) filing — regardless of how the LLM labelled ``__period__``.
-    # Failing both, fall back to the duration keywords in *period_str*.
+    # ── Annual vs quarterly routing ─────────────────────────────────────
+    # Uses LLM's __period__ duration ("Three Months Ended" vs "Year Ended")
+    # with fiscal-year-end-month as fallback.
     if period_type_override in ("annual", "quarterly"):
         period_type = period_type_override
+    elif period_str:
+        period_type = detect_period_type(period_str)
     elif end_date.month == fiscal_year_end_month:
         period_type = "annual"
     else:
-        period_type = detect_period_type(period_str)  # "annual" | "quarterly"
+        period_type = "quarterly"
     collection_name = f"concept_values_{period_type}"
     form_type = "10-K" if period_type == "annual" else "10-Q"
 
     fiscal_year, quarter = compute_fiscal_period(end_date, fiscal_year_end_month, period_str)
-    start_date = parse_period_start_date(period_str, end_date)
+    start_date = parse_period_start_date(period_str, end_date) if period_str else None
     # Store end_date as a native UTC datetime to match the existing collection schema.
     end_datetime = datetime(end_date.year, end_date.month, end_date.day, 0, 0, 0,
                             tzinfo=timezone.utc)
@@ -955,13 +928,7 @@ def upsert_concept_values(
         period_doc: dict[str, Any] = {
             "end_date": end_datetime,
             "period_date": period_date_str,
-            "form_type": form_type,
-            "fiscal_year_end_code": fiscal_year_end_code,
             "fiscal_year": fiscal_year,
-            "data_source": "earnings_press_release",
-            "company_cik": cik,
-            "company_name": company_name,
-            "unit": "USD",
         }
         # Annual periods have no quarter dimension and no start_date; quarterly do.
         if period_type == "quarterly":
@@ -974,7 +941,7 @@ def upsert_concept_values(
 
         doc: dict[str, Any] = {
             "concept_id": concept_oid,
-            "company_cik": cik,
+            "cik": cik,
             "statement_type": statement_type,
             "form_type": form_type,
             "reporting_period": period_doc,
@@ -987,7 +954,7 @@ def upsert_concept_values(
         if accession_number:
             doc["accession_number"] = accession_number
         filter_doc: dict[str, Any] = {
-            "company_cik": cik,
+            "cik": cik,
             "concept_id": concept_oid,
             "reporting_period.fiscal_year": fiscal_year,
         }
@@ -1008,11 +975,11 @@ def upsert_concept_values(
     # ── Delete existing data for this period before inserting fresh ───────
     # Avoids duplicate-key errors when the same fiscal period was previously
     # stored with a slightly different end_date (e.g. Q3 vs Q2 reclassification
-    # of the same June 27 period).  The unique index is on {company_cik,
+    # of the same June 27 period).  The unique index is on {cik,
     # concept_id, fiscal_year, quarter}, so deleting by these keys first
     # guarantees clean insertion.
     _del_filt: dict[str, Any] = {
-        "company_cik": cik,
+        "cik": cik,
         "statement_type": statement_type,
         "reporting_period.fiscal_year": fiscal_year,
     }

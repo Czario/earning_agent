@@ -459,11 +459,11 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
     # a prior-period or YTD column).  This check queries the database for the
     # prior period's value and flags implausible changes.
     _net_interest_keys = [k for k in metrics if re.search(r'net\s+interest', k, re.I)]
-    if _net_interest_keys and state.get('company_cik'):
+    if _net_interest_keys and state.get('cik'):
         try:
             from earnings_agents.tools.normalize_data_client import _get_client, _NORMALIZE_DB
             _db = _get_client()[_NORMALIZE_DB]
-            _cik = state['company_cik']
+            _cik = state['cik']
             _period_type = state.get('detected_period_type', 'quarterly')
             _col_name = 'concept_values_quarterly' if _period_type == 'quarterly' else 'concept_values_annual'
             # Find the target_concept_ids that map to these net interest keys
@@ -479,7 +479,7 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
                 _periods = sorted(
                     _db[_col_name].distinct(
                         'reporting_period.end_date',
-                        {'company_cik': _cik, 'statement_type': 'income_statement'},
+                        {'cik': _cik, 'statement_type': 'income'},
                     ),
                     reverse=True,
                 )
@@ -501,8 +501,8 @@ def analyze_metrics_node(state: EarningsAgentState) -> EarningsAgentState:
 
                     if _prior_period:
                         _prior_vals = list(_db[_col_name].find({
-                            'company_cik': _cik,
-                            'statement_type': 'income_statement',
+                            'cik': _cik,
+                            'statement_type': 'income',
                             'concept_id': {'$in': _ni_concept_ids},
                             'reporting_period.end_date': _prior_period,
                         }))

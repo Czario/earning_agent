@@ -45,7 +45,7 @@ class EarningsAgentState(TypedDict):
     # Populated by load_company_concepts_node when EARNINGS_SAVE_TARGET=normalize_data.
     # Empty list (not None) means the node ran but the company was not found,
     # triggering the generic extraction path.
-    company_cik: NotRequired[Optional[str]]
+    cik: NotRequired[Optional[str]]
     company_industry: NotRequired[Optional[dict]]  # {sic_code, sic_description, category} from normalize_data.companies
     target_concepts: NotRequired[Optional[list]]    # concept dicts from normalized_concepts_quarterly
     # concept_id strings (subset of target_concepts) that had a value in the

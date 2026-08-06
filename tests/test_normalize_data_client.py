@@ -316,7 +316,7 @@ def test_get_statement_concepts_uses_quarterly_collection_by_default():
 
     with patch.object(ndc, "_get_client") as mock_client:
         mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
-        ndc.get_statement_concepts("000123", statement_types=["income_statement"])
+        ndc.get_statement_concepts("000123", statement_types=["income"])
 
     called_col = mock_db.__getitem__.call_args[0][0]
     assert called_col == "normalized_concepts_quarterly"
@@ -336,7 +336,7 @@ def test_get_statement_concepts_uses_annual_collection_when_specified():
     with patch.object(ndc, "_get_client") as mock_client:
         mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
         ndc.get_statement_concepts(
-            "000123", statement_types=["income_statement"], period_type="annual"
+            "000123", statement_types=["income"], period_type="annual"
         )
 
     called_col = mock_db.__getitem__.call_args[0][0]
@@ -371,7 +371,7 @@ def test_upsert_concept_values_separates_quarterly_and_annual_filters():
     assert len(ops) == 1
     state = ops[0].__getstate__()[1]
     assert state["_filter"] == {
-        "company_cik": "000123",
+        "cik": "000123",
         "concept_id": ndc.ObjectId("507f1f77bcf86cd799439011"),
         "reporting_period.fiscal_year": 2026,
         "reporting_period.quarter": 1,

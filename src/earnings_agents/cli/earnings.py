@@ -513,15 +513,43 @@ def _build_8k_state(
             f"{[u.rsplit('/', 1)[-1] for u in supplemental_urls]}"
         )
 
-    # ── Period fallback: if EDGAR reportDate couldn't be corrected ─────────
-    # (e.g. IPO company, no prior 10-Q/10-K), extract directly from EX-99.1
-    # HTML — same regex the skip guard and LLM use.
-    if not sec_report_date_str:
-        from earnings_agents.tools.edgar_client import _extract_period_from_exhibit
-        exhibit_date = _extract_period_from_exhibit(filing_url)
-        if exhibit_date:
-            sec_report_date_str = exhibit_date.isoformat()
+    # ── Period detection (primary): extract from EX-99.1 filename ──────
+    # The filename itself encodes the period end date as YYYYMMDD —
+    # e.g. abbv-20260630xexhibit991.htm → 2026-06-30.
+    # This is set by the filer and is the single most reliable source,
+    # unlike SEC reportDate (often the announcement date) or regex
+    # (which can match comparison-period dates in table HTML).
+    import re as _re
+    _fn = filing_url.rsplit("/", 1)[-1] if filing_url else ""
+    _fn_date_match = _re.search(r"(\d{4})(\d{2})(\d{2})", _fn)
+    if _fn_date_match:
+        try:
+            from datetime import date as _dt_date
+            _fn_date = _dt_date(
+                int(_fn_date_match.group(1)),
+                int(_fn_date_match.group(2)),
+                int(_fn_date_match.group(3)),
+            )
+            # Only use filename date if it differs from SEC reportDate by
+            # more than a day — a large gap means SEC gave the announcement
+            # date while the filename encodes the actual period end.
+            if sec_report_date_str:
+                try:
+                    _sec_dt = _dt_date.fromisoformat(sec_report_date_str)
+                    if abs((_fn_date - _sec_dt).days) > 1:
+                        sec_report_date_str = _fn_date.isoformat()
+                except ValueError:
+                    pass
+            else:
+                sec_report_date_str = _fn_date.isoformat()
+        except (ValueError, OverflowError):
+            pass
 
+    # ── No regex fallback — if _infer_period_end and filename both failed,
+    # leave sec_report_date_str as None.  The LLM's __period__ (read from the
+    # actual document header) will be used by upsert_concept_values instead.
+    # Regex on raw HTML is unreliable — it picks the first "Month DD, YYYY"
+    # which is often a comparison-period date in table markup.
     return {
         **_base,
         "discovered_file_url": filing_url,
@@ -821,17 +849,34 @@ def _resolve_8k_skip_guard(
                 }
 
         # 3. Determine (fiscal_year, quarter) the 8-K reports on.
-        #    PRIMARY: extract period date from the actual EX-99.1 HTML.
+        #    PRIMARY: extract from EX-99.1 filename (YYYYMMDD — filer-set).
+        #    SECONDARY: regex from EX-99.1 HTML content.
         #    FALLBACK: heuristic from nearby 10-Q/10-K filings.
         #    LAST RESORT: latest stored period from DB.
         fp = None
 
-        # ── Primary: document-based extraction (zero guesswork) ─────────
+        # ── Primary: filename-based extraction (filer-set, zero guesswork) ─
         if accession:
+            import re
+            from datetime import date
             acc_nodash = accession.replace("-", "")
             ex99_urls = _find_all_ex_99_urls(cik_int, accession, acc_nodash)
             if ex99_urls:
-                period_end_date = _extract_period_from_exhibit(ex99_urls[0])
+                # 1st: extract YYYYMMDD from the EX-99.1 filename itself
+                # e.g. abbv-20260630xexhibit991.htm → 2026-06-30
+                _ex_fn = ex99_urls[0].rsplit("/", 1)[-1]
+                _ex_fn_match = re.search(r"(\d{4})(\d{2})(\d{2})", _ex_fn)
+                if _ex_fn_match:
+                    try:
+                        period_end_date = date.fromisoformat(
+                            f"{_ex_fn_match.group(1)}-{_ex_fn_match.group(2)}-{_ex_fn_match.group(3)}"
+                        )
+                    except ValueError:
+                        period_end_date = None
+                else:
+                    # 2nd: fall back to regex on HTML content
+                    period_end_date = _extract_period_from_exhibit(ex99_urls[0])
+
                 if period_end_date is not None:
                     fy, q = compute_fiscal_period(
                         period_end_date, fy_end_month, ""
@@ -843,7 +888,8 @@ def _resolve_8k_skip_guard(
                     )
                     fp = (fy, q if pt == "quarterly" else None, pt)
                     _logger.debug(
-                        "_resolve_8k_skip_guard: exhibit date %s → FY%d %s",
+                        "_resolve_8k_skip_guard: %s %s → FY%d %s",
+                        "filename date" if _ex_fn_match else "exhibit date",
                         period_end_date,
                         fy,
                         f"Q{q}" if pt == "quarterly" else "(annual)",
@@ -929,8 +975,8 @@ def _accession_already_stored(cik: str, accession: str, sec_report_date: str | N
         db = _get_client()[_NORMALIZE_DB]
         for col_name in ("concept_values_quarterly", "concept_values_annual"):
             filt: dict[str, Any] = {
-                "company_cik": cik,
-                "statement_type": "income_statement",
+                "cik": cik,
+                "statement_type": "income",
                 "accession_number": accession,
             }
             if sec_report_date:

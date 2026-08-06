@@ -111,7 +111,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
 
     concept_metrics: dict = state.get("concept_metrics") or {}
     derived_ids: set[str] = set(state.get("derived_concept_ids") or [])
-    cik: str | None = state.get("company_cik")  # type: ignore[assignment]
+    cik: str | None = state.get("cik")  # type: ignore[assignment]
     fy_end_month: int | None = state.get("fiscal_year_end_month")  # type: ignore[assignment]
     fy_end_code: str = str(state.get("fiscal_year_end_code") or "1231")
     period_str: str = str(metrics.get("__period__") or "")

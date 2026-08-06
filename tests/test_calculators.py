@@ -17,7 +17,7 @@ def _c(cid: str, label: str) -> dict:
         "label": label,
         "concept": f"us-gaap:{label.replace(' ', '')}",
         "path": "0",
-        "statement_type": "income_statement",
+        "statement_type": "income",
     }
 
 

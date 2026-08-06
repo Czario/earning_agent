@@ -85,33 +85,40 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
          state as the CLI's SEC EDGAR path.
     """
     ticker = (payload.get("ticker") or "").upper()
-    cik = payload.get("cik") or ""
-    accession = payload.get("accession_number") or ""
-    label = payload.get("company_name") or ticker or cik or "?"
 
     # Create publisher immediately so every exit path can report status.
     redis_url = os.getenv("REDIS_URL", REDIS_URL)
-    pub = WorkerProgressPublisher(redis_url, ticker or cik, payload.get("load_request_id"))
+    pub = WorkerProgressPublisher(redis_url, ticker, payload.get("load_request_id"))
 
     # ── 1. Validate message ───────────────────────────────────────────────
-    if not cik:
-        pub.publish("skip", "message missing cik — cannot look up filing")
+    if not ticker:
+        pub.publish("skip", "message missing ticker — cannot look up filing")
         pub.close()
-        logger.warning("8-K message for %s missing cik — skipping", label)
+        logger.warning("8-K message missing ticker — skipping")
         return True
 
-    # ── 2. Build state via shared function (identical to CLI path) ──────────
-    # _build_8k_state handles EVERYTHING: existing-data check, skip guard,
-    # EDGAR URL resolution, session_number threading, deferred replace,
-    # _extract_period_from_exhibit fallback — exactly the same as
-    # _build_initial_state on the CLI.  No pre-resolution needed.
-    from earnings_agents.cli.earnings import _build_8k_state
+    # ── 2. Resolve CIK + company name from DB (mirrors CLI path) ────────
+    from earnings_agents.tools.normalize_data_client import get_company_by_ticker
 
-    state = _build_8k_state(
-        ticker=ticker,
-        company_name=label,
-        cik=cik,
-        accession=accession or None,
+    company = get_company_by_ticker(ticker)
+    if company is None:
+        pub.publish("skip", f"ticker {ticker} not found in normalize_data — skipping")
+        pub.close()
+        logger.warning("8-K message for %s — company not in DB, skipping", ticker)
+        return True
+
+    cik = company["cik"]
+    company_name = company.get("name", ticker)
+
+    # ── 3. Build state via shared function (identical to CLI path) ──────────
+    from earnings_agents.cli.earnings import _build_initial_state
+
+    state = _build_initial_state(
+        {
+            "ticker": ticker,
+            "company_name": company_name,
+            "cik": cik,
+        },
     )
 
     # Store corrected period on payload so the main loop can use it for
@@ -134,10 +141,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         pub.close()
         return True
 
-    # Inject worker-only fields (not in the shared state builder).
-    state["company_cik"] = cik or None
-
-    logger.info("Processing 8-K for %s  url=%s  period=%s", label, state.get("discovered_file_url"), state.get("sec_report_date"))
+    logger.info("Processing 8-K for %s  url=%s  period=%s", ticker, state.get("discovered_file_url"), state.get("sec_report_date"))
 
     # ── Set up progress callbacks using the shared worker_progress module ────────
     # make_node_callback fires on both start (▶ stage) and end (step summary),
@@ -145,13 +149,13 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     # make_call_callback forwards every LLM/DB/HTTP call event so the UI shows
     # the same intermediate lines the CLI prints.
     llm_call_count: list[int] = [0]
-    set_node_callback(make_node_callback(pub, ticker or cik))
-    set_call_callback(make_call_callback(pub, ticker or cik, llm_call_count))
+    set_node_callback(make_node_callback(pub, ticker))
+    set_call_callback(make_call_callback(pub, ticker, llm_call_count))
     set_detail_callback(None)   # spinner text — not needed in worker
 
     t0 = perf_counter()
     try:
-        with WorkerHeartbeat(pub, ticker or cik, interval_s=60):
+        with WorkerHeartbeat(pub, ticker, interval_s=60):
             final = graph.invoke(state)
     except BaseException as exc:
         # Catches Exception (LLM errors etc.), KeyboardInterrupt, and SystemExit
@@ -194,7 +198,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         n = len(final.get("concept_metrics") or {})
         period_out = final.get("sec_report_date") or ""
         year = period_out[:4] if period_out else "?"
-        summary = f"✓ {ticker or cik}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
+        summary = f"✓ {ticker}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
         pub.publish("summary", summary, kind="summary")
         # Build a human period label (FY2026 Q1 / FY2026 Annual) by reading
         # fiscal_year + quarter that normalize_data already stored — no
@@ -223,17 +227,17 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
             payload["_sec_period_label"] = _period_label
         logger.info(
             "8-K saved for %s — period=%s  concepts=%d  llm_calls=%d  elapsed=%s",
-            label, final.get("sec_report_date"), n, llm_call_count[0], elapsed_str,
+            ticker, final.get("sec_report_date"), n, llm_call_count[0], elapsed_str,
         )
         return True
 
     if status in ("already_stored", "skipped"):
-        logger.info("8-K skipped for %s — %s", label, status)
+        logger.info("8-K skipped for %s — %s", ticker, status)
         return True
 
     logger.warning(
         "8-K pipeline ended with status=%s  error=%s  for %s",
-        status, final.get("error"), label,
+        status, final.get("error"), ticker,
     )
     return False
 

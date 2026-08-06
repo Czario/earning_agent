@@ -47,7 +47,7 @@ def _base_state(fixture: dict[str, Any]) -> dict[str, Any]:
             "_id": f"c_{i}",
             "concept": f"us-gaap:Concept{i}",
             "label": key,
-            "statement_type": "income_statement",
+            "statement_type": "income",
         }
         for i, key in enumerate(fixture["expected"])
     ]
@@ -69,7 +69,7 @@ def _base_state(fixture: dict[str, Any]) -> dict[str, Any]:
         "identity_warnings": None,
         "cleanup_removed": None,
         "findings": None,
-        "company_cik": None,
+        "cik": None,
         "concept_metrics": None,
         "fiscal_year_end_month": None,
         "fiscal_year_end_code": None,
