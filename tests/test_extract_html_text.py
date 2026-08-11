@@ -118,6 +118,85 @@ class TestClassifyTable:
     def test_empty_table_returns_other(self):
         assert _classify_table("", "") == "other"
 
+    # --- RKLB Q2'26 regression: non-GAAP prose residue must not poison GAAP statements ---
+    # RKLB's press release places a "Use of Non-GAAP Financial Measures" definitions
+    # section (ending with an "Adjusted EBITDA" subheading) directly before the GAAP
+    # statements.  The context window crosses that section boundary, so the whole-window
+    # contamination check classified IS/BS/CF as non_gaap and the pipeline extracted
+    # nothing.  The NEAREST heading line — not the whole window — must decide.
+
+    _RKLB_IS_CTX = (
+        "Rocket Lab Investor Relations Contact\n"
+        "Patrick Vorenkamp\n"
+        "About Rocket Lab\n"
+        "Forward Looking Statements\n"
+        "Adjusted EBITDA\n"
+        "ROCKET LAB CORPORATION AND SUBSIDIARIES\n"
+        "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS\n"
+        "FOR THE THREE AND SIX MONTHS ENDED JUNE 30, 2026 AND 2025"
+    )
+    _RKLB_IS_BODY = (
+        "Three Months Ended June 30, 2026 2025 Revenues: Product revenues $ 181,347 "
+        "$ 92,725 Service revenues 52,719 51,773 Total revenues 234,066 144,498 "
+        "Cost of revenues 149,490 98,110 Gross profit 84,576 46,388 "
+        "Operating loss (57,514) (59,639) Net loss $ (49,258) $ (66,414)"
+    )
+
+    def test_gaap_is_with_nongaap_prose_residue_in_context(self):
+        assert _classify_table(self._RKLB_IS_BODY, self._RKLB_IS_CTX) == "income_statement"
+
+    def test_gaap_bs_with_nongaap_prose_residue_in_context(self):
+        # Balance sheet heading nearest the table; IS heading + "Adjusted EBITDA"
+        # further back in the window — nearest heading (BS) must win.
+        ctx = (
+            "Adjusted EBITDA\n"
+            "ROCKET LAB CORPORATION AND SUBSIDIARIES\n"
+            "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS\n"
+            "FOR THE THREE AND SIX MONTHS ENDED JUNE 30, 2026 AND 2025\n"
+            "ROCKET LAB CORPORATION AND SUBSIDIARIES\n"
+            "CONDENSED CONSOLIDATED BALANCE SHEETS\n"
+            "AS OF JUNE 30, 2026 AND DECEMBER 31, 2025"
+        )
+        body = (
+            "June 30, 2026 December 31, 2025 Assets Current assets: "
+            "Cash and cash equivalents $ 2,129,485 $ 828,660 Total assets 4,187,374"
+        )
+        assert _classify_table(body, ctx) == "balance_sheet"
+
+    def test_gaap_cf_with_nongaap_prose_residue_in_context(self):
+        ctx = (
+            "Adjusted EBITDA\n"
+            "ROCKET LAB CORPORATION AND SUBSIDIARIES\n"
+            "CONDENSED CONSOLIDATED BALANCE SHEETS\n"
+            "AS OF JUNE 30, 2026 AND DECEMBER 31, 2025\n"
+            "ROCKET LAB CORPORATION AND SUBSIDIARIES\n"
+            "CONDENSED CONSOLIDATED STATEMENTS OF CASH FLOWS\n"
+            "FOR THE SIX MONTHS ENDED JUNE 30, 2026 AND 2025"
+        )
+        body = (
+            "For the Six Months Ended June 30, 2026 2025 CASH FLOWS FROM OPERATING "
+            "ACTIVITIES: Net loss $ (94,280) $ (127,030) Depreciation and amortization "
+            "35,933 Net cash used in operating activities (134,407) (77,467)"
+        )
+        assert _classify_table(body, ctx) == "cash_flow"
+
+    def test_nongaap_recon_with_own_nongaap_heading_still_dropped(self):
+        # The genuine non-GAAP reconciliation table: its NEAREST heading says
+        # non-GAAP, so it must stay excluded even with a stale GAAP heading above.
+        ctx = (
+            "CONDENSED CONSOLIDATED STATEMENTS OF CASH FLOWS\n"
+            "FOR THE SIX MONTHS ENDED JUNE 30, 2026 AND 2025\n"
+            "ROCKET LAB CORPORATION AND SUBSIDIARIES\n"
+            "RECONCILIATION OF NON-GAAP FINANCIAL MEASURES\n"
+            "FOR THE THREE AND SIX MONTHS ENDED JUNE 30, 2026 AND 2025"
+        )
+        body = (
+            "Three Months Ended June 30, 2026 2025 NET LOSS $ (49,258) $ (66,414) "
+            "Depreciation 10,172 5,882 Stock-based compensation expense 19,561 "
+            "ADJUSTED EBITDA $ (8,833) $ (27,584)"
+        )
+        assert _classify_table(body, ctx) == "non_gaap"
+
 
 # ── segment table classification ────────────────────────────────────────────
 

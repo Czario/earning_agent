@@ -315,6 +315,36 @@ def _get_table_context(table, max_chars: int = 400) -> str:
     return "\n".join(reversed(parts))
 
 
+def _nearest_heading(context_text: str) -> str:
+    """Return the context line that captions THIS table.
+
+    ``_get_table_context`` assembles preceding text in document order, so the
+    heading describing the table sits near the END of the context — but the
+    window routinely crosses section boundaries, so earlier lines may belong
+    to a different section entirely (e.g. a "Use of Non-GAAP Financial
+    Measures" block whose trailing "Adjusted EBITDA" subheading lands directly
+    before the GAAP statements — RKLB Q2'26 — or a "STATEMENTS OF CASH FLOWS"
+    heading that belongs to a table already processed).
+
+    Walk lines from nearest to farthest and return the FIRST one matching a
+    statement/heading pattern (GAAP statement, non-GAAP, or segment) — that
+    line is the caption that determines contamination.  When no line matches
+    (generic prose context), fall back to the last two lines joined so
+    multi-line headings still match via ``\\s+``.
+    """
+    lines = [l.strip() for l in context_text.strip().splitlines() if l.strip()]
+    for line in reversed(lines):
+        if (
+            _INCOME_STMT_TABLE_RX.search(line)
+            or _BALANCE_SHEET_TABLE_RX.search(line)
+            or _CASH_FLOW_TABLE_RX.search(line)
+            or _NON_GAAP_TABLE_RX.search(line)
+            or _SEGMENT_TABLE_RX.search(line)
+        ):
+            return line
+    return "\n".join(lines[-2:]) if lines else ""
+
+
 def _classify_table(table_text: str, context_text: str) -> str:
     """Classify a financial table using fast keyword regex.
 
@@ -375,6 +405,15 @@ def _classify_table(table_text: str, context_text: str) -> str:
 
     # ── 2. Full-probe non-GAAP ────────────────────────────────────────────────
     full_probe = context_text + " " + table_text
+    # The heading that captions THIS table, extracted by line-proximity from
+    # the context window.  Used for BOTH non-GAAP contamination checks and the
+    # GAAP statement checks below: the raw context tail crosses section
+    # boundaries (headings of already-processed tables linger as bare text
+    # after their <table> is decomposed), so classifying on the whole window
+    # both (a) poisons GAAP statements with non-GAAP keywords from unrelated
+    # prose sections, and (b) mislabels later tables with stale statement
+    # headings (RKLB Q2'26 regression).
+    near_context = _nearest_heading(context_text)
     if _NON_GAAP_TABLE_RX.search(full_probe):
         # Guard: many bank filing tables contain non-GAAP footnotes or a handful
         # of "Adjusted" metric rows inside an otherwise GAAP statement table
@@ -382,22 +421,27 @@ def _classify_table(table_text: str, context_text: str) -> str:
         # table).  The heading / opening context determines the primary type.
         #
         # A table is treated as GAAP (not non-GAAP) when:
-        #   (a) The context (preceding heading) identifies it as IS/BS/CF AND
-        #       the context itself does NOT contain non-GAAP keywords, OR
+        #   (a) The NEAR context (heading lines immediately preceding the
+        #       table) identifies it as IS/BS/CF AND that near context is
+        #       non-GAAP-free.  Proximity matters: the whole 400-char context
+        #       window routinely crosses section boundaries, so a non-GAAP
+        #       keyword from an earlier prose section ("Adjusted EBITDA"
+        #       definition block) must not poison a GAAP statement whose own
+        #       heading sits nearest the table (RKLB Q2'26 regression).
         #   (b) The TABLE'S OWN opening text (first 600 chars) identifies it
         #       as IS/BS/CF AND that opening section is non-GAAP-free — this
         #       catches tables whose headings are inside the table body (common
         #       in press releases where "Statement of Income Highlights" is a
         #       data row rather than a preceding DOM element), OR
         #   (c) Segment-table guard (original logic): full body matches a
-        #       segment pattern AND context is non-GAAP-free.
-        context_ngaap = _NON_GAAP_TABLE_RX.search(context_text)
+        #       segment pattern AND near context is non-GAAP-free.
+        context_ngaap = _NON_GAAP_TABLE_RX.search(near_context)
         opening = table_text[:600]
         is_gaap_by_context = (
             not context_ngaap
-            and (_INCOME_STMT_TABLE_RX.search(context_text)
-                 or _BALANCE_SHEET_TABLE_RX.search(context_text)
-                 or _CASH_FLOW_TABLE_RX.search(context_text))
+            and (_INCOME_STMT_TABLE_RX.search(near_context)
+                 or _BALANCE_SHEET_TABLE_RX.search(near_context)
+                 or _CASH_FLOW_TABLE_RX.search(near_context))
         )
         is_gaap_by_opening = (
             not context_text.strip()
@@ -417,7 +461,10 @@ def _classify_table(table_text: str, context_text: str) -> str:
         )
 
     # ── 3. Short-probe GAAP statement checks ─────────────────────────────────
-    short_probe = context_text[-600:] + " " + table_text[:600]
+    # Probe the NEAR heading (not the whole context tail — stale statement
+    # headings from already-processed tables must not classify this one) plus
+    # the table's own opening rows.
+    short_probe = near_context + " " + table_text[:600]
     if _INCOME_STMT_TABLE_RX.search(short_probe):
         return "income_statement"
     if _CASH_FLOW_TABLE_RX.search(short_probe):
