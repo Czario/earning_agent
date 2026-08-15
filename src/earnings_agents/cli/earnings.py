@@ -124,15 +124,11 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
 
     if node_name == "mongodb_save_node":
         s = state.get("status", "?")
-        ticker_val = state.get("ticker", "?")
-        period = state.get("sec_report_date") or ""
-        year = period[:4] if period else "?"
-        n_concepts = len(state.get("concept_metrics") or {})
-        if s == "saved":
-            return f"  [save]           ✓  {ticker_val}_{year}_latest  ({n_concepts} concepts upserted)"
         if s == "failed":
             return f"  [save]           ✗  {(state.get('error') or 'failed')[:70]}"
-        return f"  [save]           {s}"
+        # Success is already fully reported by the in-node [save]/[db] lines —
+        # no extra summary line.
+        return None
 
     if node_name == "agent_document_pipeline_node":
         metrics = state.get("metrics") or {}

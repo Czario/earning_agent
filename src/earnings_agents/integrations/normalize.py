@@ -1055,9 +1055,10 @@ def upsert_concept_values(
 
     from earnings_agents.hooks import report_call
     period_label = f"FY{fiscal_year} Q{quarter}" if period_type == "quarterly" else f"FY{fiscal_year}"
-    report_call(f"  [db]  upsert {len(ops)} concept(s) → {collection_name}  {period_label}")
     collection.bulk_write(ops, ordered=False)
-    report_call(f"  [db]  ✓ upserted {len(ops)} concept(s)")
+    report_call(
+        f"  [db]  ✓ upserted {len(ops)} concept(s) → {collection_name}  {period_label}"
+    )
     if period_type == "quarterly":
         logger.info(
             "upsert_concept_values: %d concept(s) → %s  CIK %s FY%d Q%d",

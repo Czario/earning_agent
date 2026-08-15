@@ -192,11 +192,22 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     if final.get("sec_report_date"):
         payload["sec_report_date"] = final["sec_report_date"]
     if final.get("_pending_replace"):
-        pub.publish(
-            "progress",
-            f"re-extracting {final.get('_replace_period_label', '?')} "
-            f"— existing data will be replaced after successful save",
-        )
+        label = final.get("_replace_period_label", "?")
+        if status == "saved":
+            # The deferred replace already ran inside mongodb_save (delete +
+            # upsert) — report it in the past tense so it doesn't read like a
+            # second save/extraction is still pending.
+            pub.publish(
+                "progress",
+                f"replaced {label} — existing data replaced "
+                f"(deferred delete + upsert)",
+            )
+        else:
+            pub.publish(
+                "progress",
+                f"{label} not saved — existing data preserved "
+                f"(replace deferred to a successful save)",
+            )
 
     if status == "saved":
         n = len(final.get("concept_metrics") or {})

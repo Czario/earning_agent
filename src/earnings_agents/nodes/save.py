@@ -65,6 +65,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if concept_metrics and cik and fy_end_month and (period_str or sec_rd):
         pending = state.get("_pending_replace") or {}
+        replace_note = ""
         if pending.get("cik") and pending.get("fiscal_year"):
             from earnings_agents.integrations.normalize import delete_fiscal_period
             pd_cik = pending["cik"]
@@ -75,9 +76,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 period_label = (
                     f"FY{pd_fy} Q{pd_q}" if pd_q is not None else f"FY{pd_fy} (annual)"
                 )
-                report_call(
-                    f"  [save]  deleted {n_del} stale concept(s) for {period_label}"
-                )
+                replace_note = f"replacing {period_label} — deleted {n_del} stale; "
                 logger.info(
                     "save: deleted %d stale concept(s) for CIK %s %s",
                     n_del, pd_cik, period_label,
@@ -87,7 +86,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         n_mapped = len(concept_metrics) - len(derived_ids)
         n_derived = len(derived_ids)
         report_call(
-            f"  [save]  upserting {n_mapped} mapped + {n_derived} derived "
+            f"  [save]  {replace_note}upserting {n_mapped} mapped + {n_derived} derived "
             f"concept(s) for CIK {cik} — {period_str or sec_report_date_str or '?'}"
         )
         try:
@@ -103,7 +102,6 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 derived_concept_ids=derived_ids,
                 accession_number=state.get("accession_number"),
             )
-            report_call(f"  [save]  ✓ {n} concept value(s) upserted")
             logger.info(
                 "normalize_data: upserted %d concept value(s) for %s", n, ticker
             )
