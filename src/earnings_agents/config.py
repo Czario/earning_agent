@@ -46,53 +46,16 @@ REDIS_QUEUE_NAME: str = os.getenv("REDIS_QUEUE_NAME", "sec:filings")
 HTTP_TIMEOUT: int = 30
 
 EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "400000"))
-# Chunk size for splitting extraction text.  When 0 (default), a per-provider
-# default is selected at runtime via default_chunk_size().  Set to a positive
-# integer to override for all providers.
-CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "0"))
-CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "300"))
 
+# Multi-exhibit fetching — filings can carry several EX-99 exhibits (press
+# release, presentation, supplemental information); the income statement often
+# lives in a supplemental exhibit (e.g. BofA's 99.3).  fetch_filing concatenates
+# all text exhibits; these caps bound per-exhibit and total size.
+FETCH_EXHIBIT_MAX_CHARS: int = int(os.getenv("FETCH_EXHIBIT_MAX_CHARS", "400000"))
+FETCH_TOTAL_MAX_CHARS: int = int(os.getenv("FETCH_TOTAL_MAX_CHARS", "1200000"))
 
-def default_chunk_size(provider: str = "ollama") -> int:
-    """Return a provider-appropriate chunk size when CHUNK_SIZE is not set.
-
-    * ``groq`` — 80 000  (very fast inference; larger chunks mean fewer calls)
-    * ``deepseek`` — 25 000  (~6K tokens; small enough for fast parallel chunks)
-    * ``gemini`` — 25 000  (same profile as deepseek)
-    * ``ollama`` — 6 000    (small local models, limited context window)
-
-    Cloud providers benefit from smaller chunks because multiple chunks run in
-    parallel (set ``OLLAMA_NUM_PARALLEL`` > 1), giving lower wall-clock time
-    and per-chunk scale detection that handles mixed-scale filings correctly.
-    """
-    p = provider.strip().lower()
-    if p == "groq":
-        return 80000
-    if p in ("deepseek", "gemini"):
-        return 25000
-    return 6000  # ollama / fallback
-
-# Maximum concurrent Ollama requests across all parallel company workers.
-# Local Ollama is single-threaded, so >1 here only helps when using a
-# remote / multi-GPU Ollama instance. Default: 1 (serialize LLM calls).
-OLLAMA_CONCURRENCY: int = int(os.getenv("OLLAMA_CONCURRENCY", "1"))
-
-
-def default_num_parallel(provider: str = "ollama") -> int:
-    """Return a provider-appropriate chunk parallelism when not set.
-
-    Cloud providers handle their own rate limiting and benefit from concurrent
-    chunk processing.  Local Ollama is single-threaded so parallelism only helps
-    with a remote/multi-GPU instance.
-    """
-    p = provider.strip().lower()
-    if p in ("groq", "deepseek", "gemini"):
-        return 3
-    return 1  # ollama / fallback
-
-# When True (default), refuse to upsert a document whose accounting identity
-# checks failed (e.g. Gross margin ≠ Revenue − COGS). When False, the document
-# is saved with an "identity_warnings" field listing the failures.
+# When True (default), refuse to upsert a document that has unresolved
+# high-severity findings. When False, the document is saved regardless.
 STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "1").strip().lower() not in {
     "0", "false", "no", "off", ""
 }
@@ -106,29 +69,11 @@ LLM_CACHE_ENABLED: bool = os.getenv("LLM_CACHE", "0").strip().lower() in {
 }
 LLM_CACHE_DIR: str = os.getenv("LLM_CACHE_DIR", ".llm_cache")
 
-# When True (default), run an additional LLM cleanup pass over the extracted
-# metrics before saving. The cleanup is constrained: it can ONLY drop keys
-# (duplicates, obvious scale errors). It cannot invent or mutate values —
-# any such attempt is rejected by deterministic guardrails.
-CLEANUP_METRICS: bool = os.getenv("CLEANUP_METRICS", "1").strip().lower() not in {
-    "0", "false", "no", "off", ""
-}
-
-# When True, the extraction prompt asks the LLM to echo a verbatim source
-# snippet for every metric (the ``__sources__`` field) which the
-# ``check_source_grounding`` checker uses to catch hallucinated values.
-# This roughly doubles the LLM output size (and generation time), so it is
-# OFF by default for speed. Enable (SOURCE_GROUNDING=1) for accuracy-critical
-# runs where anti-hallucination verification matters more than latency.
-SOURCE_GROUNDING: bool = os.getenv("SOURCE_GROUNDING", "0").strip().lower() in {
-    "1", "true", "yes", "on"
-}
-
-# Number of most-recent stored periods used to prune the extraction prompt.
-# A concept that had NO value in any of the last N periods is dropped from the
-# LLM prompt (it stays in target_concepts for mapping/derivation).  This filters
-# out dimensional/segment [Member] concepts and stale line items that bloat the
-# prompt.  Set to 0 to disable pruning entirely.
+# Window (in stored periods) for the HARD extraction-target filter:
+# a concept is extracted only if it had a value in any of the last N periods
+# (quarterly filings → last N quarterly periods, annual → last N annual
+# periods).  Concepts without a recent value never reach the agent, mapping,
+# derivation, or save.
 PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
 
 # Maximum extraction passes in the agentic loop (initial pass + retries).

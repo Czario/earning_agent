@@ -1,7 +1,7 @@
 """Unit tests for normalize_data_client helpers (no DB required)."""
 import pytest
 from unittest.mock import MagicMock, patch
-from earnings_agents.tools.normalize_data_client import (
+from earnings_agents.integrations.normalize import (
     _clean_label,
     _extract_member_tag,
     compute_fiscal_period,
@@ -164,147 +164,184 @@ def test_parse_period_start_date(period_str, end_date, expected_start):
     )
 
 
-# ── _infer_period_type (load_company_concepts_node helper) ───────────────────
+# ── load_company_concepts_node: recent-window query-time filter ──────────────
 
-from earnings_agents.nodes.load_company_concepts_node import _infer_period_type  # noqa: E402
-
-
-@pytest.mark.parametrize("sec_report_date, fy_end_month, expected", [
-    # Report date month matches FY end month → annual
-    ("2025-12-31", 12, "annual"),
-    ("2025-06-30", 6,  "annual"),
-    ("2026-01-31", 1,  "annual"),
-    # Mismatch → quarterly
-    ("2025-09-30", 12, "quarterly"),
-    ("2025-03-31", 6,  "quarterly"),
-    # Missing inputs → quarterly
-    (None, 12,         "quarterly"),
-    ("2025-12-31", None, "quarterly"),
-    (None, None,       "quarterly"),
-    # Malformed date → quarterly
-    ("not-a-date", 12, "quarterly"),
-])
-def test_infer_period_type(sec_report_date, fy_end_month, expected):
-    assert _infer_period_type(sec_report_date, fy_end_month) == expected
-
-
-@pytest.mark.parametrize("sec_report_date, fy_end_month, fy_end_code, expected", [
-    # 52/53-week filer (FYE "nearest Jan 31"): year-end drifts into early Feb.
-    ("2026-02-03", 1, "0131", "annual"),
-    # …and into late Jan of the prior calendar month boundary.
-    ("2026-01-28", 1, "0131", "annual"),
-    # 52/53-week filer (FYE "nearest Apr 30"): drift into early May.
-    ("2026-05-02", 4, "0430", "annual"),
-    # Drift just past the 7-day tolerance is NOT annual.
-    ("2026-02-08", 1, "0131", "quarterly"),
-    # A genuine quarter-end (~3 months away) is never caught by proximity.
-    ("2025-10-31", 1, "0131", "quarterly"),
-    # Without a day code, only month-equality applies → drift stays quarterly.
-    ("2026-02-03", 1, None, "quarterly"),
-])
-def test_infer_period_type_52_53_week_drift(
-    sec_report_date, fy_end_month, fy_end_code, expected
-):
-    assert _infer_period_type(sec_report_date, fy_end_month, fy_end_code) == expected
-
-
-# ── load_company_concepts_node period-type signal combination ────────────────
-
-def test_load_concepts_cadence_overrides_wrong_date_signal():
-    """Cadence (last stored = Q3 → annual) fixes a mis-dated annual release.
-
-    Mirrors the Oracle failure: the 8-K announcement date (June 10, one month
-    past the May-31 fiscal year-end) makes the date signal say "quarterly", but
-    the last stored period is Q3, so the next release must be annual.
-    """
-    from earnings_agents.nodes import load_company_concepts_node as node
-
-    company = {"cik": "0001341439", "fiscal_year_end_month": 5,
-               "fiscal_year_end_code": "0531", "name": "ORACLE CORP"}
-    state = {"ticker": "ORCL", "sec_report_date": "2026-06-10"}
-
-    with (
-        patch.object(node, "get_company_by_ticker", return_value=company),
-        patch.object(node, "get_next_period_type", return_value="annual"),
-        patch.object(node, "get_statement_concepts", return_value=[]),
-    ):
-        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
-
-    assert result["detected_period_type"] == "annual"
-
-
-def test_load_concepts_date_signal_catches_db_gap():
-    """When a quarter was skipped (cadence says quarterly) but the date lands on
-    the fiscal year-end, the date signal still classifies the release as annual."""
-    from earnings_agents.nodes import load_company_concepts_node as node
+def test_load_concepts_uses_detected_period_type_from_state():
+    """The node does NOT decide the period — it consumes ``detected_period_type``
+    set by the period agent (detect_period_node)."""
+    from earnings_agents.nodes import concepts as node
 
     company = {"cik": "000123", "fiscal_year_end_month": 12,
                "fiscal_year_end_code": "1231", "name": "Example Co"}
-    state = {"ticker": "EXMP", "sec_report_date": "2025-12-31"}
+    state = {"ticker": "EXMP", "sec_report_date": "2025-12-31",
+             "detected_period_type": "annual"}
 
     with (
         patch.object(node, "get_company_by_ticker", return_value=company),
-        # Cadence thinks the next release is a quarter (e.g. last stored was Q1).
-        patch.object(node, "get_next_period_type", return_value="quarterly"),
-        patch.object(node, "get_statement_concepts", return_value=[]),
+        patch.object(node, "get_recently_valued_concept_ids", return_value={"x"}),
+        patch.object(node, "get_statement_concepts", return_value=[]) as concepts_mock,
     ):
         result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
 
+    assert concepts_mock.call_args.kwargs["period_type"] == "annual"
     assert result["detected_period_type"] == "annual"
 
 
-def test_load_concepts_quarterly_when_both_signals_agree():
-    """A genuine mid-year quarter stays quarterly when neither signal says annual."""
-    from earnings_agents.nodes import load_company_concepts_node as node
+def _concepts(*ids):
+    return [{"_id": i, "concept": f"us-gaap:C{i}", "label": f"Label {i}",
+             "path": "001", "statement_type": "income"} for i in ids]
 
-    company = {"cik": "000123", "fiscal_year_end_month": 12,
-               "fiscal_year_end_code": "1231", "name": "Example Co"}
-    state = {"ticker": "EXMP", "sec_report_date": "2025-09-30"}
 
+def _company():
+    return {"cik": "000123", "fiscal_year_end_month": 12,
+            "fiscal_year_end_code": "1231", "name": "Example Co"}
+
+
+def test_load_concepts_queries_only_recently_valued_concepts():
+    """The recent window is computed FIRST and passed as a query-level
+    ``concept_ids`` filter — non-recent concepts are never even loaded."""
+    from earnings_agents.nodes import concepts as node
+
+    state = {"ticker": "EXMP", "sec_report_date": "2026-07-26",
+             "detected_period_type": "quarterly"}
     with (
-        patch.object(node, "get_company_by_ticker", return_value=company),
-        patch.object(node, "get_next_period_type", return_value="quarterly"),
-        patch.object(node, "get_statement_concepts", return_value=[]),
+        patch.object(node, "get_company_by_ticker", return_value=_company()),
+        patch.object(node, "get_recently_valued_concept_ids",
+                     return_value={"b"}) as recent_mock,
+        patch.object(node, "get_statement_concepts",
+                     return_value=_concepts("b")) as concepts_mock,
     ):
         result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
 
-    assert result["detected_period_type"] == "quarterly"
+    # The concept query itself is restricted to the recent window.
+    assert concepts_mock.call_args.kwargs["concept_ids"] == ["b"]
+    assert [c["_id"] for c in result["target_concepts"]] == ["b"]
+    # The window must be scoped to the detected period type.
+    assert recent_mock.call_args.kwargs["period_type"] == "quarterly"
+    assert recent_mock.call_args.kwargs["n_periods"] == 3
 
 
-def test_load_concepts_after_q4_record_is_next_fy_q1_quarterly():
-    """CRWD-style: last stored Q4 (=annual, year closed) + new FY's Q1 filing.
+def test_load_concepts_annual_queries_annual_collection():
+    from earnings_agents.nodes import concepts as node
 
-    The new filing (Q1 of the next fiscal year) must be detected as quarterly,
-    NOT annual — a Q4 record is the closed year, so the next release is Q1.
-    Exercises the REAL cadence (only get_latest_period is mocked).
-    """
-    from datetime import datetime, timezone
-    from earnings_agents.nodes import load_company_concepts_node as node
-    from earnings_agents.tools import normalize_data_client as ndc
+    state = {"ticker": "EXMP", "sec_report_date": "2026-07-25",
+             "detected_period_type": "annual"}
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=_company()),
+        patch.object(node, "get_recently_valued_concept_ids",
+                     return_value={"a"}) as recent_mock,
+        patch.object(node, "get_statement_concepts", return_value=_concepts("a")),
+    ):
+        node.load_company_concepts_node(state)  # type: ignore[arg-type]
 
-    company = {"cik": "0001535527", "fiscal_year_end_month": 1,
-               "fiscal_year_end_code": "0131", "name": "CROWDSTRIKE HOLDINGS, INC."}
-    latest = {
-        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 4,
-        "end_date": datetime(2026, 1, 31, tzinfo=timezone.utc),
+    assert recent_mock.call_args.kwargs["period_type"] == "annual"
+
+
+def test_load_concepts_skips_when_no_concept_valued_recently():
+    """Empty recent set → skip BEFORE any concept loading (no full-list fallback)."""
+    from earnings_agents.nodes import concepts as node
+
+    state = {"ticker": "EXMP", "sec_report_date": "2026-07-26",
+             "detected_period_type": "quarterly"}
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=_company()),
+        patch.object(node, "get_recently_valued_concept_ids", return_value=set()),
+        patch.object(node, "get_statement_concepts") as concepts_mock,
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["status"] == "skipped"
+    assert "nothing to extract" in result["error"]
+    assert result["target_concepts"] == []
+    concepts_mock.assert_not_called()
+
+
+def test_load_concepts_skips_when_recent_lookup_fails():
+    from earnings_agents.nodes import concepts as node
+
+    state = {"ticker": "EXMP", "sec_report_date": "2026-07-26",
+             "detected_period_type": "quarterly"}
+    with (
+        patch.object(node, "get_company_by_ticker", return_value=_company()),
+        patch.object(node, "get_recently_valued_concept_ids",
+                     side_effect=Exception("db down")),
+        patch.object(node, "get_statement_concepts") as concepts_mock,
+    ):
+        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
+
+    assert result["status"] == "skipped"
+    assert "Recent-value lookup failed" in result["error"]
+    concepts_mock.assert_not_called()
+
+
+# ── check_period_node (post-detection existence check) ───────────────────────
+
+from earnings_agents.nodes.check import check_period_node  # noqa: E402
+
+
+def _check_state(**over):
+    base = {
+        "ticker": "AMAT", "company_name": "Applied Materials Inc",
+        "cik": "0000006951", "fiscal_year_end_month": 10,
+        "detected_period_type": "quarterly",
+        "sec_report_date": "2026-07-26",
+        "period_label": "Three Months Ended July 26, 2026",
+        "accession_number": None,
     }
-    state = {"ticker": "CRWD", "sec_report_date": "2026-06-03"}
+    base.update(over)
+    return base
 
-    with (
-        patch.object(node, "get_company_by_ticker", return_value=company),
-        patch.object(ndc, "get_latest_period", return_value=latest),
-        patch.object(node, "get_statement_concepts", return_value=[]),
-    ):
-        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
 
-    assert result["detected_period_type"] == "quarterly"
+def test_check_period_schedules_deferred_replace_when_period_exists():
+    with patch("earnings_agents.nodes.check.fiscal_period_exists", return_value=True):
+        out = check_period_node(_check_state())
+    assert out["_pending_replace"] == {
+        "cik": "0000006951", "fiscal_year": 2026, "quarter": 3,
+    }
+    assert out["_replace_period_label"] == "FY2026 Q3"
+
+
+def test_check_period_annual_uses_quarter_none():
+    state = _check_state(
+        detected_period_type="annual",
+        sec_report_date="2026-07-25",
+        period_label="Fiscal Year Ended July 25, 2026",
+        fiscal_year_end_month=7,
+    )
+    with patch("earnings_agents.nodes.check.fiscal_period_exists", return_value=True):
+        out = check_period_node(state)
+    assert out["_pending_replace"]["quarter"] is None
+    assert out["_replace_period_label"] == "FY2026 (annual)"
+
+
+def test_check_period_annual_never_checks_quarterly_q4():
+    """Annual processing must not look at (or delete) a quarterly Q4 record for
+    the same fiscal year — the exact-period check is annual-only (quarter None)."""
+    state = _check_state(
+        detected_period_type="annual",
+        sec_report_date="2026-07-25",
+        period_label="Fiscal Year Ended July 25, 2026",
+        fiscal_year_end_month=7,
+    )
+    with patch("earnings_agents.nodes.check.fiscal_period_exists", return_value=False) as mock:
+        out = check_period_node(state)
+    # The existence check must be scoped to the annual collection (quarter=None)
+    assert mock.call_args.args[2] is None
+    assert out.get("_pending_replace") is None
+
+
+def test_check_period_proceeds_for_new_period():
+    with patch("earnings_agents.nodes.check.fiscal_period_exists", return_value=False):
+        out = check_period_node(_check_state())
+    assert out.get("_pending_replace") is None
+    assert out.get("status") != "failed"
 
 
 # ── get_statement_concepts uses correct collection ───────────────────────────
 
 def test_get_statement_concepts_uses_quarterly_collection_by_default():
     """get_statement_concepts(...) without period_type queries normalized_concepts_quarterly."""
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     # find() must return something with a .sort() method that itself is iterable
     mock_cursor = MagicMock()
@@ -324,7 +361,7 @@ def test_get_statement_concepts_uses_quarterly_collection_by_default():
 
 def test_get_statement_concepts_uses_annual_collection_when_specified():
     """get_statement_concepts(..., period_type='annual') queries normalized_concepts_annual."""
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     mock_cursor = MagicMock()
     mock_cursor.sort.return_value = iter([])
@@ -343,12 +380,107 @@ def test_get_statement_concepts_uses_annual_collection_when_specified():
     assert called_col == "normalized_concepts_annual"
 
 
+def test_get_statement_concepts_window_filter_exempts_system_and_calculated():
+    """The recent-window `_id $in` must NOT filter out system:/calculated
+    concepts — they are always loaded (derivation targets)."""
+    from earnings_agents.integrations import normalize as ndc
+
+    mock_cursor = MagicMock()
+    mock_cursor.sort.return_value = iter([])
+    mock_col = MagicMock()
+    mock_col.find.return_value = mock_cursor
+    mock_db = MagicMock()
+    mock_db.__getitem__ = MagicMock(return_value=mock_col)
+
+    with patch.object(ndc, "_get_client") as mock_client:
+        mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
+        ndc.get_statement_concepts(
+            "000123", statement_types=["income"],
+            concept_ids=["507f1f77bcf86cd799439011"],
+        )
+
+    query = mock_col.find.call_args.args[0]
+    assert "$and" in query
+    window_or = query["$and"][0]["$or"]
+    # All three arms must exist: window ids, system: regex, calculated flag.
+    arms = {
+        "_id" in arm or "concept" in arm or "calculated" in arm
+        for arm in window_or
+    }
+    assert len(window_or) == 3
+    assert any("_id" in arm for arm in window_or)
+    assert any(arm.get("concept", {}).get("$regex") == "^system:" for arm in window_or)
+    assert any("calculated" in arm for arm in window_or)
+
+
+def test_get_statement_concepts_without_window_has_no_and_clause():
+    """Without concept_ids there is no window restriction at all."""
+    from earnings_agents.integrations import normalize as ndc
+
+    mock_cursor = MagicMock()
+    mock_cursor.sort.return_value = iter([])
+    mock_col = MagicMock()
+    mock_col.find.return_value = mock_cursor
+    mock_db = MagicMock()
+    mock_db.__getitem__ = MagicMock(return_value=mock_col)
+
+    with patch.object(ndc, "_get_client") as mock_client:
+        mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
+        ndc.get_statement_concepts("000123", statement_types=["income"])
+
+    query = mock_col.find.call_args.args[0]
+    assert "$and" not in query
+
+
+def test_get_statement_concepts_keeps_same_label_children_under_distinct_parents():
+    """Rows sharing a label (e.g. 'Hardware' under Revenue and Cost of Revenue)
+    are NOT deduplicated — each is kept and disambiguated by its parent path,
+    and the shared GAAP tag gets a path-qualified taxonomy key so mapping stays
+    unambiguous."""
+    from earnings_agents.integrations import normalize as ndc
+
+    rows = [
+        {"_id": "a", "concept": "us-gaap:Revenue", "label": "Total revenue", "path": "001", "statement_type": "income"},
+        {"_id": "b", "concept": "us-gaap:ProductMember", "label": "Hardware", "path": "001.001", "statement_type": "income"},
+        {"_id": "c", "concept": "us-gaap:CostOfRevenue", "label": "Cost of Revenue", "path": "002", "statement_type": "income"},
+        {"_id": "d", "concept": "us-gaap:ProductMember", "label": "Hardware", "path": "002.001", "statement_type": "income"},
+        {"_id": "e", "concept": "us-gaap:ServiceMember", "label": "Cloud and other services", "path": "001.002", "statement_type": "income"},
+        {"_id": "f", "concept": "us-gaap:ServiceMember", "label": "Cloud and other services", "path": "002.002", "statement_type": "income"},
+    ]
+
+    mock_cursor = MagicMock()
+    mock_cursor.sort.return_value = iter(rows)
+    mock_col = MagicMock()
+    mock_col.find.return_value = mock_cursor
+    mock_db = MagicMock()
+    mock_db.__getitem__ = MagicMock(return_value=mock_col)
+
+    with patch.object(ndc, "_get_client") as mock_client:
+        mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
+        result = ndc.get_statement_concepts("000123", statement_types=["income"])
+
+    labels = [c["label"] for c in result]
+    keys = [c["taxonomy_key"] for c in result]
+
+    # Both Hardware rows survive, disambiguated by their parent section.
+    assert "Hardware (Total revenue)" in labels
+    assert "Hardware (Cost of Revenue)" in labels
+    assert "Cloud and other services (Total revenue)" in labels
+    assert "Cloud and other services (Cost of Revenue)" in labels
+    # The shared GAAP tag is path-qualified so JSON keys never collide.
+    assert len(keys) == len(set(keys))
+    assert "us-gaap:ProductMember|001.001" in keys
+    assert "us-gaap:ProductMember|002.001" in keys
+    assert "us-gaap:ServiceMember|001.002" in keys
+    assert "us-gaap:ServiceMember|002.002" in keys
+
+
 # ── get_latest_period returns correct structure ───────────────────────────────
 
 def test_upsert_concept_values_separates_quarterly_and_annual_filters():
     """Upserts include period-type information so annual vs quarterly rows stay distinct."""
     from datetime import date
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     mock_collection = MagicMock()
     mock_db = MagicMock()
@@ -384,7 +516,7 @@ def test_upsert_concept_values_separates_quarterly_and_annual_filters():
 def test_upsert_concept_values_uses_annual_collection_for_annual_periods():
     """Annual inserts target the annual collection and keep annual form_type in the filter."""
     from datetime import date
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     mock_collection = MagicMock()
     mock_db = MagicMock()
@@ -422,7 +554,7 @@ def test_upsert_concept_values_period_type_override_is_authoritative():
     selection and the persisted period type can never diverge.
     """
     from datetime import date
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     mock_collection = MagicMock()
     mock_db = MagicMock()
@@ -454,7 +586,7 @@ def test_upsert_concept_values_period_type_override_is_authoritative():
 def test_get_latest_period_returns_most_recent_across_both_collections():
     """get_latest_period picks the most recent end_date from both collections."""
     from datetime import datetime, timezone
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     quarterly_doc = {
         "reporting_period": {
@@ -493,7 +625,7 @@ def test_get_latest_period_returns_most_recent_across_both_collections():
 
 def test_get_latest_period_returns_none_when_no_data():
     """get_latest_period returns None when both collections have no data for the CIK."""
-    from earnings_agents.tools import normalize_data_client as ndc
+    from earnings_agents.integrations import normalize as ndc
 
     mock_col = MagicMock()
     mock_col.find_one.return_value = None
@@ -504,323 +636,6 @@ def test_get_latest_period_returns_none_when_no_data():
         mock_client.return_value.__getitem__ = MagicMock(return_value=mock_db)
         result = ndc.get_latest_period("000123")
 
-    assert result is None
-
-
-# ── get_next_period_type (filing-cadence signal) ─────────────────────────────
-
-@pytest.mark.parametrize("latest, expected", [
-    # After Q3 the next release is always the annual report (no standalone Q4).
-    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 3}, "annual"),
-    # Mid-year quarters → the next standalone quarter.
-    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 1}, "quarterly"),
-    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 2}, "quarterly"),
-    # A legacy Q4 record == the annual (year closed) → next is next-FY Q1.
-    # This must NOT resolve to "annual" (that would mislabel the new FY's Q1).
-    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": 4}, "quarterly"),
-    # After the annual report → Q1 of the next fiscal year.
-    ({"period_type": "annual", "fiscal_year": 2025, "quarter": None}, "quarterly"),
-    # Defensive: a missing/zero quarter is treated as not-yet-Q3.
-    ({"period_type": "quarterly", "fiscal_year": 2026, "quarter": None}, "quarterly"),
-])
-def test_get_next_period_type(latest, expected):
-    from earnings_agents.tools import normalize_data_client as ndc
-
-    with patch.object(ndc, "get_latest_period", return_value=latest):
-        assert ndc.get_next_period_type("000123") == expected
-
-
-def test_get_next_period_type_returns_none_without_prior_data():
-    """No stored period → cadence cannot be inferred → None."""
-    from earnings_agents.tools import normalize_data_client as ndc
-
-    with patch.object(ndc, "get_latest_period", return_value=None):
-        assert ndc.get_next_period_type("000123") is None
-
-
-def test_get_next_period_type_gated_skips_non_newer_release():
-    """A non-newer release does NOT advance the cycle — returns the stored type.
-
-    Re-processing the already-stored Q3 release (same or older period-end) must
-    report the stored period's own type ("quarterly") rather than advancing to
-    "annual" — otherwise the Q3 release would be reclassified as annual,
-    duplicating it across the quarterly/annual collections.
-    """
-    from datetime import date, datetime, timezone
-    from earnings_agents.tools import normalize_data_client as ndc
-
-    latest = {
-        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 3,
-        "end_date": datetime(2026, 3, 31, tzinfo=timezone.utc),
-    }
-    with patch.object(ndc, "get_latest_period", return_value=latest):
-        # Exact re-run (same period-end) → no advance → stored type.
-        assert ndc.get_next_period_type("000123", date(2026, 3, 31)) == "quarterly"
-        # Older release → no advance → stored type.
-        assert ndc.get_next_period_type("000123", date(2025, 12, 31)) == "quarterly"
-
-
-def test_get_next_period_type_gated_allows_genuine_next_annual():
-    """A genuinely newer release after Q3 still resolves to annual."""
-    from datetime import date, datetime, timezone
-    from earnings_agents.tools import normalize_data_client as ndc
-
-    latest = {
-        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 3,
-        "end_date": datetime(2026, 3, 31, tzinfo=timezone.utc),
-    }
-    with patch.object(ndc, "get_latest_period", return_value=latest):
-        # New annual period-end (~3 months later) → annual.
-        assert ndc.get_next_period_type("000123", date(2026, 6, 30)) == "annual"
-
-
-def test_get_next_period_type_rerun_of_annual_stays_annual():
-    """Re-processing the stored annual release stays annual (no spurious advance)."""
-    from datetime import date, datetime, timezone
-    from earnings_agents.tools import normalize_data_client as ndc
-
-    latest = {
-        "period_type": "annual", "fiscal_year": 2026, "quarter": None,
-        "end_date": datetime(2026, 5, 31, tzinfo=timezone.utc),
-    }
-    with patch.object(ndc, "get_latest_period", return_value=latest):
-        # Same period-end → no advance → stored type "annual".
-        assert ndc.get_next_period_type("000123", date(2026, 5, 31)) == "annual"
-        # Strictly newer → advance: after annual the next release is Q1.
-        assert ndc.get_next_period_type("000123", date(2026, 8, 31)) == "quarterly"
-
-
-def test_load_concepts_rerun_q3_not_reclassified_as_annual():
-    """Re-running the same Q3 release must stay quarterly, not flip to annual.
-
-    Exercises the REAL cadence gate (only get_latest_period is mocked) to prove
-    the cross-collection duplicate path is closed end-to-end at the node.
-    """
-    from datetime import datetime, timezone
-    from earnings_agents.nodes import load_company_concepts_node as node
-    from earnings_agents.tools import normalize_data_client as ndc
-
-    company = {"cik": "0000789019", "fiscal_year_end_month": 6,
-               "fiscal_year_end_code": "0630", "name": "MICROSOFT CORP"}
-    latest = {
-        "period_type": "quarterly", "fiscal_year": 2026, "quarter": 3,
-        "end_date": datetime(2026, 3, 31, tzinfo=timezone.utc),
-    }
-    state = {"ticker": "MSFT", "sec_report_date": "2026-03-31"}
-
-    with (
-        patch.object(node, "get_company_by_ticker", return_value=company),
-        patch.object(ndc, "get_latest_period", return_value=latest),
-        patch.object(node, "get_statement_concepts", return_value=[]),
-    ):
-        result = node.load_company_concepts_node(state)  # type: ignore[arg-type]
-
-    assert result["detected_period_type"] == "quarterly"
-
-
-
-# ── _resolve_8k_skip_guard (CLI helper) ─────────────────────────────────────
-
-from earnings_agents.cli.earnings import _resolve_8k_skip_guard  # noqa: E402
-
-
-def _mock_submissions_resp(*, forms, report_dates=None, filing_dates=None, items=None):
-    """Build a minimal SEC submissions JSON response mock."""
-    data = {
-        "filings": {
-            "recent": {
-                "form": forms,
-                "reportDate": report_dates or [""] * len(forms),
-                "filingDate": filing_dates or [""] * len(forms),
-                "items": items or [""] * len(forms),
-                "accessionNumber": ["acc"] * len(forms),
-                "primaryDocument": ["doc.htm"] * len(forms),
-            }
-        }
-    }
-    resp = MagicMock()
-    resp.raise_for_status = MagicMock()
-    resp.json.return_value = data
-    return resp
-
-
-def test_skip_guard_deletes_and_proceeds_when_fiscal_period_exists():
-    """When period exists and dry_run=False, deletes existing data and returns deletion info."""
-    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
-    submissions = _mock_submissions_resp(
-        forms=["8-K", "10-Q"],
-        report_dates=["", "2025-09-30"],
-        filing_dates=["2025-10-15", "2025-10-15"],
-        items=["2.02,9.01", ""],
-    )
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
-        patch("earnings_agents.tools.normalize_data_client.delete_fiscal_period", return_value=5),
-        patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
-        patch("earnings_agents.tools.edgar_client._find_all_ex_99_urls", return_value=[]),
-    ):
-        result = _resolve_8k_skip_guard("AAPL", "000123")
-    assert result is not None
-    assert result["action"] == "replace"
-    assert result["pending_delete"]["cik"] == "000123"
-    assert result["pending_delete"]["fiscal_year"] == 2025
-    assert result["pending_delete"]["quarter"] == 3
-    assert result["period_label"] == "FY2025 Q3"
-
-
-def test_skip_guard_skips_in_dry_run_when_fiscal_period_exists():
-    """When period exists and dry_run=True, returns skip state dict (no delete)."""
-    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
-    submissions = _mock_submissions_resp(
-        forms=["8-K", "10-Q"],
-        report_dates=["", "2025-09-30"],
-        filing_dates=["2025-10-15", "2025-10-15"],
-        items=["2.02,9.01", ""],
-    )
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=True),
-        patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
-        patch("earnings_agents.tools.edgar_client._find_all_ex_99_urls", return_value=[]),
-    ):
-        result = _resolve_8k_skip_guard("AAPL", "000123", dry_run=True)
-    assert result is not None
-    assert result["status"] == "already_stored"
-
-
-def test_skip_guard_proceeds_when_fiscal_period_not_found():
-    """Returns None (proceed) when the FY+Q is not yet in the DB."""
-    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
-    submissions = _mock_submissions_resp(
-        forms=["8-K", "10-Q"],
-        report_dates=["", "2025-06-30"],
-        filing_dates=["2025-07-25", "2025-07-25"],
-        items=["2.02,9.01", ""],
-    )
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.normalize_data_client.fiscal_period_exists", return_value=False),
-        patch("earnings_agents.tools.edgar_client._edgar_get", return_value=submissions),
-    ):
-        result = _resolve_8k_skip_guard("AAPL", "000123")
-    assert result is None
-
-
-def test_skip_guard_returns_none_when_company_missing():
-    """Returns None (proceed) when company not found in normalize_data."""
-    with patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=None):
-        result = _resolve_8k_skip_guard("UNKN", "000999")
-    assert result is None
-
-
-def test_skip_guard_returns_none_when_fy_end_month_missing():
-    """Returns None (proceed) when company has no fiscal_year_end_month."""
-    company = {"cik": "000123", "name": "TestCo"}  # no fiscal_year_end_month
-    with patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company):
-        result = _resolve_8k_skip_guard("AAPL", "000123")
-    assert result is None
-
-
-def test_skip_guard_returns_none_on_missing_args():
-    """Returns None when ticker or CIK is missing."""
-    assert _resolve_8k_skip_guard("", "000123") is None
-    assert _resolve_8k_skip_guard("AAPL", "") is None
-    assert _resolve_8k_skip_guard("", "") is None
-
-
-def test_skip_guard_returns_none_on_sec_api_error():
-    """Returns None (fail-safe) when the SEC API call fails."""
-    company = {"cik": "000123", "name": "TestCo", "fiscal_year_end_month": 12}
-    import requests as req
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value=company),
-        patch("earnings_agents.tools.edgar_client._edgar_get", side_effect=req.RequestException("timeout")),
-    ):
-        result = _resolve_8k_skip_guard("AAPL", "000123")
-    assert result is None
-
-
-def test_print_latest_data_status_reports_next_quarter_needed():
-    """The coverage summary distinguishes quarterly periods and shows the next 8-K needed."""
-    from earnings_agents.cli.earnings import _print_latest_data_status
-
-    lines = []
-
-    latest = {
-        "period_type": "quarterly",
-        "fiscal_year": 2026,
-        "quarter": 1,
-        "end_date": MagicMock(strftime=MagicMock(return_value="2025-09-30")),
-    }
-
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value={"cik": "000123", "fiscal_year_end_month": 12, "fiscal_year_end_code": "1231"}),
-        patch("earnings_agents.tools.normalize_data_client.get_latest_period", return_value=latest),
-    ):
-        _print_latest_data_status([{"ticker": "AAPL", "company_name": "Apple Inc"}], printer=lines.append)
-
-    joined = "\n".join(lines)
-    assert "last stored: FY2026 Q1" in joined
-    assert "need: FY2026 Q2 8-K" in joined
-
-
-def test_print_latest_data_status_q3_requires_annual_not_q4():
-    """After Q3, the next 8-K is the Annual (which covers Q4+full year). There is no Q4 quarterly 8-K."""
-    from earnings_agents.cli.earnings import _print_latest_data_status
-
-    lines = []
-
-    latest = {
-        "period_type": "quarterly",
-        "fiscal_year": 2026,
-        "quarter": 3,
-        "end_date": MagicMock(strftime=MagicMock(return_value="2026-09-30")),
-    }
-
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value={"cik": "000123", "fiscal_year_end_month": 12, "fiscal_year_end_code": "1231"}),
-        patch("earnings_agents.tools.normalize_data_client.get_latest_period", return_value=latest),
-    ):
-        _print_latest_data_status([{"ticker": "AAPL", "company_name": "Apple Inc"}], printer=lines.append)
-
-    joined = "\n".join(lines)
-    assert "last stored: FY2026 Q3" in joined
-    # Must show Annual, NOT Q4
-    assert "Annual 8-K" in joined
-    assert "1231" in joined
-    assert "Q4 8-K" not in joined
-
-
-def test_print_latest_data_status_reports_next_annual_needed():
-    """The coverage summary distinguishes annual periods and points to the next fiscal-year 8-K."""
-    from earnings_agents.cli.earnings import _print_latest_data_status
-
-    lines = []
-
-    latest = {
-        "period_type": "annual",
-        "fiscal_year": 2025,
-        "quarter": None,
-        "end_date": MagicMock(strftime=MagicMock(return_value="2025-12-31")),
-    }
-
-    with (
-        patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker", return_value={"cik": "000123", "fiscal_year_end_month": 12, "fiscal_year_end_code": "1231"}),
-        patch("earnings_agents.tools.normalize_data_client.get_latest_period", return_value=latest),
-    ):
-        _print_latest_data_status([{"ticker": "AAPL", "company_name": "Apple Inc"}], printer=lines.append)
-
-    joined = "\n".join(lines)
-    assert "last stored: FY2025 annual" in joined
-    assert "need: FY2026 Q1 8-K" in joined
-
-
-def test_skip_guard_returns_none_on_db_error():
-    """Returns None on DB error — fail safe, never skip on ambiguity."""
-    with patch("earnings_agents.tools.normalize_data_client.get_company_by_ticker",
-               side_effect=Exception("DB down")):
-        result = _resolve_8k_skip_guard("AAPL", "000123")
     assert result is None
 
 

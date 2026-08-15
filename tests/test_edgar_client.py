@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from earnings_agents.tools.edgar_client import get_latest_earnings_url, normalize_cik
+from earnings_agents.integrations.edgar import get_latest_earnings_url, normalize_cik
 
 
 def test_normalize_cik():
@@ -64,7 +64,7 @@ _INDEX_HTML_NO_EX99 = """
 """
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_finds_exhibit_99_from_8k_item_202(mock_get):
     """Returns Exhibit 99.1 URL from the latest 8-K with Item 2.02."""
     submissions_resp = MagicMock()
@@ -84,7 +84,7 @@ def test_finds_exhibit_99_from_8k_item_202(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0000320193")
 
     assert url is not None
     assert "ex991pressrelease.htm" in url
@@ -93,7 +93,7 @@ def test_finds_exhibit_99_from_8k_item_202(mock_get):
     assert report_date == "2026-03-29"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_finds_all_ex_99_exhibits(mock_get):
     """Returns all EX-99 exhibit URLs when multiple exhibits exist (e.g. EX-99.1 and EX-99.2)."""
     index_html = """
@@ -132,7 +132,7 @@ def test_finds_all_ex_99_exhibits(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0001649749")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0001649749")
 
     assert url is not None
     assert "ex991press.htm" in url
@@ -143,7 +143,7 @@ def test_finds_all_ex_99_exhibits(mock_get):
     assert report_date is not None
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_falls_back_to_first_8k_when_no_item_202(mock_get):
     """When no Item 2.02 exists, uses the first available 8-K."""
     submissions_resp = MagicMock()
@@ -161,14 +161,14 @@ def test_falls_back_to_first_8k_when_no_item_202(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0000789019")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0000789019")
     # Falls back to primary doc since no EX-99.1 in index
     assert url is not None
     assert "msft-8k.htm" in url
     assert supplemental_urls == []
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_returns_none_when_no_8k_filings(mock_get):
     """Returns None when a company has no 8-K filings at all."""
     resp = MagicMock()
@@ -181,29 +181,29 @@ def test_returns_none_when_no_8k_filings(mock_get):
     )
     mock_get.return_value = resp
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0001234567")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0001234567")
     assert url is None
     assert supplemental_urls == []
     assert report_date is None
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_returns_none_on_submissions_api_error(mock_get):
     """Returns None when the EDGAR API call fails."""
     import requests as req
     mock_get.side_effect = req.RequestException("timeout")
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0000320193")
     assert url is None
     assert supplemental_urls == []
     assert report_date is None
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_falls_back_to_primary_doc_when_index_fails(mock_get):
     """When the HTML index fetch fails on every retry, uses primaryDocument from submissions."""
     import requests as req
-    from earnings_agents.tools.edgar_client import _EDGAR_MAX_RETRIES
+    from earnings_agents.integrations.edgar import _EDGAR_MAX_RETRIES
 
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
@@ -221,9 +221,9 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
     # falls back to the primary document.
     index_errors = [req.RequestException("index not found")] * (_EDGAR_MAX_RETRIES + 1)
 
-    with patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None):
+    with patch("earnings_agents.integrations.edgar._time.sleep", return_value=None):
         mock_get.side_effect = [submissions_resp, *index_errors]
-        url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
+        url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0000320193")
 
     assert url is not None
     assert "aapl-20260430.htm" in url
@@ -233,16 +233,13 @@ def test_falls_back_to_primary_doc_when_index_fails(mock_get):
     assert report_date == "2026-03-29"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
-def test_uses_prior_year_10q_for_period_end(mock_get):
-    """When the 8-K reportDate is the earnings announcement date (not the fiscal
-    quarter end), the prior-year same-quarter 10-Q is used to project the
-    correct period end date one year forward.
+@patch("earnings_agents.integrations.edgar.requests.get")
+def test_report_date_passed_through_raw_not_projected(mock_get):
+    """The 8-K reportDate (often the announcement date) is returned RAW.
 
-    Scenario mirrors NVIDIA Q1 FY2027:
-      8-K  filingDate=2026-05-28  reportDate=2026-05-20  (announcement date — wrong)
-      10-Q filingDate=2025-05-29  reportDate=2025-04-27  (prior-year Q1 — correct end)
-    Expected period end: 2025-04-27 + 1 year = 2026-04-27
+    Period correction is the period agent's job — it reads the actual period
+    header from the document.  No prior-year 10-Q/10-K projection happens in
+    EDGAR resolution anymore.
     """
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
@@ -261,24 +258,19 @@ def test_uses_prior_year_10q_for_period_end(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0001045810")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0001045810")
 
     assert url is not None
     assert supplemental_urls == []
-    # Prior-year 10-Q reportDate 2025-04-27 + 1 year → 2026-04-27 (actual quarter end)
-    assert report_date == "2026-04-27"
+    assert report_date == "2026-05-20"  # raw — not projected to 2026-04-27
+    assert accession == "0001045810-26-000051"
+    assert filing_date == "2026-05-28"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
-def test_uses_prior_year_10k_for_fast_annual_reporter(mock_get):
-    """Fast annual reporters (e.g. Oracle) announce only ~10 days after the
-    fiscal year-end, so the prior-year 10-K projection must still be accepted.
-
-    Scenario mirrors Oracle FY2026 (fiscal year ends May 31):
-      8-K  filingDate=2026-06-10  reportDate=2026-06-10  (announcement date — wrong)
-      10-K filingDate=2025-06-18  reportDate=2025-05-31  (prior-year FYE — correct end)
-    Expected period end: 2025-05-31 + 1 year = 2026-05-31  (10 days before filing)
-    """
+@patch("earnings_agents.integrations.edgar.requests.get")
+def test_report_date_raw_for_fast_annual_reporter(mock_get):
+    """Oracle-style: the announcement-date reportDate stays RAW — the period
+    agent reads 'Fiscal Year Ended May 31, 2026' from the document."""
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
     submissions_resp.json.return_value = _mock_submissions(
@@ -296,20 +288,18 @@ def test_uses_prior_year_10k_for_fast_annual_reporter(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0001341439")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0001341439")
 
     assert url is not None
     assert supplemental_urls == []
-    # Prior-year 10-K reportDate 2025-05-31 + 1 year → 2026-05-31 (actual FYE),
-    # even though it is only 10 days before the 2026-06-10 filing date.
-    assert report_date == "2026-05-31"
+    assert report_date == "2026-06-10"  # raw — not projected to 2026-05-31
+    assert filing_date == "2026-06-10"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
-def test_keeps_raw_report_date_when_no_prior_periodic_filings(mock_get):
-    """When no prior 10-Q/10-K exists, the raw reportDate is kept for the skip
-    guard (best-effort).  The upsert now prefers the LLM's __period__ date, so
-    keeping the raw date here is safe — it only affects the skip decision."""
+@patch("earnings_agents.integrations.edgar.requests.get")
+def test_keeps_raw_report_date(mock_get):
+    """reportDate is passed through RAW — the period agent reads the actual
+    period from the document; EDGAR metadata is not corrected here."""
     submissions_resp = MagicMock()
     submissions_resp.raise_for_status = MagicMock()
     submissions_resp.json.return_value = _mock_submissions(
@@ -327,12 +317,14 @@ def test_keeps_raw_report_date_when_no_prior_periodic_filings(mock_get):
 
     mock_get.side_effect = [submissions_resp, index_resp]
 
-    url, supplemental_urls, report_date = get_latest_earnings_url("0000320193")
+    url, supplemental_urls, report_date, accession, filing_date, exhibits = get_latest_earnings_url("0000320193")
     assert supplemental_urls == []
 
     assert url is not None
-    # No prior 10-Q/10-K — raw reportDate kept for skip guard (best-effort).
+    # Raw reportDate — no prior-year projection anymore.
     assert report_date == "2026-03-29"
+    assert accession == "0000320193-26-000011"
+    assert filing_date == "2026-05-01"
 
 
 # ---------------------------------------------------------------------------
@@ -342,12 +334,12 @@ def test_keeps_raw_report_date_when_no_prior_periodic_filings(mock_get):
 # Patching _EDGAR_RATE_LIMITER.acquire to a no-op keeps these tests fast and
 # deterministic — rate-limiting is already covered by the TokenBucket unit.
 
-@patch("earnings_agents.tools.edgar_client._EDGAR_RATE_LIMITER")
-@patch("earnings_agents.tools.edgar_client.requests.get")
-@patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None)
+@patch("earnings_agents.integrations.edgar._EDGAR_RATE_LIMITER")
+@patch("earnings_agents.integrations.edgar.requests.get")
+@patch("earnings_agents.integrations.edgar._time.sleep", return_value=None)
 def test_edgar_get_retries_on_503(mock_sleep, mock_get, mock_limiter):
     """_edgar_get retries on HTTP 503 and eventually returns the successful response."""
-    from earnings_agents.tools.edgar_client import _edgar_get
+    from earnings_agents.integrations.edgar import _edgar_get
 
     fail_resp = MagicMock()
     fail_resp.status_code = 503
@@ -364,12 +356,12 @@ def test_edgar_get_retries_on_503(mock_sleep, mock_get, mock_limiter):
     assert mock_sleep.call_count == 1   # one delay between attempts
 
 
-@patch("earnings_agents.tools.edgar_client._EDGAR_RATE_LIMITER")
-@patch("earnings_agents.tools.edgar_client.requests.get")
-@patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None)
+@patch("earnings_agents.integrations.edgar._EDGAR_RATE_LIMITER")
+@patch("earnings_agents.integrations.edgar.requests.get")
+@patch("earnings_agents.integrations.edgar._time.sleep", return_value=None)
 def test_edgar_get_exhausts_retries_and_returns_last_error_response(mock_sleep, mock_get, mock_limiter):
     """After MAX_RETRIES all fail with 503, _edgar_get returns the final response."""
-    from earnings_agents.tools.edgar_client import _edgar_get, _EDGAR_MAX_RETRIES
+    from earnings_agents.integrations.edgar import _edgar_get, _EDGAR_MAX_RETRIES
 
     fail_resp = MagicMock()
     fail_resp.status_code = 503
@@ -381,13 +373,13 @@ def test_edgar_get_exhausts_retries_and_returns_last_error_response(mock_sleep, 
     assert mock_get.call_count == _EDGAR_MAX_RETRIES + 1
 
 
-@patch("earnings_agents.tools.edgar_client._EDGAR_RATE_LIMITER")
-@patch("earnings_agents.tools.edgar_client.requests.get")
-@patch("earnings_agents.tools.edgar_client._time.sleep", return_value=None)
+@patch("earnings_agents.integrations.edgar._EDGAR_RATE_LIMITER")
+@patch("earnings_agents.integrations.edgar.requests.get")
+@patch("earnings_agents.integrations.edgar._time.sleep", return_value=None)
 def test_edgar_get_retries_on_connection_error_then_succeeds(mock_sleep, mock_get, mock_limiter):
     """A transient RequestException is retried; success on the second attempt."""
     import requests as req
-    from earnings_agents.tools.edgar_client import _edgar_get
+    from earnings_agents.integrations.edgar import _edgar_get
 
     ok_resp = MagicMock()
     ok_resp.status_code = 200
@@ -401,7 +393,7 @@ def test_edgar_get_retries_on_connection_error_then_succeeds(mock_sleep, mock_ge
 
 # ── get_next_8k_status ────────────────────────────────────────────────────────
 
-from earnings_agents.tools.edgar_client import get_next_8k_status  # noqa: E402
+from earnings_agents.integrations.edgar import get_next_8k_status  # noqa: E402
 
 
 def _next_submissions(forms, items, report_dates, filing_dates, accessions=None, primary_docs=None):
@@ -420,7 +412,7 @@ def _next_submissions(forms, items, report_dates, filing_dates, accessions=None,
     }
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_get_next_8k_status_available_when_newer_filing_exists(mock_get):
     """Returns available=True when SEC has an 8-K with report_date after last_stored."""
     submissions = _next_submissions(
@@ -446,7 +438,7 @@ def test_get_next_8k_status_available_when_newer_filing_exists(mock_get):
     assert result["latest_edgar_report_date"] == "2025-12-31"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_get_next_8k_status_ignores_current_quarter_announcement(mock_get):
     """An 8-K announcement date that falls *shortly after* the stored period end
     belongs to the already-stored quarter and must NOT be returned as available.
@@ -477,7 +469,7 @@ def test_get_next_8k_status_ignores_current_quarter_announcement(mock_get):
     assert result["latest_edgar_report_date"] == "2026-04-29"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_get_next_8k_status_not_yet(mock_get):
     """Returns available=False when the only 8-K on SEC is the already-stored one."""
     submissions = _next_submissions(
@@ -500,7 +492,7 @@ def test_get_next_8k_status_not_yet(mock_get):
     assert result["latest_edgar_report_date"] == "2025-09-30"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_get_next_8k_status_latest_edgar_matches_stored(mock_get):
     """latest_edgar_report_date == last_stored signals the coverage display that
     the current period is already stored and a re-run will skip.
@@ -521,7 +513,7 @@ def test_get_next_8k_status_latest_edgar_matches_stored(mock_get):
     assert result["latest_edgar_report_date"] == "2026-05-04"
 
 
-@patch("earnings_agents.tools.edgar_client.requests.get")
+@patch("earnings_agents.integrations.edgar.requests.get")
 def test_get_next_8k_status_api_error_returns_empty(mock_get):
     """Returns all-None dict when the EDGAR submissions API fails."""
     import requests as req

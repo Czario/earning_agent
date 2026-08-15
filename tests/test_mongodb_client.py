@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from earnings_agents.tools.mongodb_client import _MONGO_MAX_RETRIES, upsert_earnings
+from earnings_agents.integrations.mongo import _MONGO_MAX_RETRIES, upsert_earnings
 
 
 def _make_collection(side_effects):
@@ -14,8 +14,8 @@ def _make_collection(side_effects):
     return col
 
 
-@patch("earnings_agents.tools.mongodb_client.time.sleep", return_value=None)
-@patch("earnings_agents.tools.mongodb_client.get_collection")
+@patch("earnings_agents.integrations.mongo.time.sleep", return_value=None)
+@patch("earnings_agents.integrations.mongo.get_collection")
 def test_upsert_succeeds_on_first_attempt(mock_get_col, mock_sleep):
     """Happy path: single attempt, no sleep, upsert called once."""
     col = _make_collection([None])  # update_one returns None on success
@@ -27,8 +27,8 @@ def test_upsert_succeeds_on_first_attempt(mock_get_col, mock_sleep):
     mock_sleep.assert_not_called()
 
 
-@patch("earnings_agents.tools.mongodb_client.time.sleep", return_value=None)
-@patch("earnings_agents.tools.mongodb_client.get_collection")
+@patch("earnings_agents.integrations.mongo.time.sleep", return_value=None)
+@patch("earnings_agents.integrations.mongo.get_collection")
 def test_upsert_retries_on_transient_error_then_succeeds(mock_get_col, mock_sleep):
     """Two transient failures followed by success: retried twice with back-off."""
     col = _make_collection([
@@ -44,8 +44,8 @@ def test_upsert_retries_on_transient_error_then_succeeds(mock_get_col, mock_slee
     assert mock_sleep.call_count == 2
 
 
-@patch("earnings_agents.tools.mongodb_client.time.sleep", return_value=None)
-@patch("earnings_agents.tools.mongodb_client.get_collection")
+@patch("earnings_agents.integrations.mongo.time.sleep", return_value=None)
+@patch("earnings_agents.integrations.mongo.get_collection")
 def test_upsert_raises_after_all_retries_exhausted(mock_get_col, mock_sleep):
     """When every attempt fails, the final exception propagates to the caller."""
     col = _make_collection(
@@ -60,8 +60,8 @@ def test_upsert_raises_after_all_retries_exhausted(mock_get_col, mock_sleep):
     assert mock_sleep.call_count == _MONGO_MAX_RETRIES
 
 
-@patch("earnings_agents.tools.mongodb_client.time.sleep", return_value=None)
-@patch("earnings_agents.tools.mongodb_client.get_collection")
+@patch("earnings_agents.integrations.mongo.time.sleep", return_value=None)
+@patch("earnings_agents.integrations.mongo.get_collection")
 def test_upsert_raises_immediately_on_missing_id(mock_get_col, mock_sleep):
     """ValueError is raised synchronously when _id is absent — no retries."""
     mock_get_col.return_value = MagicMock()

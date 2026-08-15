@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from earnings_agents.llm_factory import _CachedLLM
+from earnings_agents.llm import _CachedLLM
 
 
 # ---------------------------------------------------------------------------
@@ -89,21 +89,21 @@ class TestCachedLLM:
 # ---------------------------------------------------------------------------
 
 class TestBuildLLMCacheIntegration:
-    @patch("earnings_agents.llm_factory.LLM_CACHE_ENABLED", True)
-    @patch("earnings_agents.llm_factory.LLM_PROVIDER", "ollama")
+    @patch("earnings_agents.llm.LLM_CACHE_ENABLED", True)
+    @patch("earnings_agents.llm.LLM_PROVIDER", "ollama")
     def test_cache_enabled_wraps_ollama_in_cached_llm(self, tmp_path):
         with (
-            patch("earnings_agents.llm_factory.LLM_CACHE_DIR", str(tmp_path)),
+            patch("earnings_agents.llm.LLM_CACHE_DIR", str(tmp_path)),
             patch("langchain_ollama.OllamaLLM", MagicMock()),
         ):
-            from earnings_agents.llm_factory import build_llm
+            from earnings_agents.llm import build_llm
             llm = build_llm()
             assert isinstance(llm, _CachedLLM)
 
-    @patch("earnings_agents.llm_factory.LLM_CACHE_ENABLED", False)
-    @patch("earnings_agents.llm_factory.LLM_PROVIDER", "ollama")
+    @patch("earnings_agents.llm.LLM_CACHE_ENABLED", False)
+    @patch("earnings_agents.llm.LLM_PROVIDER", "ollama")
     def test_cache_disabled_returns_raw_llm(self):
         with patch("langchain_ollama.OllamaLLM", MagicMock()) as mock_cls:
-            from earnings_agents.llm_factory import build_llm
+            from earnings_agents.llm import build_llm
             llm = build_llm()
             assert not isinstance(llm, _CachedLLM)

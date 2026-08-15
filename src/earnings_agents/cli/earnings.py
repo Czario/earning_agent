@@ -43,10 +43,10 @@ from earnings_agents.config import (  # noqa: E402
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
 )
-from earnings_agents.nodes.detect_document_type import detect_document_type_node  # noqa: E402
-from earnings_agents.workflow import build_graph  # noqa: E402
-from earnings_agents.company_registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
-from earnings_agents.tools.edgar_client import get_latest_earnings_url, get_next_8k_status  # noqa: E402
+from earnings_agents.nodes.detect import detect_document_type_node  # noqa: E402
+from earnings_agents.graph import build_graph  # noqa: E402
+from earnings_agents.registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
+from earnings_agents.integrations.edgar import get_latest_earnings_url  # noqa: E402
 from earnings_agents.hooks import set_detail_callback, set_node_callback  # noqa: E402
 
 SEP = "=" * 64
@@ -68,26 +68,23 @@ def _fmt_dur(ms: float) -> str:
 
 # Human-readable stage names for the rich progress description
 _NODE_LABELS: dict[str, str] = {
+    "fetch_filing_node":              "fetch",
+    "detect_period_node":             "period",
+    "check_period_node":              "check period",
     "load_company_concepts_node":     "load concepts",
     "detect_document_type_node":      "detect type",
-    "extract_html_text_node":         "fetch text",
-    "extract_financial_metrics_node": "extract metrics",
-    "analyze_metrics_node":           "analyse",
-    "cleanup_metrics_node":           "cleanup",
     "mongodb_save_node":              "save",
+    "agent_document_pipeline_node":   "agent pipeline",
 }
 
-# Short abbreviations used when compacting the completed-stage breadcrumb
-# so it fits within the terminal width.
 _SHORT_STAGE: dict[str, str] = {
+    "fetch":          "fetch",
+    "period":         "period",
+    "check period":   "check",
     "load concepts":  "cncpt",
     "detect type":    "type",
-    "fetch text":     "fetch",
-    "fetch pdf":      "fetch",
-    "extract metrics": "extr",
-    "analyse":        "anal",
-    "cleanup":        "clean",
     "save":           "save",
+    "agent pipeline": "agent",
 }
 
 
@@ -109,67 +106,21 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
             return f"  [detect type]    failed — {(state.get('error') or '')[:60]}"
         return f"  [detect type]    {state.get('file_type') or '?'}"
 
-    if node_name == "extract_html_text_node":
-        if state.get("status") == "failed":
-            return "  [fetch text]    failed"
-        n = len(state.get("raw_text") or "")
-        lines = [f"  [fetch text]     {n:,} chars"]
-        supp_log = state.get("_supplemental_log") or []
-        if supp_log:
-            lines.extend(supp_log)
-        return "\n".join(lines)
+    if node_name == "detect_period_node":
+        if state.get("status") in ("failed", "skipped"):
+            return f"  [period]         ✗  {(state.get('error') or '')[:70]}"
+        d = state.get("detected_period") or {}
+        label = d.get("period_label") or d.get("period_end") or "?"
+        return f"  [period]         ✓  {d.get('period_type')}  {label}"
 
-    if node_name == "extract_financial_metrics_node":
-        attempt = state.get("extraction_attempts", 1)
-        metrics = state.get("metrics") or {}
-        n_metrics = len([k for k in metrics if not k.startswith("__")])
-        if state.get("status") == "failed":
-            return f"  [extract {attempt}/3]    failed — {(state.get('error') or '')[:60]}"
-        concept_metrics = state.get("concept_metrics") or {}
-        derived_ids = set(state.get("derived_concept_ids") or [])
-        target_concepts = state.get("target_concepts") or []
-        n_total_concepts = len(target_concepts) + len(state.get("calculated_concepts") or [])
-        n_mapped = len(concept_metrics) - len(derived_ids)
-        n_derived = len(derived_ids)
-        n_absent = len([c for c in target_concepts if c["_id"] not in concept_metrics])
-        lines = [f"  [extract {attempt}/3]    → {n_metrics} metrics extracted"]
-        if n_total_concepts:
-            lines.append(
-                f"  [extract {attempt}/3]    concepts: "
-                f"{n_mapped} mapped  {n_derived} derived  {n_absent} not in filing"
-                f"  (of {n_total_concepts})"
-            )
-        return "\n".join(lines)
-
-    if node_name == "analyze_metrics_node":
-        attempt = state.get("extraction_attempts", 1)
-        findings = state.get("findings") or []
-        high = [f for f in findings if isinstance(f, dict) and f.get("severity") == "high"]
-        medium = [f for f in findings if isinstance(f, dict) and f.get("severity") == "medium"]
-        needs = state.get("needs_reextract", False)
-        if needs:
-            msgs = "; ".join((f.get("message") or "?")[:45] for f in high[:2])
-            extra = f"  (+{len(high) - 2} more)" if len(high) > 2 else ""
-            lines = [f"  [analyze {attempt}/3]     ✗ {msgs}{extra}  → re-extract"]
-            notes = (state.get("extraction_notes") or "").strip()
-            if notes:
-                lines.append("  ┌─ hints injected into next prompt ───────────────────────")
-                for note_line in notes.splitlines()[:15]:
-                    lines.append(f"  │  {note_line}")
-                remaining = len(notes.splitlines()) - 15
-                if remaining > 0:
-                    lines.append(f"  │  ... ({remaining} more lines)")
-                lines.append("  └─────────────────────────────────────────────────────────")
-            return "\n".join(lines)
-        if high:
-            msgs = "; ".join((f.get("message") or "?")[:45] for f in high[:2])
-            return f"  [analyze {attempt}/3]     ⚠ {len(high)} unresolved (max attempts): {msgs}"
-        suffix = f"  ({len(medium)} medium)" if medium else ""
-        return f"  [analyze {attempt}/3]     ✓ all required found{suffix}"
-
-    if node_name == "cleanup_metrics_node":
-        removed = state.get("cleanup_removed") or []
-        return f"  [cleanup]        {len(removed)} key(s) removed"
+    if node_name == "check_period_node":
+        s = state.get("status", "?")
+        if s == "failed":
+            return f"  [check period]   ✗  {(state.get('error') or '')[:70]}"
+        if state.get("_pending_replace"):
+            lbl = state.get("_replace_period_label") or "existing period"
+            return f"  [check period]   re-extract {lbl} — replace after successful save"
+        return "  [check period]   new period — proceeding"
 
     if node_name == "mongodb_save_node":
         s = state.get("status", "?")
@@ -182,6 +133,27 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
         if s == "failed":
             return f"  [save]           ✗  {(state.get('error') or 'failed')[:70]}"
         return f"  [save]           {s}"
+
+    if node_name == "agent_document_pipeline_node":
+        metrics = state.get("metrics") or {}
+        n_metrics = len([k for k in metrics if not k.startswith("__")])
+        if state.get("status") == "failed":
+            return f"  [agent pipe]  failed — {(state.get('error') or '')[:60]}"
+        concept_metrics = state.get("concept_metrics") or {}
+        derived_ids = set(state.get("derived_concept_ids") or [])
+        target_concepts = state.get("target_concepts") or []
+        n_total = len(target_concepts) + len(state.get("calculated_concepts") or [])
+        n_mapped = len(concept_metrics) - len(derived_ids)
+        n_derived = len(derived_ids)
+        n_absent = len([c for c in target_concepts if c["_id"] not in concept_metrics])
+        lines = [f"  [agent pipe]  → {n_metrics} metrics extracted"]
+        if n_total:
+            lines.append(
+                f"  [agent pipe]  concepts: "
+                f"{n_mapped} mapped  {n_derived} derived  {n_absent} not in filing"
+                f"  (of {n_total})"
+            )
+        return "\n".join(lines)
 
     return None
 
@@ -228,108 +200,6 @@ def _check_mongodb() -> tuple[bool, str]:
         return True, f"MongoDB OK — {MONGODB_DB}.{MONGODB_COLLECTION}"
     except Exception as exc:  # noqa: BLE001
         return False, f"MongoDB unreachable: {exc}"
-
-
-def _print_latest_data_status(companies: list[dict], printer=print) -> None:
-    """For each company, show the last stored period and which period is needed next.
-
-    Queries ``concept_values_annual`` and ``concept_values_quarterly`` to find
-    the most recent period already in normalize_data, then infers the next
-    expected period so the operator knows which 8-K to target.
-    """
-    try:
-        from earnings_agents.tools.normalize_data_client import (
-            get_company_by_ticker,
-            count_fiscal_period_values,
-            get_latest_period,
-        )
-    except Exception as exc:  # noqa: BLE001
-        printer(f"[WARN] Could not import normalize_data_client: {exc}")
-        return
-
-    printer("")
-    printer("── normalize_data coverage ──────────────────────────────────────")
-    for info in companies:
-        ticker = info.get("ticker") or ""
-        name = info.get("company_name", ticker)
-        label = f"{ticker or name}"
-
-        try:
-            company = get_company_by_ticker(ticker) if ticker else None
-        except Exception:  # noqa: BLE001
-            company = None
-
-        if company is None:
-            printer(f"  {label:<12}  not in normalize_data.companies — targeted extraction disabled")
-            continue
-
-        cik = company["cik"]
-        fy_end_month = company["fiscal_year_end_month"]
-        fy_end_code = company.get("fiscal_year_end_code") or f"{fy_end_month:02d}??"
-
-        try:
-            latest = get_latest_period(cik)
-        except Exception as exc:  # noqa: BLE001
-            printer(f"  {label:<12}  DB error: {exc}")
-            continue
-
-        if latest is None:
-            printer(f"  {label:<12}  no data yet  →  fetch any available 8-K")
-            continue
-
-        pt = latest["period_type"]
-        fy = latest["fiscal_year"]
-        q = latest["quarter"]
-        end_dt = latest["end_date"].strftime("%Y-%m-%d") if latest["end_date"] else "?"
-
-        if pt == "annual":
-            last_str = f"FY{fy} annual  (end {end_dt})"
-            # Annual filing covers Q4 + full year; next needed is Q1 of the next fiscal year.
-            next_str = f"FY{fy + 1} Q1 8-K"
-        elif (q or 0) >= 4:
-            # A Q4 record is equivalent to the annual — the fiscal year is
-            # already closed (the annual 10-K *is* the Q4 report). The next
-            # needed filing is Q1 of the following fiscal year, NOT "FY annual".
-            last_str = f"FY{fy} Q4 (=annual)  (end {end_dt})"
-            next_str = f"FY{fy + 1} Q1 8-K"
-        else:
-            last_str = f"FY{fy} Q{q}  (end {end_dt})"
-            if (q or 0) == 3:
-                # Q3 is the last standalone quarterly 8-K.
-                # The annual 8-K covers Q4 + full year — there is no Q4-only 8-K.
-                next_str = f"FY{fy} Annual 8-K  (fiscal year-end {fy_end_code})"
-            else:
-                next_str = f"FY{fy} Q{(q or 0) + 1} 8-K"
-
-        # How many concept values exist for the latest stored period?
-        q_arg = q if pt == "quarterly" else None
-        try:
-            n_existing = count_fiscal_period_values(cik, fy, q_arg)
-        except Exception:  # noqa: BLE001
-            n_existing = None
-
-        # Cross-check SEC EDGAR: is the next needed 8-K already filed?
-        sec_status = get_next_8k_status(cik, end_dt)
-        if sec_status["available"]:
-            sec_note = f"[SEC ✓ filed  report {sec_status['sec_report_date']}]"
-        elif sec_status.get("latest_edgar_report_date"):
-            # EDGAR has a recent 8-K but it didn't clear the next-period threshold —
-            # it's the already-stored period's filing. No new 8-K has landed yet.
-            count_str = f"{n_existing} value(s) — " if n_existing is not None else ""
-            sec_note = (
-                f"[✓ {count_str}"
-                f"will delete & replace, no new 8-K on SEC yet]"
-            )
-        else:
-            sec_note = "[SEC ⏳ not yet]"
-
-        printer(f"  {label:<12}  last stored: {last_str:<36}  need: {next_str}")
-        printer(f"  {'':<12}  {sec_note}")
-
-    printer("─" * 66)
-    printer("")
-
-
 
 
 def _print_insertion_summary(results: list[dict], printer=print) -> None:
@@ -415,7 +285,7 @@ def _has_existing_period_data(ticker: str) -> bool:
     if not ticker:
         return False
     try:
-        from earnings_agents.tools.normalize_data_client import (
+        from earnings_agents.integrations.normalize import (
             get_company_by_ticker,
             get_latest_period,
         )
@@ -443,8 +313,15 @@ def _build_8k_state(
     """Build the initial state for an 8-K pipeline run — shared by CLI and worker.
 
     Both the CLI (``_build_initial_state``) and the Redis worker
-    (``_process_payload``) call this function so period detection, skip logic,
-    and state construction are identical in every code path.
+    (``_process_payload``) call this function so URL/accession resolution and
+    state construction are identical in every code path.
+
+    Period detection does NOT happen here — the period agent reads the filing
+    document inside the graph (detect_period node).  This function only
+    resolves the filing URL, the accession, and the filing date.  No accession
+    or period existence checks — the graph's check_period node sees whether
+    the exact fiscal period is already stored and schedules a deferred
+    replace.
 
     When *filing_url* is not provided, the function fetches the latest 8-K
     from SEC EDGAR (CLI path).  When it IS provided (worker path), the
@@ -461,6 +338,7 @@ def _build_8k_state(
         "extraction_notes": None,
         "needs_reextract": False,
         "previous_high_finding_keys": None,
+        "exhibit_meta": [],
     }
 
     if not _has_existing_period_data(ticker):
@@ -474,29 +352,27 @@ def _build_8k_state(
             "error": "no existing normalize_data period data found for this company; skipping 8-K path.",
         }
 
-    # ── Skip guard: check if the 8-K's fiscal period is already stored ──────
-    skip_state = _resolve_8k_skip_guard(ticker, cik, printer=printer, dry_run=dry_run)
-    if skip_state is not None and skip_state.get("action") == "skip":
-        return skip_state
-
-    # ── Replace guard: period exists; defer deletion until after save ─────
-    if skip_state is not None and skip_state.get("action") == "replace":
-        _base["_pending_replace"] = skip_state["pending_delete"]
-        _base["_replace_period_label"] = skip_state.get("period_label", "")
-
-    # Capture accession from skip guard result (both skip and replace have it).
-    _acc = accession or (skip_state or {}).get("accession_number")
-    if _acc:
-        _base["accession_number"] = _acc
-
-    # ── Resolve filing URL + period date ────────────────────────────────────
+    # ── Resolve filing URL, accession, filing date, exhibit list ──────────
+    _edgar_report_date: str | None = None
+    _filing_date: str | None = None
+    exhibits: list[dict] = []
     if not filing_url:
         printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
-        filing_url, supplemental_urls, sec_report_date_str = get_latest_earnings_url(cik)
+        (
+            filing_url,
+            supplemental_urls,
+            _edgar_report_date,
+            accession,
+            _filing_date,
+            exhibits,
+        ) = get_latest_earnings_url(cik)
 
-    # Quarter is derived from the period end date via compute_fiscal_period —
-    # no text-based extraction needed (avoids matching comparison quarters in
-    # the document body).
+    if accession:
+        _base["accession_number"] = accession
+    if _filing_date:
+        _base["filing_date"] = _filing_date
+    if exhibits:
+        _base["exhibit_meta"] = exhibits
 
     if not filing_url:
         return {
@@ -513,43 +389,6 @@ def _build_8k_state(
             f"{[u.rsplit('/', 1)[-1] for u in supplemental_urls]}"
         )
 
-    # ── Period detection (primary): extract from EX-99.1 filename ──────
-    # The filename itself encodes the period end date as YYYYMMDD —
-    # e.g. abbv-20260630xexhibit991.htm → 2026-06-30.
-    # This is set by the filer and is the single most reliable source,
-    # unlike SEC reportDate (often the announcement date) or regex
-    # (which can match comparison-period dates in table HTML).
-    import re as _re
-    _fn = filing_url.rsplit("/", 1)[-1] if filing_url else ""
-    _fn_date_match = _re.search(r"(\d{4})(\d{2})(\d{2})", _fn)
-    if _fn_date_match:
-        try:
-            from datetime import date as _dt_date
-            _fn_date = _dt_date(
-                int(_fn_date_match.group(1)),
-                int(_fn_date_match.group(2)),
-                int(_fn_date_match.group(3)),
-            )
-            # Only use filename date if it differs from SEC reportDate by
-            # more than a day — a large gap means SEC gave the announcement
-            # date while the filename encodes the actual period end.
-            if sec_report_date_str:
-                try:
-                    _sec_dt = _dt_date.fromisoformat(sec_report_date_str)
-                    if abs((_fn_date - _sec_dt).days) > 1:
-                        sec_report_date_str = _fn_date.isoformat()
-                except ValueError:
-                    pass
-            else:
-                sec_report_date_str = _fn_date.isoformat()
-        except (ValueError, OverflowError):
-            pass
-
-    # ── No regex fallback — if _infer_period_end and filename both failed,
-    # leave sec_report_date_str as None.  The LLM's __period__ (read from the
-    # actual document header) will be used by upsert_concept_values instead.
-    # Regex on raw HTML is unreliable — it picks the first "Month DD, YYYY"
-    # which is often a comparison-period date in table markup.
     return {
         **_base,
         "discovered_file_url": filing_url,
@@ -589,11 +428,6 @@ def _run_company(graph, info: dict, printer=print) -> dict:
 
     if state["status"] == "skipped":
         printer(f"  [SKIP]  {state['error']}")
-        printer(SEP)
-        return state
-
-    if state["status"] == "already_stored":
-        printer(f"  [UP TO DATE]  period {state.get('sec_report_date', '?')} already in normalize_data — skipping")
         printer(SEP)
         return state
 
@@ -640,8 +474,7 @@ def _dry_run_company(
 
     file_type: str | None = None
     url_blocked = state.get("status") == "failed"
-    already_stored = state.get("status") == "already_stored"
-    if not url_blocked and not already_stored and state.get("discovered_file_url"):
+    if not url_blocked and state.get("discovered_file_url"):
         dt = detect_document_type_node(state)
         file_type = dt.get("file_type")
 
@@ -649,8 +482,6 @@ def _dry_run_company(
         verdict = "skipped"
     elif url_blocked:
         verdict = "blocked"
-    elif already_stored:
-        verdict = "already_stored"
     elif not llm_ok or not mongo_ok:
         verdict = "warning"
     else:
@@ -669,9 +500,6 @@ def _dry_run_company(
     elif verdict == "skipped":
         printer(f"  Reason  : {state.get('error', 'No existing normalize_data period data found')}")
         printer("  Action  : Skipping SEC 8-K discovery because no prior normalize_data period exists")
-    elif verdict == "already_stored":
-        printer(f"  Reason  : period {state.get('sec_report_date', '?')} already stored in normalize_data")
-        printer("  Action  : No action needed — data is up to date")
     elif verdict == "warning":
         if not llm_ok:
             if LLM_PROVIDER == "ollama":
@@ -694,303 +522,11 @@ def _dry_run_company(
 def _is_already_saved(ticker: str) -> bool:
     """Return True if an earnings document for *ticker* already exists in MongoDB for the current year."""
     from datetime import datetime, timezone
-    from earnings_agents.tools.mongodb_client import get_collection
+    from earnings_agents.integrations.mongo import get_collection
     year = datetime.now(timezone.utc).year
     doc_id = f"{ticker}_{year}_latest"
     try:
         return get_collection().count_documents({"_id": doc_id}, limit=1) > 0
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _resolve_8k_skip_guard(
-    ticker: str,
-    cik: str,
-    printer=print,
-    dry_run: bool = False,
-) -> dict | None:
-    """Check whether the latest 8-K's fiscal period is already stored in the DB.
-
-    1. Gets ``fiscal_year_end_month`` from normalize_data.
-    2. Fetches SEC submissions, finds the latest 8-K Item 2.02 and its
-       accession number.
-    3. **Primary path**: fetches the EX-99.1 exhibit HTML and regex-extracts
-       the actual period-end date from the document (same date the LLM will
-       later read as ``__period__``).  Uses ``compute_fiscal_period`` to
-       derive ``(fiscal_year, quarter, period_type)``.  Zero guesswork.
-    4. **Fallback**: if the exhibit fetch fails, uses
-       ``_infer_8k_fiscal_period`` (10-Q/10-K proximity heuristic).
-    5. **Last resort**: uses ``get_latest_period`` from the DB.
-    6. Checks both period existence AND accession-number existence.
-
-    When *dry_run* is True and the period already exists, returns a skip dict.
-
-    When *dry_run* is False and the period exists, returns a *replace* dict
-    with ``pending_delete`` info — **the actual deletion is deferred** to
-    after the pipeline saves successfully, preventing data loss if the
-    pipeline fails mid-run.
-
-    Returns ``None`` on any error or when the period is not already stored
-    (fail-safe: never skips on ambiguity).
-    """
-    if not ticker or not cik:
-        return None
-    try:
-        from earnings_agents.tools.normalize_data_client import (
-            compute_fiscal_period,
-            delete_fiscal_period,
-            fiscal_period_exists,
-            get_company_by_ticker,
-            get_latest_period,
-        )
-        from earnings_agents.tools.edgar_client import (
-            _EDGAR_ARCHIVES_BASE,
-            _EDGAR_SUBMISSIONS,
-            _edgar_get,
-            _extract_period_from_exhibit,
-            _find_all_ex_99_urls,
-            _infer_8k_fiscal_period,
-            normalize_cik,
-        )
-
-        # 1. Get fiscal_year_end_month.
-        company = get_company_by_ticker(ticker)
-        if company is None:
-            return None
-        fy_end_month = company.get("fiscal_year_end_month")
-        if not fy_end_month:
-            return None
-
-        # 2. Fetch SEC submissions (one HTTP call).
-        cik_padded = normalize_cik(cik)
-        cik_int = str(int(cik_padded))
-        sub_url = _EDGAR_SUBMISSIONS.format(cik=cik_padded)
-        from earnings_agents.config import HTTP_TIMEOUT
-        try:
-            resp = _edgar_get(sub_url, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:  # noqa: BLE001
-            return None
-
-        recent = data.get("filings", {}).get("recent", {})
-        forms: list[str] = recent.get("form", [])
-        filing_dates: list[str] = recent.get("filingDate", [])
-        items_list: list[str] = recent.get("items", [])
-        accessions: list[str] = recent.get("accessionNumber", [])
-        report_dates: list[str] = recent.get("reportDate", [])
-
-        # Find latest 8-K (Item 2.02) — capture filing_date, accession, and report_date.
-        filing_date_str: str | None = None
-        accession: str | None = None
-        sec_report_date: str | None = None
-        for i, form in enumerate(forms):
-            if form != "8-K":
-                continue
-            item_str = items_list[i] if i < len(items_list) else ""
-            if "2.02" in item_str:
-                fd = filing_dates[i] if i < len(filing_dates) else ""
-                acc = accessions[i] if i < len(accessions) else ""
-                rd = report_dates[i] if i < len(report_dates) else ""
-                if fd:
-                    filing_date_str = fd
-                if acc:
-                    accession = acc
-                if rd:
-                    sec_report_date = rd
-                break
-
-        # ── Accession-level dedup (scoped to period) ──────────────────────
-        if accession:
-            acc_exists = _accession_already_stored(cik, accession, sec_report_date)
-            if acc_exists:
-                if dry_run:
-                    printer(
-                        f"  [UP TO DATE] accession {accession} already stored — skipping"
-                    )
-                    return {
-                        "action": "skip",
-                        "status": "already_stored",
-                        "ticker": ticker,
-                        "company_name": company.get("name", ticker),
-                        "accession_number": accession,
-                        "discovered_file_url": None,
-                        "file_type": None,
-                        "raw_text": None,
-                        "metrics": None,
-                        "error": None,
-                        "extraction_attempts": 0,
-                        "extraction_notes": None,
-                        "needs_reextract": False,
-                        "previous_high_finding_keys": None,
-                    }
-                # Live run: accession already stored → skip silently.
-                # (The period-level check below would handle this too, but
-                #  accession dedup catches the exact-filing-already-processed
-                #  case even if period inference is off.)
-                printer(
-                    f"  [UP TO DATE] accession {accession} already stored — skipping"
-                )
-                return {
-                    "action": "skip",
-                    "status": "already_stored",
-                    "ticker": ticker,
-                    "company_name": company.get("name", ticker),
-                    "accession_number": accession,
-                    "discovered_file_url": None,
-                    "file_type": None,
-                    "raw_text": None,
-                    "metrics": None,
-                    "error": None,
-                    "extraction_attempts": 0,
-                    "extraction_notes": None,
-                    "needs_reextract": False,
-                    "previous_high_finding_keys": None,
-                }
-
-        # 3. Determine (fiscal_year, quarter) the 8-K reports on.
-        #    PRIMARY: extract from EX-99.1 filename (YYYYMMDD — filer-set).
-        #    SECONDARY: regex from EX-99.1 HTML content.
-        #    FALLBACK: heuristic from nearby 10-Q/10-K filings.
-        #    LAST RESORT: latest stored period from DB.
-        fp = None
-
-        # ── Primary: filename-based extraction (filer-set, zero guesswork) ─
-        if accession:
-            import re
-            from datetime import date
-            acc_nodash = accession.replace("-", "")
-            ex99_urls = _find_all_ex_99_urls(cik_int, accession, acc_nodash)
-            if ex99_urls:
-                # 1st: extract YYYYMMDD from the EX-99.1 filename itself
-                # e.g. abbv-20260630xexhibit991.htm → 2026-06-30
-                _ex_fn = ex99_urls[0].rsplit("/", 1)[-1]
-                _ex_fn_match = re.search(r"(\d{4})(\d{2})(\d{2})", _ex_fn)
-                if _ex_fn_match:
-                    try:
-                        period_end_date = date.fromisoformat(
-                            f"{_ex_fn_match.group(1)}-{_ex_fn_match.group(2)}-{_ex_fn_match.group(3)}"
-                        )
-                    except ValueError:
-                        period_end_date = None
-                else:
-                    # 2nd: fall back to regex on HTML content
-                    period_end_date = _extract_period_from_exhibit(ex99_urls[0])
-
-                if period_end_date is not None:
-                    fy, q = compute_fiscal_period(
-                        period_end_date, fy_end_month, ""
-                    )
-                    pt = (
-                        "annual"
-                        if period_end_date.month == fy_end_month
-                        else "quarterly"
-                    )
-                    fp = (fy, q if pt == "quarterly" else None, pt)
-                    _logger.debug(
-                        "_resolve_8k_skip_guard: %s %s → FY%d %s",
-                        "filename date" if _ex_fn_match else "exhibit date",
-                        period_end_date,
-                        fy,
-                        f"Q{q}" if pt == "quarterly" else "(annual)",
-                    )
-
-        # ── Fallback: 10-Q/10-K proximity heuristic ─────────────────────
-        if fp is None and filing_date_str:
-            fp = _infer_8k_fiscal_period(recent, filing_date_str, fy_end_month)
-
-        # ── Last resort: latest stored period from DB ───────────────────
-        if fp is None:
-            latest = get_latest_period(cik)
-            if latest is not None:
-                fp = (
-                    latest["fiscal_year"],
-                    latest.get("quarter"),
-                    latest.get("period_type", "quarterly"),
-                )
-
-        # 4. Check period existence — return skip or pending_replace.
-        if fp is not None:
-            fy, q, pt = fp
-            q_arg = q if pt == "quarterly" else None
-            if fiscal_period_exists(cik, fy, q_arg):
-                period_label = (
-                    f"FY{fy} Q{q}" if pt == "quarterly" else f"FY{fy} (annual)"
-                )
-                if dry_run:
-                    printer(
-                        f"  [UP TO DATE] period {period_label} already stored — skipping"
-                    )
-                    return {
-                        "action": "skip",
-                        "status": "already_stored",
-                        "ticker": ticker,
-                        "company_name": company.get("name", ticker),
-                        "accession_number": accession,
-                        "discovered_file_url": None,
-                        "file_type": None,
-                        "raw_text": None,
-                        "metrics": None,
-                        "error": None,
-                        "extraction_attempts": 0,
-                        "extraction_notes": None,
-                        "needs_reextract": False,
-                        "previous_high_finding_keys": None,
-                    }
-                # Live run: return replace info — deletion deferred to
-                # after pipeline save (prevents data loss on pipeline failure).
-                printer(
-                    f"  [REPLACE] period {period_label} — will re-extract, "
-                    f"existing data removed after successful save"
-                )
-                return {
-                    "action": "replace",
-                    "pending_delete": {
-                        "cik": cik,
-                        "fiscal_year": fy,
-                        "quarter": q_arg,
-                    },
-                    "period_label": period_label,
-                    "ticker": ticker,
-                    "company_name": company.get("name", ticker),
-                    "accession_number": accession,
-                }
-
-        return None
-    except Exception:  # noqa: BLE001 — fail safe: never skip on ambiguity
-        _logger.debug("_resolve_8k_skip_guard: unexpected error", exc_info=True)
-        return None
-
-
-def _accession_already_stored(cik: str, accession: str, sec_report_date: str | None = None) -> bool:
-    """Return True when *accession* already exists for *cik* in normalize_data.
-
-    When *sec_report_date* is provided, only matches documents whose
-    ``reporting_period.end_date`` matches — preventing a stale accession
-    from a different period (cached from a later SEC 8-K) from blocking
-    re-extraction of the current period.
-    """
-    try:
-        from earnings_agents.tools.normalize_data_client import _get_client, _NORMALIZE_DB
-        db = _get_client()[_NORMALIZE_DB]
-        for col_name in ("concept_values_quarterly", "concept_values_annual"):
-            filt: dict[str, Any] = {
-                "cik": cik,
-                "statement_type": "income",
-                "accession_number": accession,
-            }
-            if sec_report_date:
-                from datetime import date as _date, datetime, timezone
-                try:
-                    rd = _date.fromisoformat(sec_report_date)
-                    filt["reporting_period.end_date"] = datetime(
-                        rd.year, rd.month, rd.day, tzinfo=timezone.utc,
-                    )
-                except (ValueError, TypeError):
-                    pass
-            if db[col_name].count_documents(filt, limit=1):
-                return True
-        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -1068,9 +604,8 @@ def _run_company_parallel(args: tuple) -> dict:
     def _node_cb(node_name: str, event: str, _ticker: str, node_state=None, elapsed_ms: float | None = None) -> None:
         stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
         if event == "start":
-            if node_name == "extract_financial_metrics_node":
+            if node_name == "agent_document_pipeline_node":
                 _extract_pass[0] += 1
-                _last_chunk_done[0] = 0  # reset per-pass chunk counter
                 if _extract_pass[0] > 1:
                     stage = f"re-extract #{_extract_pass[0]}"
             _current_stage[0] = stage
@@ -1143,8 +678,6 @@ def _run_company_parallel(args: tuple) -> dict:
         desc = f"[green]{name}[/]  saved \u2713{llm_tag}"
     elif status == "failed":
         desc = f"[red]{name}[/]  failed \u2717{llm_tag}"
-    elif status == "already_stored":
-        desc = f"[cyan]{name}[/]  already up to date \u2713"
     else:
         desc = f"[yellow]{name}[/]  {status}"
     progress.update(company_task, total=1, completed=1, description=desc)
@@ -1166,8 +699,8 @@ def _dry_run_company_parallel(args: tuple) -> dict:
     company_task = progress.add_task(f"{label}  checking\u2026", total=None)
     result = _dry_run_company(info, printer=lambda _: None)
     verdict = result.get("_dry_run_verdict", "?")
-    color = {"ready": "green", "warning": "yellow", "blocked": "red", "already_stored": "cyan"}.get(verdict, "white")
-    verdict_label = {"already_stored": "up to date"}.get(verdict, verdict)
+    color = {"ready": "green", "warning": "yellow", "blocked": "red"}.get(verdict, "white")
+    verdict_label = verdict
     progress.update(company_task, total=1, completed=1,
                     description=f"[{color}]{name}[/]  {verdict_label}")
     progress.update(overall_task, advance=1)
@@ -1233,18 +766,7 @@ def main() -> None:
         action="store_true",
         default=False,
         help=(
-            "Save the document to MongoDB even when accounting identity checks "
-            "fail (Gross margin = Revenue − COGS, Net income = Pre-tax − Tax, …). "
-            "Warnings are still recorded in the document's identity_warnings field."
-        ),
-    )
-    parser.add_argument(
-        "--no-llm-cleanup",
-        action="store_true",
-        default=False,
-        help=(
-            "Skip the LLM cleanup pass that removes duplicate/mis-scaled keys "
-            "from the extracted metrics before saving."
+"Save the document to MongoDB even when high-severity findings are unresolved."
         ),
     )
     args = parser.parse_args()
@@ -1253,13 +775,8 @@ def main() -> None:
         parser.error("Provide at least one --cik or --ticker argument.")
 
     if args.allow_inconsistent:
-        # Override the env-default save gate so this run accepts identity warnings.
-        import earnings_agents.workflow as _wf
+        import earnings_agents.graph as _wf
         _wf.STRICT_ACCURACY = False
-
-    if args.no_llm_cleanup:
-        import earnings_agents.nodes.cleanup_metrics as _cm
-        _cm.CLEANUP_METRICS = False
 
     companies = _resolve_companies(args.cik, args.ticker)
     if not companies:
@@ -1305,7 +822,6 @@ def main() -> None:
     _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")
 
     if args.dry_run:
-        _print_latest_data_status(companies, printer=_progress.console.print)
         total = len(companies)
         with _progress as progress:
             overall_task = progress.add_task("[bold]Dry-run[/]", total=total)
@@ -1326,11 +842,8 @@ def main() -> None:
         blocked = sum(1 for r in results if r.get("_dry_run_verdict") == "blocked")
         warnings = sum(1 for r in results if r.get("_dry_run_verdict") == "warning")
         skipped = sum(1 for r in results if r.get("_dry_run_verdict") == "skipped")
-        up_to_date_count = sum(1 for r in results if r.get("_dry_run_verdict") == "already_stored")
-        ready = total - blocked - warnings - skipped - up_to_date_count
+        ready = total - blocked - warnings - skipped
         parts = [f"{ready} ready"]
-        if up_to_date_count:
-            parts.append(f"{up_to_date_count} up to date")
         if skipped:
             parts.append(f"{skipped} skipped")
         if warnings:
@@ -1341,7 +854,6 @@ def main() -> None:
         sys.exit(1 if blocked else 0)
 
     # Live run
-    _print_latest_data_status(companies, printer=_progress.console.print)
     graph = build_graph()
     total = len(companies)
     with _progress as progress:
@@ -1362,13 +874,10 @@ def main() -> None:
 
     saved = [r for r in results if r.get("status") == "saved"]
     skipped = [r for r in results if r.get("status") == "skipped"]
-    up_to_date = [r for r in results if r.get("status") == "already_stored"]
-    failed = [r for r in results if r.get("status") not in ("saved", "skipped", "already_stored")]
+    failed = [r for r in results if r.get("status") not in ("saved", "skipped")]
     summary = f"Done: {len(saved)}/{total} saved"
     if skipped:
         summary += f", {len(skipped)} skipped"
-    if up_to_date:
-        summary += f", {len(up_to_date)} already up to date"
     if failed:
         summary += f", {len(failed)} failed"
     print(summary + ".")

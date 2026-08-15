@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from earnings_agents.company_registry import lookup_by_cik, lookup_by_ticker, normalize_cik
+from earnings_agents.registry import lookup_by_cik, lookup_by_ticker, normalize_cik
 
 _MOCK_INDEX = {
     "ticker_to_cik": {"AAPL": "0000320193", "MSFT": "0000789019"},
@@ -19,7 +19,7 @@ _MOCK_INDEX = {
 
 @pytest.fixture(autouse=True)
 def mock_sec_registry():
-    with patch("earnings_agents.company_registry._build_index", return_value=_MOCK_INDEX):
+    with patch("earnings_agents.registry._build_index", return_value=_MOCK_INDEX):
         yield
 
 

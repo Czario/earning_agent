@@ -33,8 +33,7 @@ dev = [
 earnings-run-once = "earnings_agents.cli.earnings:main"
 earnings = "earnings_agents.cli.earnings:main"
 earnings-failures = "earnings_agents.cli.failures:main"
-earnings-skills = "earnings_agents.cli.skills:main"
-earnings-8k-worker = "earnings_agents.cli.worker_8k:main"
+earnings-8k-worker = "earnings_agents.cli.worker:main"
 
 [build-system]
 requires = ["hatchling"]

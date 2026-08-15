@@ -19,7 +19,7 @@ import time
 from functools import wraps
 from typing import Any, Callable
 
-from earnings_agents.workflow_state import EarningsAgentState
+from earnings_agents.state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
 

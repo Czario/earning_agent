@@ -1,8 +1,6 @@
-uv run earnings --ticker MSFT --dry-run
-uv run earnings --ticker AAPL MSFT GOOGL --dry-run
+# Run extraction for one ticker
+uv run earnings --ticker HIMS
 
-uv run earnings --ticker AAPL MSFT GOOGL NVDA          # 4 parallel workers (default)
-uv run earnings --ticker AAPL MSFT GOOGL --max-workers 2
 
-uv run earnings --ticker MSFT -v
-
+# Dry run (connectivity check, no LLM)
+uv run earnings --ticker HIMS --dry-run"

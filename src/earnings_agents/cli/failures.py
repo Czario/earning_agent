@@ -22,7 +22,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from earnings_agents.tools.mongodb_client import get_collection
+from earnings_agents.integrations.mongo import get_collection
 
 console = Console()
 
@@ -129,7 +129,6 @@ def main(argv: list[str] | None = None) -> None:
     table.add_column("Status", no_wrap=True)
     table.add_column("Scraped At (UTC)", no_wrap=True)
     table.add_column("Findings (high/medium)", overflow="fold")
-    table.add_column("Identity Warnings", overflow="fold")
 
     for doc in docs:
         ticker = doc.get("ticker", "?")
@@ -138,7 +137,6 @@ def main(argv: list[str] | None = None) -> None:
         scraped_str = scraped_at.strftime("%Y-%m-%d %H:%M") if scraped_at else "?"
 
         findings: list[dict] = doc.get("findings") or []
-        iw: list[str] = doc.get("identity_warnings") or []
 
         status_style = "red" if status == "failed" else "yellow"
         status_cell = f"[{status_style}]{status}[/{status_style}]"
@@ -148,9 +146,7 @@ def main(argv: list[str] | None = None) -> None:
         else:
             finding_cell = _format_finding_types(_finding_type_summary(findings))
 
-        iw_cell = ("  ".join(iw[:3]) + ("…" if len(iw) > 3 else "")) if iw else "—"
-
-        table.add_row(ticker, status_cell, scraped_str, finding_cell, iw_cell)
+        table.add_row(ticker, status_cell, scraped_str, finding_cell)
 
     console.print(table)
 
