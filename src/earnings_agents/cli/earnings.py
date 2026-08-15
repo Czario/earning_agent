@@ -660,6 +660,9 @@ def _run_company_parallel(args: tuple) -> dict:
             if "\u2192 calling llm" in msg:
                 _llm_calls[0] += 1
             progress.console.print(f"[dim]{name}[/][bold yellow]{esc_msg}[/]")
+        elif "[industry]" in msg:
+            # Single industry-context line per extraction pass (SIC injected).
+            progress.console.print(f"[dim]{name}[/][bold cyan]{esc_msg}[/]")
         else:
             progress.console.print(f"[dim]{name}[/]{esc_msg}")
 

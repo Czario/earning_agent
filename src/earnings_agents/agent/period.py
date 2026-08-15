@@ -258,6 +258,7 @@ def run_period_detection(
     *,
     ticker: str,
     company_name: str = "",
+    company_industry: dict | None = None,
     cik: str | None = None,
     fy_end_month: int | None = None,
     fy_end_code: str | None = None,
@@ -268,7 +269,8 @@ def run_period_detection(
 
     *document_map* (when the filing is a multi-exhibit bundle) is surfaced by
     ``get_document_info`` so the agent knows the first document is the press
-    release carrying the period header.
+    release carrying the period header.  *company_industry* feeds the cached
+    ``get_company_info`` tool (the period prompt itself does not use it).
 
     Raises :class:`PeriodDetectionError` when the agent produces nothing usable.
     Returns the validated period dict:
@@ -284,6 +286,7 @@ def run_period_detection(
 
     tools = build_pi_tools(
         raw_text, prior_values={}, cik=cik, company_name=company_name,
+        company_industry=company_industry,
         document_map=document_map,
     )
 
@@ -355,6 +358,7 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
             raw_text,
             ticker=ticker,
             company_name=state.get("company_name") or ticker,
+            company_industry=company.get("industry"),
             cik=company.get("cik"),
             fy_end_month=company.get("fiscal_year_end_month"),
             fy_end_code=company.get("fiscal_year_end_code"),
@@ -373,6 +377,7 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
     return {
         **state,
         "cik": company["cik"],
+        "company_industry": company.get("industry") or {},
         "fiscal_year_end_month": company["fiscal_year_end_month"],
         "fiscal_year_end_code": company.get("fiscal_year_end_code"),
         "detected_period_type": period["period_type"],

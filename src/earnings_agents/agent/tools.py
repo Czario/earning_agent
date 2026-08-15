@@ -30,6 +30,7 @@ def build_pi_tools(
     prior_values: dict[str, float],
     cik: str | None = None,
     company_name: str = "",
+    company_industry: dict | None = None,
     document_map: list[dict] | None = None,
 ) -> list:
     """Build the pi-style tool set for raw document navigation.
@@ -40,6 +41,10 @@ def build_pi_tools(
         prior_values: Prior-period values for sanity checking.
         cik: Company CIK for company info lookup.
         company_name: Company name for display.
+        company_industry: Cached ``{sic_code, sic_description}`` profile from
+            ``normalize_data.companies`` — ``get_company_info`` returns it
+            directly instead of re-querying MongoDB (falls back to a DB
+            lookup when absent).
         document_map: Exhibit boundaries inside *document_text*
             (``[{exhibit, url, line_start, line_end, truncated, skipped}]``).
             When provided, ``get_document_info`` lists it so the agent can
@@ -313,13 +318,26 @@ def build_pi_tools(
     # ── 7. Company info lookup ──────────────────────────────────────────
     @_lc_tool
     def get_company_info() -> str:
-        """Get the company's industry, fiscal year end, and market info from
-        the SEC company database.
+        """Get the company's industry profile (SIC code + description).
 
-        Use this to understand what kind of company you're dealing with —
-        is it a bank, insurer, manufacturer, retailer?  This helps you
-        identify which metrics are most important.
+        ADVISORY CONTEXT ONLY: use it to understand what kind of company
+        you're dealing with (bank, insurer, manufacturer, retailer) so you
+        can recognize industry terminology in the filing.  Industry data can
+        never supply values — extract numbers from the filing only.
         """
+        from earnings_agents.agent.industry import normalize_company_industry
+
+        profile = normalize_company_industry(company_industry)
+        if profile:
+            return (
+                f"Company: {company_name or '?'}\n"
+                f"CIK: {cik or 'unknown'}\n"
+                f"Industry: {profile['sic_description'] or '?'} "
+                f"(SIC {profile['sic_code'] or '?'})"
+            )
+
+        # Fallback — callers that built the toolset without a cached profile
+        # (or with an empty one) get the full document lookup.
         try:
             from earnings_agents.integrations.normalize import _get_client, _NORMALIZE_DB
             db = _get_client()[_NORMALIZE_DB]

@@ -166,6 +166,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     return {
         **state,
         "cik": cik,
+        "company_industry": company.get("industry") or {},
         "target_concepts": concepts,
         "recent_concept_ids": recent_concept_ids,
         "calculated_concepts": [],

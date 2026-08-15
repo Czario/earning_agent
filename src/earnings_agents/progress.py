@@ -10,6 +10,7 @@ different message types with distinct styling:
   ``step_start``  — node begins:  "► load concepts"
   ``step_end``    — node summary: "[load concepts]  71 concepts  (annual)"
   ``call_llm``    — LLM API call: "[llm]  chunk 1/1  → calling llm  (deepseek)"
+  ``call_industry`` — industry context: "[industry]  context injected — SIC 3711 …"
   ``call``        — DB / HTTP:    "[db]  query normalized_concepts_annual …"
   ``summary``     — final line:   "✓ saved  (5 LLM calls)"
   ``skip``        — non-fatal skip notice
@@ -181,7 +182,9 @@ def make_call_callback(
     the caller can read the total after the pipeline finishes.
 
     LLM call messages (containing ``[llm]`` or ``→ calling llm``) are
-    published with ``kind="call_llm"``; everything else with ``kind="call"``.
+    published with ``kind="call_llm"``; industry-tracking messages
+    (``[industry]``) with ``kind="call_industry"``; everything else with
+    ``kind="call"``.
     """
 
     def _callback(msg: str) -> None:
@@ -191,7 +194,12 @@ def make_call_callback(
         is_llm = " [llm]" in stripped or (
             "llm" in stripped.lower() and "\u2192" in stripped
         )
-        kind = "call_llm" if is_llm else "call"
+        if stripped.startswith("[industry]"):
+            kind = "call_industry"
+        elif is_llm:
+            kind = "call_llm"
+        else:
+            kind = "call"
         if is_llm and "\u2192 calling llm" in stripped:
             llm_call_count[0] += 1
         pub.publish("call", stripped, kind=kind)

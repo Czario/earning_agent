@@ -34,16 +34,18 @@ def _get_client() -> MongoClient:  # type: ignore[type-arg]
 # ── Company lookup ───────────────────────────────────────────────────────────
 
 def get_company_by_ticker(ticker: str) -> dict[str, Any] | None:
-    """Return ``{cik, name, fiscal_year_end_month}`` for *ticker*, or ``None``.
+    """Return ``{cik, name, fiscal_year_end_month, industry}`` for *ticker*.
 
     Queries normalize_data.companies by ``ticker_symbol`` (case-insensitive).
     ``fiscal_year_end_month`` is derived from the ``corporate_info.fiscal_year_end``
     field, which is stored as an "MMDD" string (e.g. "0630" for June 30).
+    ``industry`` is the raw ``{sic_code, sic_description}`` subdocument (``{}``
+    when absent) — advisory context for the extraction agent.
     """
     db = _get_client()[_NORMALIZE_DB]
     doc = db["companies"].find_one(
         {"ticker_symbol": ticker.upper()},
-        {"cik": 1, "name": 1, "corporate_info.fiscal_year_end": 1},
+        {"cik": 1, "name": 1, "corporate_info.fiscal_year_end": 1, "industry": 1},
     )
     if doc is None:
         return None
@@ -59,6 +61,7 @@ def get_company_by_ticker(ticker: str) -> dict[str, Any] | None:
         "name": doc.get("name", ticker),
         "fiscal_year_end_month": fy_end_month,
         "fiscal_year_end_code": fy_code,
+        "industry": doc.get("industry") or {},
     }
 
 

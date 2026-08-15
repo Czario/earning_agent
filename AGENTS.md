@@ -80,7 +80,9 @@ fetch_filing → detect_period → check_period → load_company_concepts
 3. Prompt = `PIPELINE_SYSTEM_PROMPT` + `build_concept_list` (`system:` CALC concepts
    excluded — the agent never extracts them; the list is already hard-filtered
    to recently-valued concepts upstream) + period hints from the detected period
-   (incl. the Q4→annual column rule)
+   (incl. the Q4→annual column rule) + advisory industry context
+   (`agent/industry.py::build_industry_context` — SIC code/description from
+   `companies.industry`, injected on EVERY pass incl. retries)
 4. `run_agent_loop` (ReAct; `agent/loop.py`) until `finalize_extraction` —
    **open-ended, no step cap**; fallback recovers a final JSON blob from the last AI message
 5. `_parse_llm_response` applies the `__scale__` multiplier — **never** scales keys
@@ -89,7 +91,10 @@ fetch_filing → detect_period → check_period → load_company_concepts
    Tier 1: exact or whitespace-normalized label
 7. `derive_missing_concepts` — one lightweight LLM pass computes missing `system:`
    (CALC) parents from the path hierarchy; never overrides extracted values.
-   Margins/ratios are excluded from the `GP = Rev − CoR` shortcut (bug observed live)
+   Margins/ratios are excluded from the `GP = Rev − CoR` shortcut (bug observed live).
+   `[derived]` lines report each computed concept's label + value and each
+   omitted one by name (`[llm] derive missing CALC — <names> → calling llm` lists
+   the candidates)
 8. Observability: `missing_concept_labels` / `missing_toplevel_labels` /
    `missing_segment_labels` — dimensionality from DB flags `dimension` /
    `dimension_concept`, **not** `"|" in taxonomy_key`
@@ -107,7 +112,7 @@ reused automatically.
 
 `get_document_info`, `read_lines`, `search` (word-indexed, context blocks, 15-block cap),
 `get_prior_value`, `verify_identity` (GP = Rev − CoR), `calculate` (safe AST arithmetic),
-`get_company_info`. Tool results truncated to 8000 chars.
+`get_company_info` (cached SIC profile from state, DB fallback — advisory only). Tool results truncated to 8000 chars.
 
 ### Concept lookup & fiscal math (`integrations/normalize.py`)
 
@@ -126,7 +131,7 @@ reused automatically.
 ```
 src/earnings_agents/
   graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py
-  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py
+  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py
   integrations/ edgar.py · normalize.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
@@ -156,6 +161,11 @@ tests/          9 test modules + fixtures/golden/ (scale-parsing JSON cases)
   **Exception**: `system:`/`calculated` concepts are always loaded so the CALC
   derivation pass can compute them (they are never in the agent's extraction
   list). Empty recent set → run skipped (nothing to extract).
+- **Industry context is advisory-only.** SIC data from `companies.industry` is
+  injected into the extraction prompt and `get_company_info` as read-only
+  context (helps recognize filing terminology); it can never add concepts
+  outside the recent-value target, supply or infer values, or override
+  anything read from the filing. Missing industry data never fails a run.
 - **Q4 is never extracted as quarterly.** Q4 == annual; both-column releases → the
   fiscal-year (annual) column. Enforced in the period agent prompt, the business-rules
   gate, the extraction prompt, and naturally by `quarter=null` annual upserts.
@@ -178,8 +188,10 @@ tests/          9 test modules + fixtures/golden/ (scale-parsing JSON cases)
   a 2.08% yield). Ratio matching is word-bounded so "Operating expenses"
   (contains "ration") still scales.
 - **`report_call` convention** — every LLM/tool/DB call surfaced as `[llm]`/`[tool]`/
-  `[db]`-prefixed lines; the CLI highlights `→ calling llm` yellow and counts LLM calls;
-  the worker publishes the same lines to `sec:worker:events` (`call_llm` vs `call` kinds)
+  `[db]`-prefixed lines; a single `[industry]` line per extraction pass shows the
+  injected SIC context; the CLI highlights `→ calling llm` yellow and industry
+  cyan and counts LLM calls; the worker publishes the same lines to
+  `sec:worker:events` (`call_llm` vs `call_industry` vs `call` kinds)
 - **Multi-component cost rows** — the system prompt teaches the agent to SUM subtotal +
   additional cost rows (amortization/depreciation/impairment) and verify via
   `verify_identity`

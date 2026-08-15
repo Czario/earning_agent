@@ -11,6 +11,10 @@ import logging
 from typing import Any
 
 from earnings_agents.agent.loop import run_agent_loop
+from earnings_agents.agent.industry import (
+    build_industry_context,
+    normalize_company_industry,
+)
 from earnings_agents.agent.derive import (
     load_prior_values,
     map_concepts,
@@ -139,14 +143,29 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
         hints_parts.append(f"PRIOR ATTEMPT FAILURES:\n{state['extraction_notes']}")
     hints_block = "\n\n".join(hints_parts) if hints_parts else ""
 
-    system_prompt = PIPELINE_SYSTEM_PROMPT.format(
-        concept_list=concept_list_str,
-    ) + f"\n\nCOMPANY: {state['company_name']} ({ticker})\nATTEMPT: {attempt_num}\n\n{hints_block}"
+    # ── Industry context — advisory SIC data injected on EVERY pass ─────
+    company_industry = state.get("company_industry")
+    industry_context = build_industry_context(company_industry)
+    industry_profile = normalize_company_industry(company_industry)
+    if industry_profile:
+        report_call(
+            f"  [industry]  context injected — SIC {industry_profile['sic_code']} "
+            f"({industry_profile['sic_description'][:60]})"
+        )
+
+    system_prompt = (
+        PIPELINE_SYSTEM_PROMPT.format(concept_list=concept_list_str)
+        + f"\n\nCOMPANY: {state['company_name']} ({ticker})\nATTEMPT: {attempt_num}\n\n"
+        + industry_context
+    )
+    if hints_block:
+        system_prompt += f"\n\n{hints_block}"
 
     # ── 4. Build tools and run agent ─────────────────────────────────────
     tools = build_pi_tools(
         plain_text, prior_values, cik=state.get("cik"),
         company_name=state["company_name"],
+        company_industry=company_industry,
         document_map=state.get("document_map"),
     )
 
@@ -204,10 +223,6 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
         else:
             logger.info("  %s = %s (non-numeric)", k, str(v)[:80])
 
-    report_call(
-        f"  [agent pipe]  → {len([k for k in metrics if not k.startswith('__')])} metrics extracted"
-    )
-
     # Pop out the derived-marker field the agent returns (if any)
     metrics.pop("__derived__", None)
 
@@ -218,11 +233,6 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
     concept_metrics, derived_ids = derive_missing_concepts(
         concept_metrics, target_concepts,
     )
-
-    if derived_ids:
-        report_call(
-            f"  [derived]  {len(derived_ids)} concept(s) computed deterministically"
-        )
 
     # ── 6. Return state ──────────────────────────────────────────────────
     raw_text = plain_text[:EXTRACTION_MAX_CHARS]

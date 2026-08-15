@@ -310,9 +310,17 @@ def derive_missing_concepts(
         from earnings_agents.hooks import report_call as _report_call
         from earnings_agents.llm import build_llm
         from earnings_agents.config import LLM_PROVIDER as _LP
+        labels = _build_id_label_map(target_concepts)
+        names = ", ".join(labels.get(cid, cid) for cid in missing_calc[:6])
+        if names:
+            extra = (
+                f" (+{len(missing_calc) - 6} more)" if len(missing_calc) > 6 else ""
+            )
+            derive_msg = f"derive missing CALC — {names}{extra}"
+        else:
+            derive_msg = "derive (combined-costs split only)"
         _report_call(
-            f"  [llm]  derive {len(missing_calc)} missing CALC concept(s)  "
-            f"→ calling llm  ({_LP or 'llm'})"
+            f"  [llm]  {derive_msg}  → calling llm  ({_LP or 'llm'})"
         )
         llm = build_llm()
         response = llm.invoke(prompt)
@@ -358,6 +366,19 @@ def derive_missing_concepts(
         derived.add(cid)
         label = _build_id_label_map(target_concepts).get(cid, cid)
         logger.info("derive: %s = %.0f (agent-computed)", label, val)
+
+    # ── Report what was computed / omitted, with concept names ───────
+    from earnings_agents.hooks import report_call
+    labels = _build_id_label_map(target_concepts)
+    for cid in sorted(derived):
+        report_call(
+            f"  [derived]  ✓ {labels.get(cid, cid)} = {metrics[cid]:,.0f}"
+        )
+    for cid in missing_calc:
+        if cid not in derived:
+            report_call(
+                f"  [derived]  ✗ {labels.get(cid, cid)} — not computable (no data)"
+            )
 
     return metrics, derived
 

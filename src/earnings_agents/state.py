@@ -43,7 +43,7 @@ class EarningsAgentState(TypedDict):
     # Empty list (not None) means the node ran but the company was not found,
     # triggering the generic extraction path.
     cik: NotRequired[Optional[str]]
-    company_industry: NotRequired[Optional[dict]]  # {sic_code, sic_description, category} from normalize_data.companies
+    company_industry: NotRequired[Optional[dict]]  # {sic_code, sic_description} from normalize_data.companies
     target_concepts: NotRequired[Optional[list]]    # concept dicts from normalized_concepts_quarterly
     # concept_id strings (subset of target_concepts) that had a value in the
     # last N stored periods. Used to prune the extraction prompt to concepts the
