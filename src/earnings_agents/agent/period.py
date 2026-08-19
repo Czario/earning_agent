@@ -19,7 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from earnings_agents.agent.loop import run_agent_loop
@@ -92,6 +93,150 @@ class PeriodDetectionError(RuntimeError):
     """The period agent failed or produced an unusable answer."""
 
 
+@dataclass(frozen=True)
+class DetectedPeriod:
+    """The one canonical period contract produced by the period agent.
+
+    ``fiscal_year`` is resolved once, immediately after the agent has read and
+    validated ``period_end``.  Downstream code must consume this object via
+    :func:`require_detected_period`; it must not reconstruct a period from
+    legacy scalar state fields or filing metadata.
+    """
+
+    period_type: str
+    period_end: date
+    quarter: int | None
+    period_label: str | None
+    fiscal_year: int
+
+
+_MONTH_NAME_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"[.]?\s+(\d{1,2}),?\s+(\d{4})",
+    re.IGNORECASE,
+)
+
+
+def parse_period_end_date(period_str: str) -> date | None:
+    """Parse a period-agent label date; no period type is inferred here."""
+    m = _MONTH_NAME_RE.search(period_str or "")
+    if not m:
+        return None
+    date_str = f"{m.group(1)} {m.group(2)} {m.group(3)}"
+    for fmt in ("%B %d %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def compute_fiscal_year(period_end: date, fiscal_year_end_month: int) -> int:
+    """Compute fiscal year from the period-agent's validated end date only."""
+    return (
+        period_end.year
+        if period_end.month <= fiscal_year_end_month
+        else period_end.year + 1
+    )
+
+
+def require_detected_period(state: Any) -> DetectedPeriod:
+    """Return the validated, canonical period-agent result from *state*.
+
+    This is the only downstream period contract.  It reads ``detected_period``
+    exclusively: no legacy scalar fields, filing dates, cadence, or database
+    state can supply or alter the reporting period.
+    """
+    raw = state.get("detected_period")
+    if not isinstance(raw, dict):
+        raise PeriodDetectionError(
+            "period-agent result missing detected_period"
+        )
+
+    period_type = raw.get("period_type")
+    if period_type not in ("annual", "quarterly"):
+        raise PeriodDetectionError(
+            "period-agent result missing/invalid detected_period.period_type"
+        )
+
+    period_end = parse_detected_period_end(state)
+    if period_end is None:
+        raise PeriodDetectionError(
+            "period-agent result missing/invalid detected_period.period_end"
+        )
+
+    quarter = raw.get("quarter")
+    if period_type == "annual":
+        if quarter is not None:
+            raise PeriodDetectionError(
+                "period-agent annual result must have detected_period.quarter=null"
+            )
+    elif quarter not in (1, 2, 3):
+        raise PeriodDetectionError(
+            "period-agent quarterly result missing/invalid detected_period.quarter"
+        )
+
+    fiscal_year = raw.get("fiscal_year")
+    if isinstance(fiscal_year, bool) or not isinstance(fiscal_year, int):
+        raise PeriodDetectionError(
+            "period-agent result missing/invalid detected_period.fiscal_year"
+        )
+
+    period_label = raw.get("period_label")
+    if period_label is not None and not isinstance(period_label, str):
+        raise PeriodDetectionError(
+            "period-agent result has invalid detected_period.period_label"
+        )
+
+    return DetectedPeriod(
+        period_type=period_type,
+        period_end=period_end,
+        quarter=quarter,
+        period_label=period_label,
+        fiscal_year=fiscal_year,
+    )
+
+
+def format_period_label(period: DetectedPeriod) -> str:
+    """Render the human-readable label for the canonical detected period."""
+    if period.quarter is not None:
+        return f"FY{period.fiscal_year} Q{period.quarter}"
+    return f"FY{period.fiscal_year} (annual)"
+
+
+def parse_iso_period_end(raw: Any) -> date | None:
+    """Parse an ISO ``YYYY-MM-DD`` period-end string into a date.
+
+    Single shared parser for the period agent's normalized period-end string.
+    Datetime values from MongoDB are normalized to a plain date; returns
+    ``None`` when the value is absent or unparseable.
+    """
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_detected_period_end(state: Any) -> date | None:
+    """Parse the canonical period-agent end date from state.
+
+    The canonical state value is ``detected_period.period_end``.  This helper
+    deliberately does not inspect EDGAR metadata or any legacy scalar period
+    fields.
+    """
+    raw = state.get("detected_period")
+    if not isinstance(raw, dict):
+        return None
+    return parse_iso_period_end(raw.get("period_end"))
+
+
 # ── Result parsing + business rules ─────────────────────────────────────────
 
 def _parse_period_end(raw: Any) -> date | None:
@@ -115,7 +260,6 @@ def _parse_period_end(raw: Any) -> date | None:
             return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
         except ValueError:
             return None
-    from earnings_agents.integrations.normalize import parse_period_end_date
     return parse_period_end_date(s)
 
 
@@ -209,7 +353,6 @@ def apply_period_business_rules(
     # from it.  If the agent's label carries no parseable date (e.g.
     # "Three months ended 6/30/2026"), normalize it to a standard header form
     # built from the validated period_end.
-    from earnings_agents.integrations.normalize import parse_period_end_date
     if (
         label
         and parse_period_end_date(label) is None
@@ -374,20 +517,27 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
         f"  [period]  ✓ {period['period_type']}  "
         f"{period['period_label'] or period['period_end'].isoformat()}"
     )
+    fy_end_month = company.get("fiscal_year_end_month")
+    if not isinstance(fy_end_month, int):
+        error = f"Company {ticker} has no valid fiscal year-end month"
+        report_call(f"  [period]  ✗ {error}")
+        return {**state, "status": "failed", "error": error}
+
+    fiscal_year = compute_fiscal_year(period["period_end"], fy_end_month)
+    # Store one complete, immutable-in-contract period record.  All downstream
+    # nodes consume this record through require_detected_period().
+    detected_period = {
+        "period_type": period["period_type"],
+        "period_end": period["period_end"].isoformat(),
+        "quarter": period["quarter"],
+        "period_label": period["period_label"],
+        "fiscal_year": fiscal_year,
+    }
     return {
         **state,
         "cik": company["cik"],
         "company_industry": company.get("industry") or {},
-        "fiscal_year_end_month": company["fiscal_year_end_month"],
+        "fiscal_year_end_month": fy_end_month,
         "fiscal_year_end_code": company.get("fiscal_year_end_code"),
-        "detected_period_type": period["period_type"],
-        "detected_quarter": period["quarter"],
-        "period_label": period["period_label"],
-        "sec_report_date": period["period_end"].isoformat(),
-        "detected_period": {
-            "period_type": period["period_type"],
-            "period_end": period["period_end"].isoformat(),
-            "quarter": period["quarter"],
-            "period_label": period["period_label"],
-        },
+        "detected_period": detected_period,
     }

@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from earnings_agents.agent.loop import run_agent_loop
+from earnings_agents.agent.period import require_detected_period
 from earnings_agents.agent.industry import (
     build_industry_context,
     normalize_company_industry,
@@ -23,6 +24,7 @@ from earnings_agents.agent.derive import (
 )
 from earnings_agents.agent.prompts import (
     PIPELINE_SYSTEM_PROMPT,
+    COMPANY_IDENTITY_RULE,
     build_concept_list,
     build_retry_briefing,
 )
@@ -91,10 +93,17 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
     report_call(f"  [agent doc]  {len(plain_text):,} chars, {n_lines:,} lines → agent")
 
     # ── 2. Load prior values ─────────────────────────────────────────────
-    sec_report_date = state.get("sec_report_date")
     cik = state.get("cik")
-    detected_period_type = state.get("detected_period_type")
-    prior_values = load_prior_values(target_concepts, cik, detected_period_type, sec_report_date)
+    try:
+        period = require_detected_period(state)
+    except Exception as exc:
+        return {
+            **state,
+            "extraction_attempts": attempt_num,
+            "status": "failed",
+            "error": f"Agent pipeline: invalid period-agent result for {ticker}: {exc}",
+        }
+    prior_values = load_prior_values(target_concepts, cik, period)
 
     dollar_multiplier = SCALE_MULTIPLIERS.get(doc_scale, 1) if doc_scale else 1
 
@@ -117,18 +126,19 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
         logger.info("Agent retry briefing for %s (pass %d):\n%s", ticker, attempt_num, retry_briefing[:500])
 
     hints_parts: list[str] = []
-    if sec_report_date:
-        period_type = detected_period_type or "quarterly"
-        fy_code = state.get("fiscal_year_end_code") or ""
-        fy_hint = f" (fiscal year ends {fy_code})" if fy_code else ""
-        label = state.get("period_label")
-        label_hint = f' — column header: "{label}"' if label else ""
-        hints_parts.append(
-            f"PERIOD: {period_type} filing, period-end {sec_report_date}{fy_hint}. "
-            f"Extract from the {period_type} column (most recent/latest){label_hint}. "
-            f"If the document shows both a Q4 and a fiscal-year column, "
-            f"extract the fiscal-year (annual) column — never Q4."
-        )
+    period_type = period.period_type
+    fy_code = state.get("fiscal_year_end_code") or ""
+    fy_hint = f" (fiscal year ends {fy_code})" if fy_code else ""
+    label_hint = (
+        f' — column header: "{period.period_label}"'
+        if period.period_label else ""
+    )
+    hints_parts.append(
+        f"PERIOD: {period_type} filing, period-end {period.period_end.isoformat()}"
+        f"{fy_hint}. Extract from the {period_type} column (most recent/latest)"
+        f"{label_hint}. If the document shows both a Q4 and a fiscal-year "
+        f"column, extract the fiscal-year (annual) column — never Q4."
+    )
     if retry_briefing:
         hints_parts.append(
             f"⚠  RETRY — PASS {attempt_num} — TARGETED FIX ONLY\n\n"
@@ -156,6 +166,10 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
     system_prompt = (
         PIPELINE_SYSTEM_PROMPT.format(concept_list=concept_list_str)
         + f"\n\nCOMPANY: {state['company_name']} ({ticker})\nATTEMPT: {attempt_num}\n\n"
+        + COMPANY_IDENTITY_RULE.format(
+            company_name=state["company_name"], ticker=ticker,
+        )
+        + "\n\n"
         + industry_context
     )
     if hints_block:
@@ -199,6 +213,31 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
             "extraction_attempts": attempt_num,
             "status": "failed",
             "error": f"Agent pipeline produced no result for {ticker}",
+        }
+
+    # ── 4b. Company-identity gate ──────────────────────────────────────
+    # A manual filing URL (or any source) may point at a document that does
+    # NOT belong to the ticker (observed live: Netflix shareholder letter fed
+    # with ticker ORCL).  The extraction agent is instructed to flag
+    # "__company_mismatch__" instead of extracting another company's numbers.
+    # The gate HARD-FAILS the run — nothing is mapped, derived, or saved.
+    if final_result.pop("__company_mismatch__", False):
+        report_call(
+            f"  [pipeline]  ✗ document does not belong to {ticker} — "
+            f"aborting (company mismatch)"
+        )
+        logger.warning(
+            "Company mismatch for %s — document is for another company; aborting",
+            ticker,
+        )
+        return {
+            **state,
+            "extraction_attempts": attempt_num,
+            "status": "failed",
+            "error": (
+                f"Document does not match ticker {ticker} — extraction "
+                f"aborted (company mismatch)"
+            ),
         }
 
     # ── 5. Merge, validate, map ─────────────────────────────────────────

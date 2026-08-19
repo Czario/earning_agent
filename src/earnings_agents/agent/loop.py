@@ -48,6 +48,53 @@ _TABLE_RAW_MAX = 10_000_000
 _IMPLAUSIBLE_ABS_USD = _TABLE_RAW_MAX * 1_000_000
 
 
+def _coerce_number(v: Any) -> float | None:
+    """Coerce an LLM-emitted value into a signed float, or ``None``.
+
+    Accepts JSON numbers and numeric strings in SEC/IR styles:
+      -1234, -1,234, "1,234", "$1,234", "(1,234)", "($1,234)", "-(1,234)"
+
+    Parenthesized amounts are NEGATIVE (SEC convention) — ``(175,685)``
+    becomes ``-175685.0``.  This is the deterministic sign guardrail behind
+    the agent: whatever sign convention the source used (parentheses, a
+    leading minus, or a currency symbol), the stored value is a correctly
+    signed number.  Booleans and non-numeric text return ``None``.
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    # Drop leading currency symbols + whitespace BEFORE the paren check so
+    # "$ (1,234)" is recognised as parenthesized.
+    s = s.lstrip("$\u20ac\u00a3 \t\n\r")
+    negative = False
+    # SEC/IR parenthesized amount → negative.  Handle "($1,234)", "(1,234)"
+    # and "(-667,172)" (paren already containing a minus — still negative).
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+    s = (
+        s.replace("$", "")
+        .replace(",", "")
+        .replace("\xa0", "")
+        .replace(" ", "")
+    )
+    if not s:
+        return None
+    try:
+        value = float(s)
+    except ValueError:
+        return None
+    # Parenthesized amounts are negative in magnitude — "(-667,172)" is
+    # -667172, never +667172 (SEC never means double negation).
+    return -abs(value) if negative else value
+
+
 def _parse_llm_response(
     response: str,
     shares_multiplier: int = 1,
@@ -84,9 +131,23 @@ def _parse_llm_response(
         multiplier = llm_multiplier if llm_multiplier > 1 else 1
 
     table_raw_max = _IMPLAUSIBLE_ABS_USD // multiplier if multiplier > 1 else _TABLE_RAW_MAX
+    # Deterministic sign guardrail — runs UNCONDITIONALLY (even with no
+    # __scale__ multiplier): coerce SEC/IR-style strings ("(175,685)",
+    # "-175,685", "$1,234", ...) to signed floats so signs are never lost,
+    # doubled, or passed downstream as strings.  Non-numeric text is left
+    # untouched.
+    for k, v in list(parsed.items()):
+        if v is None or isinstance(v, (int, float)):
+            continue
+        coerced = _coerce_number(v)
+        if coerced is not None:
+            parsed[k] = coerced
+
     if multiplier > 1 or shares_multiplier > 1:
         for k, v in list(parsed.items()):
-            if v is None or not isinstance(v, (int, float)):
+            # Booleans must never be scaled (e.g. "__company_mismatch__": true
+            # would otherwise become 1000 under a thousands multiplier).
+            if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
                 continue
             is_share_count = bool(_SHARE_COUNT_PATTERN.search(k))
             if is_share_count and shares_multiplier > 1:

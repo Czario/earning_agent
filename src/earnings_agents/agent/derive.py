@@ -147,10 +147,22 @@ CONCEPT HIERARCHY — each parent is computed from its children:
 {hierarchy_block}
 
 RULES:
-  • Gross Profit = Revenue − Cost of Revenue (if GP is missing but both
-    Revenue and Cost of Revenue are present in the extracted or computable
-    values).
+  • Gross Profit = Revenue − Cost of Revenue (the Revenue value is in
+    EXTRACTED VALUES; compute Cost of Revenue from its own children in the
+    HIERARCHY, then subtract it from that Revenue).
   • Every other parent = sum of its children.
+  • If ALL children of a parent are present in the extracted or computed
+    values, ALWAYS compute the parent as their sum — do not omit a value
+    you can compute exactly.
+  • Every parent whose children are ALL present MUST appear in your JSON —
+    a missing computable parent is an error, not an omission.
+  • When the filing printed ONE combined row for a parent that the HIERARCHY
+    splits into children (e.g. "Restructuring and other" = 1,838 splits into
+    "Restructuring Charges" + "Acquisition related and other"; or "Costs
+    and Expenses" = Cost of Revenue + Operating Expenses), ALLOCATE the
+    combined total across the children: a missing child = combined total −
+    sum of the extracted children, then compute the parent as the children's
+    sum.  Do not leave such a parent uncomputed.
   • If a combined "Costs and Expenses" line was extracted, it covers BOTH
     Cost of Revenue AND Operating Expenses.  Split it using the hierarchy:
     the children under each parent tell you how to allocate the total.
@@ -170,24 +182,48 @@ _SYSTEM_PREFIX_RX = re.compile(r"^system:", re.I)
 def _build_hierarchy(
     target_concepts: list[dict],
 ) -> dict[str, list[str]]:
-    """Build parent-concept-id → list-of-child-concept-ids from the path hierarchy."""
-    path_to_id: dict[str, str] = {}
+    """Build parent-concept-id → list-of-child-concept-ids from the path hierarchy.
+
+    Children are DIRECT only — exactly one path segment deeper.  Matching all
+    descendants would double-count nested parents in higher-level sums (e.g.
+    Operating Expenses must list "Restructure and Other" as one child, not
+    also its grandchildren Restructuring Charges / Acquisition related and
+    other, which roll up into Restructure and Other first).
+    """
+    # Keep every row at a path.  ``order_key`` is part of the row identity;
+    # path alone is not unique in normalized XBRL data (geographic members,
+    # alternate concepts, and same-path statement rows are common).
+    nodes_by_path: dict[str, list[dict]] = {}
     for c in target_concepts:
         p = (c.get("path") or "").strip()
-        # First concept at a path wins — sibling rows can share a path
-        # (disambiguated by order_key), so last-write would be arbitrary.
-        if p and p not in path_to_id:
-            path_to_id[p] = c["_id"]
+        if p:
+            nodes_by_path.setdefault(p, []).append(c)
+
+    def _order_value(c: dict) -> tuple[int, str]:
+        value = c.get("order_key")
+        return (value is None, "" if value is None else str(value))
+
+    for nodes in nodes_by_path.values():
+        nodes.sort(key=_order_value)
 
     parent_children: dict[str, list[str]] = {}
-    for parent_path, parent_id in path_to_id.items():
+    for parent_path, parent_nodes in nodes_by_path.items():
         prefix = parent_path + "."
-        children: list[str] = []
-        for child_path, child_id in path_to_id.items():
-            if child_path.startswith(prefix):
-                children.append(child_id)
-        if children:
-            parent_children[parent_id] = children
+        parent_depth = parent_path.count(".")
+        child_ids: list[str] = []
+        for child_path, child_nodes in nodes_by_path.items():
+            if (
+                child_path.startswith(prefix)
+                and child_path.count(".") == parent_depth + 1
+            ):
+                # Preserve every child row, ordered by (path, order_key).
+                child_ids.extend(c["_id"] for c in child_nodes)
+        if child_ids:
+            # A same-path parent row is a distinct (path, order_key) node, so
+            # retain the direct child group for each parent rather than
+            # arbitrarily attaching it to the first row only.
+            for parent in parent_nodes:
+                parent_children[parent["_id"]] = list(child_ids)
 
     return parent_children
 
@@ -201,24 +237,128 @@ def _build_derivation_prompt(
     concept_metrics: dict[str, float],
     target_concepts: list[dict],
 ) -> str:
-    """Build the derivation prompt: extracted values + hierarchy."""
+    """Build the derivation prompt: extracted values + hierarchy.
+
+    LEAN PROMPT: the extracted block carries only the values the derivation
+    actually references — descendants of the missing CALC parents, the
+    Revenue operand when Gross Profit is missing, and the combined-costs
+    concept for row-allocation.  The hierarchy block already embeds every
+    missing parent's child values, so the rest is history-size noise that
+    only slows the LLM call (observed live: 33 values → 49.9s derive).
+    """
     id_label = _build_id_label_map(target_concepts)
     parent_children = _build_hierarchy(target_concepts)
+    present_ids = set(concept_metrics)
 
-    # ── Extracted block ──────────────────────────────────────────────
+    # ── Extracted block — restricted to referenced values ─────────────
+    missing_calc_ids = {
+        c["_id"] for c in target_concepts
+        if _SYSTEM_PREFIX_RX.match(
+            (c.get("concept") or c.get("taxonomy_key") or "").strip()
+        ) and c["_id"] not in present_ids
+    }
+
+    referenced: set[str] = set()
+    dependency_uncertain = False
+    uncertainty_reasons: list[str] = []
+    path_counts: dict[str, int] = {}
+    for c in target_concepts:
+        p = (c.get("path") or "").strip()
+        if p:
+            path_counts[p] = path_counts.get(p, 0) + 1
+
+    if missing_calc_ids:
+        # (a) All descendants of the missing parents — nested parents and
+        # their leaves (e.g. Restructuring Charges under Restructure and
+        # Other under Operating Expenses).
+        missing_paths = {
+            (c.get("path") or "").strip()
+            for c in target_concepts if c["_id"] in missing_calc_ids
+        }
+        if not all(missing_paths):
+            dependency_uncertain = True
+            uncertainty_reasons.append("missing CALC parent has no path")
+        for c in target_concepts:
+            p = (c.get("path") or "").strip()
+            if any(p.startswith(mp + ".") for mp in missing_paths if mp):
+                referenced.add(c["_id"])
+                if path_counts.get(p, 0) > 1:
+                    dependency_uncertain = True
+                    uncertainty_reasons.append(f"duplicate dependency path {p}")
+        for mp in missing_paths:
+            if mp and path_counts.get(mp, 0) > 1:
+                dependency_uncertain = True
+                uncertainty_reasons.append(f"duplicate CALC path {mp}")
+
+        # (b) Revenue operand when Gross Profit is missing — GP = Revenue −
+        # CoR, and only Revenue's VALUE is pre-known (CoR is computed by the
+        # derivation itself, never pre-shown).
+        for c in target_concepts:
+            if c["_id"] not in missing_calc_ids:
+                continue
+            ll = (c.get("label") or "").lower()
+            if "gross" in ll and "profit" in ll and not (
+                "margin" in ll or "ratio" in ll or "%" in ll
+            ):
+                revenue_candidates = [
+                    t for t in target_concepts
+                    if "RevenueFromContract" in (
+                        t.get("taxonomy_key") or t.get("concept") or ""
+                    )
+                ]
+                if len(revenue_candidates) != 1:
+                    dependency_uncertain = True
+                    uncertainty_reasons.append("Revenue operand is ambiguous or absent")
+                for t in revenue_candidates:
+                    referenced.add(t["_id"])
+
+    # (c) Combined costs concept — the row-allocation rule needs its total.
+    combined_candidates = [
+        c for c in target_concepts
+        if (c.get("taxonomy_key") or c.get("concept") or "").strip()
+        == "us-gaap:CostsAndExpenses"
+        or "costs and expenses" in (c.get("label") or "").lower()
+    ]
+    if len(combined_candidates) > 1:
+        dependency_uncertain = True
+        uncertainty_reasons.append("combined-costs operand is ambiguous")
+    referenced.update(c["_id"] for c in combined_candidates)
+
+    allowed = referenced & present_ids
+    if dependency_uncertain:
+        # Full context is a safety fallback only when the dependency graph is
+        # ambiguous or incomplete — never merely because the referenced set
+        # happens to contain fewer than an arbitrary number of values.
+        allowed = present_ids
+        logger.debug(
+            "derive prompt: dependency uncertainty; keeping full block (%s)",
+            "; ".join(dict.fromkeys(uncertainty_reasons)),
+        )
+
     extracted_lines: list[str] = []
     for cid, val in sorted(concept_metrics.items(), key=lambda x: str(x[0])):
+        if cid not in allowed:
+            continue
         label = id_label.get(cid, cid)
         extracted_lines.append(f"  • {label} = {val:,.0f}")
     extracted_block = "\n".join(extracted_lines) if extracted_lines else "  (none)"
+    if len(allowed) < len(present_ids):
+        logger.debug(
+            "derive prompt: %d of %d extracted values referenced (%s)",
+            len(allowed), len(present_ids),
+            ", ".join(sorted(id_label.get(i, i) for i in allowed))[:200],
+        )
 
     # ── Hierarchy block ──────────────────────────────────────────────
-    # Only show CALC (system:) concepts that have children.
+    # Only show CALC (system:) concepts that are MISSING and have children —
+    # parents already present are not the LLM's problem, and a leaner prompt
+    # means a faster derivation call (observed live: a bloated prompt riding
+    # LangChain's x3 retries took 5m01s).
     hierarchy_lines: list[str] = []
     for c in target_concepts:
         cid = c["_id"]
         concept = (c.get("concept") or c.get("taxonomy_key") or "").strip()
-        if not _SYSTEM_PREFIX_RX.match(concept):
+        if not _SYSTEM_PREFIX_RX.match(concept) or cid in present_ids:
             continue
         label = c.get("label", "?")
         child_ids = parent_children.get(cid, [])
@@ -322,8 +462,23 @@ def derive_missing_concepts(
         _report_call(
             f"  [llm]  {derive_msg}  → calling llm  ({_LP or 'llm'})"
         )
-        llm = build_llm()
-        response = llm.invoke(prompt)
+        # Bounded, self-retried derive call: max_retries=0 disables LangChain's
+        # built-in x3 retries (a hung request would otherwise stall for
+        # timeout×3 — observed live: 120s × 3 ≈ 5m01s).  Our single retry
+        # bounds the worst case to ~2 × timeout while still surviving one
+        # transient failure.
+        response: str | None = None
+        for attempt in (1, 2):
+            try:
+                llm = build_llm(max_retries=0)
+                response = llm.invoke(prompt)
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Derivation LLM call failed (attempt %d/2): %s", attempt, exc,
+                )
+        if response is None:
+            return concept_metrics, set()
     except Exception as exc:
         logger.warning("Derivation LLM call failed: %s", exc)
         return concept_metrics, set()
@@ -388,22 +543,20 @@ def derive_missing_concepts(
 def load_prior_values(
     target_concepts: list[dict],
     cik: str | None,
-    detected_period_type: str | None,
-    sec_report_date: str | None,
+    period: Any,
 ) -> dict[str, float]:
     """Load prior-period values from normalize_data for agent reference."""
     if not cik or not target_concepts:
         return {}
     try:
-        from earnings_agents.integrations.normalize import _get_client, _NORMALIZE_DB
-        from datetime import date as _date
-
-        db = _get_client()[_NORMALIZE_DB]
-        period_type = detected_period_type or "quarterly"
-        col_name = (
-            "concept_values_quarterly" if period_type == "quarterly"
-            else "concept_values_annual"
+        from earnings_agents.integrations.normalize import (
+            _get_client,
+            _NORMALIZE_DB,
+            _values_collection,
         )
+        from earnings_agents.agent.period import parse_iso_period_end
+        db = _get_client()[_NORMALIZE_DB]
+        col_name = _values_collection(period)
 
         all_periods = sorted(
             db[col_name].distinct(
@@ -413,13 +566,11 @@ def load_prior_values(
             reverse=True,
         )
 
-        if sec_report_date:
-            try:
-                cfd = _date.fromisoformat(sec_report_date) if isinstance(sec_report_date, str) else sec_report_date
-                if all_periods and all_periods[0] == cfd:
-                    all_periods = all_periods[1:]
-            except (ValueError, TypeError):
-                pass
+        if (
+            all_periods
+            and parse_iso_period_end(all_periods[0]) == period.period_end
+        ):
+            all_periods = all_periods[1:]
 
         prior_end = all_periods[0] if all_periods else None
         if not prior_end:
@@ -446,7 +597,10 @@ def load_prior_values(
                 if label:
                     result[label] = float(val)
 
-        logger.info("Prior values: loaded %d from %s", len(result), prior_end.date())
+        logger.info(
+            "Prior values: loaded %d from %s",
+            len(result), parse_iso_period_end(prior_end) or prior_end,
+        )
         return result
     except Exception:
         logger.debug("Prior values unavailable", exc_info=True)

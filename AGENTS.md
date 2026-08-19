@@ -13,7 +13,6 @@ Tier 0/1 concept mapping, CALC derivation, strict save gate) keep it accurate.
 
 ```bash
 uv sync                                  # install deps
-uv run pytest -q                         # all tests
 uv run earnings --ticker MSFT            # CLI run (SEC EDGAR path)
 uv run earnings --ticker MSFT --dry-run  # connectivity check, no LLM
 uv run earnings --ticker MSFT -v         # DEBUG logging
@@ -35,10 +34,10 @@ fetch_filing → detect_period → check_period → load_company_concepts
 
 | # | Node | File | Job |
 |---|------|------|-----|
-| 1 | `fetch_filing` | `nodes/fetch.py` | Fetch **ALL** EX-99 text exhibits (press release + presentation + supplemental — income statements often live in a supplemental exhibit, e.g. BofA's 99.3), convert each to plain text, concatenate with `DOCUMENT n OF m` headers; records `document_map` (exhibit line ranges, truncation, skips) in state. Non-text exhibits skipped; per-exhibit/total size caps. |
-| 2 | `detect_period` | `agent/period.py` | **The period agent** (below). Reads the document header and reports `{period_type, period_end, quarter, period_label}`. Failure = run failure — **no deterministic period inference anywhere**. |
-| 3 | `check_period` | `nodes/check.py` | With the agent-detected period, computes `(fiscal_year, quarter)` via `compute_fiscal_period` and checks **exact-period existence only** (no accession checks): same fiscal period stored → schedule `_pending_replace` and **continue** (delete stays deferred to save); else proceed. An annual period is checked/replaced in `concept_values_annual` only — a quarterly Q4 record for the same fiscal year is never checked or touched. |
-| 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes `detected_period_type` (no period decision here). **Computes the recent-value window FIRST** (`get_recently_valued_concept_ids`: concepts valued in any of the last `PROMPT_HISTORY_PERIODS` (3) periods — quarterly → `concept_values_quarterly`, annual → `concept_values_annual`), then loads **only those** concept docs (`_id $in` query-level filter) — non-recent concepts are never even loaded. **Exception**: `system:` and `calculated` concepts are ALWAYS loaded (CALC derivation targets — excluding them would make them permanently underivable); they are never in the agent's extraction list. **Skips** when no historical data exists OR no concept was valued recently (nothing to extract). |
+| 1 | `fetch_filing` | `nodes/fetch.py` | Fetch **ALL** EX-99 text exhibits AND PDF documents (press release + presentation + supplemental — income statements often live in a supplemental exhibit, e.g. BofA's 99.3; manually-triggered shareholder letters arrive as PDFs, e.g. on Q4CDN), convert each to plain text (HTML via BeautifulSoup, PDF via pdfplumber with `PDF page n of m` separators), concatenate with `DOCUMENT n OF m` headers; records `document_map` (doc line ranges, truncation, skips) in state. Non-fetchable exhibits (images) skipped; per-exhibit/total size caps; `file_type` = `pdf` when any PDF was fetched, else `html`. |
+| 2 | `detect_period` | `agent/period.py` | **The period agent** (below). Reads the document header and writes the canonical `detected_period` record `{period_type, period_end, quarter, period_label, fiscal_year}`. Failure = run failure — **no deterministic period inference anywhere**. |
+| 3 | `check_period` | `nodes/check.py` | Consumes the canonical agent-detected period (including its already-resolved `fiscal_year` and `quarter`) and checks **exact-period existence only** (no accession checks): same fiscal period stored → schedule `_pending_replace` and **continue** (delete stays deferred to save); else proceed. An annual period is checked/replaced in `concept_values_annual` only — a quarterly Q4 record for the same fiscal year is never checked or touched. |
+| 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes the canonical `detected_period` (no period decision here). **Computes the recent-value window FIRST** (`get_recently_valued_concept_ids`: concepts valued in any of the last `PROMPT_HISTORY_PERIODS` (3) periods — quarterly → `concept_values_quarterly`, annual → `concept_values_annual`), then loads **only those** concept docs (`_id $in` query-level filter) — non-recent concepts are never even loaded. **Exception**: `system:` and `calculated` concepts are ALWAYS loaded (CALC derivation targets — excluding them would make them permanently underivable); they are never in the agent's extraction list. **Skips** when no historical data exists OR no concept was valued recently (nothing to extract). |
 | 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop → map → derive (below). |
 | 6 | `mongodb_save` | `nodes/save.py` | STRICT_ACCURACY gate → deferred replace (`delete_fiscal_period` immediately before upsert — no data-loss window) → upsert into `concept_values_{quarterly\|annual}`. |
 
@@ -56,7 +55,7 @@ fetch_filing → detect_period → check_period → load_company_concepts
   `read_lines`, `get_company_info` + terminal `finalize_period`), **open-ended** —
   no step cap.
 - Given `fiscal_year_end` (MMDD from `normalize_data.companies`); returns strict JSON
-  `{period_type, period_end, quarter, period_label}`. Multi-exhibit bundles are
+  `{period_type, period_end, quarter, period_label}`; the graph stores this as the canonical `detected_period` record after resolving `fiscal_year`. Multi-exhibit bundles are
   surfaced via the `get_document_info` exhibit map — the FIRST document is the
   press release carrying the period header.
 - Robust parsing: `period_end` accepts ISO, `M/D/YYYY`, and month-name forms;
@@ -116,14 +115,24 @@ reused automatically.
 
 ### Concept lookup & fiscal math (`integrations/normalize.py`)
 
-- `get_statement_concepts(cik, statement_types, period_type)` — returns `{_id, concept,
+- `get_statement_concepts(cik, statement_types, period=DetectedPeriod)` — returns `{_id, concept,
   label, path, statement_type, taxonomy_key, dimension, dimension_concept}`, sorted by
   `(path, order_key)`; labels disambiguated on collision; taxonomy keys path-qualified.
-- `compute_fiscal_period(end_date, fy_end_month, period_str)` — fiscal year + quarter
-  from the **agent-read** period date/label; prefers unambiguous period-str durations,
-  calendar-math fallback with 3-day boundary tolerance for Dec FY.
-- `upsert_concept_values` — routes quarterly/annual (`period_type_override` = the
-  agent's decision → FY-end month → period-str duration); deletes the period's docs
+- Collection routing is DRY: `_concepts_collection(period)` →
+  `normalized_concepts_{quarterly|annual}` and `_values_collection(period)` →
+  `concept_values_{quarterly|annual}` are the single routing helpers used by every
+  concept/value read & write (concept queries, recent-window, existence/delete,
+  prior-value loads, and the upsert). Every production read/write API receives
+  the explicit period-agent type or the canonical `DetectedPeriod` object; there
+  is no quarter-only or default-quarter routing. Fiscal-year math lives in
+  `agent/period.py::compute_fiscal_year(end_date, fy_end_month)`; the display
+  label `FY2026 Q3` / `FY2026 (annual)` is formatted by one shared
+  `agent/period.py::format_period_label(period)` — no node recomputes
+  it. All downstream period consumers call `require_detected_period(state)` and
+  use the canonical `detected_period` record; no node reads duplicate scalar
+  period fields or EDGAR/report dates for period identity.
+- `upsert_concept_values` — accepts the canonical `DetectedPeriod`, routes
+  quarterly/annual from its agent decision, and deletes the period's docs
   before bulk-write; `calculated` flag per derived id; `accession_number` stamped for traceability (never used for checks/dedup).
 
 ## Code map
@@ -135,7 +144,6 @@ src/earnings_agents/
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py
   integrations/ edgar.py · normalize.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
-tests/          9 test modules + fixtures/golden/ (scale-parsing JSON cases)
 ```
 
 - `llm.py` — provider factory (`build_llm` → `invoke(str)->str` for the derive pass;
@@ -144,15 +152,15 @@ tests/          9 test modules + fixtures/golden/ (scale-parsing JSON cases)
 - `progress.py` — `WorkerProgressPublisher` (Redis pub/sub `sec:worker:events`), heartbeat
 - `registry.py` — CIK/ticker lookup from `data/reference/sec_company_tickers.json` (24 h disk cache)
 - `integrations/edgar.py` — submissions API → 8-K Item 2.02 → filing index → EX-99.1 URLs;
-  `get_latest_earnings_url` returns `(url, supplemental, report_date, accession,
-  filing_date)`; **reportDate is passed through raw/informational** (the period agent
-  reads the document); token bucket (`EDGAR_RATE_LIMIT`, default 8 req/s); retry on 429/5xx
+  `get_latest_earnings_url` returns `(url, supplemental, accession, filing_date,
+  exhibits)`; the period agent alone reads the document for reporting period
+  identity; token bucket (`EDGAR_RATE_LIMIT`, default 8 req/s); retry on 429/5xx
 - `integrations/mongo.py` — raw earnings collection (`earnings_db.earnings`)
 
 ## Guardrails & invariants — do not break
 
 - **Period comes from the period agent or the run fails.** No regex/filename/
-  EDGAR-reportDate/cadence inference exists anywhere in the codebase.
+  EDGAR metadata/cadence inference exists anywhere in the codebase.
 - **Extraction target = recently-valued concepts only.** A concept is extracted
   only if it had a stored value in any of the last 3 periods (quarterly filing →
   last 3 quarterly periods in `concept_values_quarterly`; annual → last 3 annual
@@ -181,12 +189,33 @@ tests/          9 test modules + fixtures/golden/ (scale-parsing JSON cases)
   (no data loss on mid-run failure). No accession checks anywhere — re-runs always
   replace the same exact period; a quarterly Q4 record is never checked or deleted
   by annual processing.
+- **Manual filing URLs (admin panel)** — the worker honors a `filing_url` in the
+  queue payload (press-release HTML or **PDF shareholder letter**; passed through
+  from `POST /api/sec-rss/trigger-filing` → `sec:filings:8k`). When present, the
+  EDGAR lookup is skipped inside `_build_8k_state`; the queue's `filing_date`
+  (queued-day, also passed through) still anchors the period agent's sanity
+  window. No accession is stamped for manual URLs (informational only). PDFs use
+  a minimal static-asset request first (important for CDNs such as Adobe that
+  stall on a spoofed Chrome UA), then curl, then native-fingerprint Playwright
+  as fallbacks; they are converted via pdfplumber with the same caps, headers,
+  and `document_map` contract as HTML exhibits.
 - **Scale handling** — deterministic document pre-scan + `__scale__` field; parser
   refuses to scale percentages, per-share values, and share counts — incl.
   CamelCase taxonomy keys (`margin`/`yield`/`growth`/`ratio`/`eps`/`per share`…,
   observed live: `custom:NetInterestMarginCompanyProvided` stored 2,080,000 for
   a 2.08% yield). Ratio matching is word-bounded so "Operating expenses"
   (contains "ration") still scales.
+- **Sign handling (SEC/IR convention)** — parenthesized amounts are negative:
+  `_parse_llm_response` first runs an unconditional `_coerce_number` pass that
+  turns `"(175,685)"`, `"-175,685"`, `"$1,234"`, `"($1,234)"`, `"(-667,172)"`
+  into correctly signed floats (parens → `-abs`), always before scaling so
+  signs are never lost or doubled; strings that are not numbers stay untouched
+  downstream. The agent's `calculate` tool converts a bare parenthesized number
+  to `(0-n)` so `calculate("(175,685)")` → -175685 (operator groups like
+  `(a - b)` are untouched). The extraction prompt instructs the agent that
+  parenthesized/leading-minus rows are negative, that expense/loss rows
+  (interest expense, income tax provision) are usually shown parenthesized, and
+  to never copy a sign from another column.
 - **`report_call` convention** — every LLM/tool/DB call surfaced as `[llm]`/`[tool]`/
   `[db]`-prefixed lines; a single `[industry]` line per extraction pass shows the
   injected SIC context; the CLI highlights `→ calling llm` yellow and industry
@@ -242,16 +271,6 @@ pass (`build_llm`) still works.
 
 Both paths share `_build_8k_state` in `cli/earnings.py` — URL/accession resolution and
 state construction are identical by design.
-
-## Tests
-
-`pytest` (asyncio auto). `tests/`: `test_period_detection` (period agent: JSON parsing,
-Q4→annual coercion, sanity window, failure→failed, loop terminal-tool parameterization),
-`test_company_registry`, `test_concept_flags` (concept-audit regression: dimension
-flags, path collisions, margin safety), `test_edgar_client`, `test_failures_cli`,
-`test_llm_factory`, `test_mongodb_client`, `test_normalize_data_client` (fiscal math,
-concept collection selection, `check_period` node, save filters), `test_save_gate`.
-`tests/fixtures/golden/` holds scale-parsing JSON cases.
 
 ## Design decisions & known issues
 

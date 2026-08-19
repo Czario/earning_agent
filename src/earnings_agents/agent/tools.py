@@ -269,6 +269,10 @@ def build_pi_tools(
 
         Supports: +, -, *, /, parentheses, decimal numbers.
         No variables, no functions, no imports — pure arithmetic only.
+
+        NOTE: a parenthesized number on its own follows SEC/IR convention and
+        is NEGATIVE — calculate("(175,685)") → -175685, so passing a
+        negative-looking table row keeps its sign.
         """
         import ast
         import operator
@@ -307,6 +311,12 @@ def build_pi_tools(
         try:
             # Clean the expression: remove commas, currency symbols, whitespace
             clean = expression.replace(",", "").replace("$", "").strip()
+            # SEC/IR convention: a bare parenthesized number is NEGATIVE.
+            # Convert (1,234) → (0-1234) so the sign survives arithmetic
+            # (e.g. "-(175,685)" becomes -(0-175685) = +175685, i.e. the
+            # double negative the author wrote).  Groups containing operators
+            # "(a - b)" are untouched.
+            clean = re.sub(r"\((\d+(?:\.\d+)?)\)", r"(0-\1)", clean)
             tree = ast.parse(clean, mode="eval")
             result = _eval(tree.body)
             if isinstance(result, float) and result == int(result):

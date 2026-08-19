@@ -6,10 +6,12 @@ Refuses to save when accounting identity checks failed and
 from __future__ import annotations
 
 import logging
-from datetime import date as _date
-
 from earnings_agents.config import STRICT_ACCURACY
 from earnings_agents.state import EarningsAgentState
+from earnings_agents.agent.period import (
+    format_period_label,
+    require_detected_period,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +36,15 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         logger.error(msg)
         return {**state, "status": "failed", "error": msg}
 
+    try:
+        period = require_detected_period(state)
+    except Exception as exc:
+        msg = f"Refusing to save {ticker}: invalid period-agent result: {exc}"
+        report_call(f"  [save]  ✗ {msg}")
+        return {**state, "status": "failed", "error": msg}
+
     metrics = state.get("metrics") or {}
-    sec_report_date_str: str | None = state.get("sec_report_date")
-    sec_rd: _date | None = None
-    if sec_report_date_str:
-        try:
-            sec_rd = _date.fromisoformat(sec_report_date_str)
-        except ValueError:
-            pass
+    sec_rd = period.period_end
 
     if high_unresolved:
         logger.warning(
@@ -54,28 +57,19 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
     concept_metrics: dict = state.get("concept_metrics") or {}
     derived_ids: set[str] = set(state.get("derived_concept_ids") or [])
     cik: str | None = state.get("cik")
-    fy_end_month: int | None = state.get("fiscal_year_end_month")
-    fy_end_code: str = str(state.get("fiscal_year_end_code") or "1231")
-    # Period label comes from the PERIOD AGENT (detected from the document
-    # header); the extraction agent's __period__ is only a fallback.
-    period_str: str = str(
-        state.get("period_label") or (metrics.get("__period__") or "")
-    )
-    detected_period_type: str | None = state.get("detected_period_type")
+    # The period label and all period identity come from the canonical period
+    # agent result.  Extraction metadata is never allowed to provide a period.
+    period_str: str = period.period_label or ""
 
-    if concept_metrics and cik and fy_end_month and (period_str or sec_rd):
+    if concept_metrics and cik:
         pending = state.get("_pending_replace") or {}
         replace_note = ""
-        if pending.get("cik") and pending.get("fiscal_year"):
+        if pending.get("cik"):
             from earnings_agents.integrations.normalize import delete_fiscal_period
             pd_cik = pending["cik"]
-            pd_fy = pending["fiscal_year"]
-            pd_q = pending.get("quarter")
-            n_del = delete_fiscal_period(pd_cik, pd_fy, pd_q)
+            n_del = delete_fiscal_period(pd_cik, period)
             if n_del:
-                period_label = (
-                    f"FY{pd_fy} Q{pd_q}" if pd_q is not None else f"FY{pd_fy} (annual)"
-                )
+                period_label = format_period_label(period)
                 replace_note = f"replacing {period_label} — deleted {n_del} stale; "
                 logger.info(
                     "save: deleted %d stale concept(s) for CIK %s %s",
@@ -87,18 +81,14 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         n_derived = len(derived_ids)
         report_call(
             f"  [save]  {replace_note}upserting {n_mapped} mapped + {n_derived} derived "
-            f"concept(s) for CIK {cik} — {period_str or sec_report_date_str or '?'}"
+            f"concept(s) for CIK {cik} — {period_str or sec_rd.isoformat()}"
         )
         try:
             n = upsert_concept_values(
                 cik=cik,
                 company_name=state["company_name"],
                 concept_metrics=concept_metrics,
-                period_str=period_str,
-                fiscal_year_end_month=fy_end_month,
-                fiscal_year_end_code=fy_end_code,
-                report_date=sec_rd,
-                period_type_override=detected_period_type,
+                period=period,
                 derived_concept_ids=derived_ids,
                 accession_number=state.get("accession_number"),
             )
@@ -112,16 +102,13 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         reason_parts = []
         if not concept_metrics: reason_parts.append("no concept_metrics")
         if not cik: reason_parts.append("no CIK")
-        if not fy_end_month: reason_parts.append("no fy_end_month")
-        if not period_str and not sec_rd: reason_parts.append("no period date")
         report_call(f"  [save]  skipped — {', '.join(reason_parts)}")
         logger.warning(
             "Skipping normalize_data upsert for %s — "
-            "missing concept_metrics=%s cik=%s fy_end_month=%s period=%r",
+            "missing concept_metrics=%s cik=%s period=%r",
             ticker,
             bool(concept_metrics),
             cik,
-            fy_end_month,
             period_str,
         )
 

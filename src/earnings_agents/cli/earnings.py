@@ -98,7 +98,11 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
             reason = (state.get("error") or "no concepts")[:70]
             return f"  [load concepts]  skipped — {reason}"
         n = len(state.get("target_concepts") or [])
-        pt = state.get("detected_period_type") or "quarterly"
+        try:
+            from earnings_agents.agent.period import require_detected_period
+            pt = require_detected_period(state).period_type
+        except Exception:
+            pt = "unknown"
         return f"  [load concepts]  {n} concepts  ({pt})"
 
     if node_name == "detect_document_type_node":
@@ -109,9 +113,13 @@ def _format_step_line(node_name: str, state: dict) -> str | None:
     if node_name == "detect_period_node":
         if state.get("status") in ("failed", "skipped"):
             return f"  [period]         ✗  {(state.get('error') or '')[:70]}"
-        d = state.get("detected_period") or {}
-        label = d.get("period_label") or d.get("period_end") or "?"
-        return f"  [period]         ✓  {d.get('period_type')}  {label}"
+        try:
+            from earnings_agents.agent.period import require_detected_period
+            period = require_detected_period(state)
+            label = period.period_label or period.period_end.isoformat()
+            return f"  [period]         ✓  {period.period_type}  {label}"
+        except Exception as exc:  # defensive: hooks must not break the CLI
+            return f"  [period]         ✗  invalid result — {str(exc)[:50]}"
 
     if node_name == "check_period_node":
         s = state.get("status", "?")
@@ -222,7 +230,12 @@ def _print_insertion_summary(results: list[dict], printer=print) -> None:
             c["_id"]: c.get("label", c["_id"]) for c in all_concepts
         }
 
-        period = result.get("sec_report_date", "")
+        try:
+            from earnings_agents.agent.period import require_detected_period
+            detected_period = require_detected_period(result)
+            period = detected_period.period_end.isoformat()
+        except Exception:
+            period = ""
         header = f"Inserted concept values for {ticker}"
         if period:
             header += f"  ({period})"
@@ -276,24 +289,6 @@ def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
     return companies
 
 
-def _has_existing_period_data(ticker: str) -> bool:
-    """Return True when normalize_data already has at least one stored period for the ticker."""
-    if not ticker:
-        return False
-    try:
-        from earnings_agents.integrations.normalize import (
-            get_company_by_ticker,
-            get_latest_period,
-        )
-
-        company = get_company_by_ticker(ticker)
-        if company is None:
-            return False
-        return get_latest_period(company["cik"]) is not None
-    except Exception:  # noqa: BLE001 — fail safe: never force a skip on ambiguity
-        return False
-
-
 def _build_8k_state(
     ticker: str,
     company_name: str,
@@ -301,8 +296,8 @@ def _build_8k_state(
     *,
     filing_url: str | None = None,
     supplemental_urls: list[str] | None = None,
-    sec_report_date_str: str | None = None,
     accession: str | None = None,
+    filing_date: str | None = None,
     printer=print,
     dry_run: bool = False,
 ) -> dict:
@@ -314,14 +309,18 @@ def _build_8k_state(
 
     Period detection does NOT happen here — the period agent reads the filing
     document inside the graph (detect_period node).  This function only
-    resolves the filing URL, the accession, and the filing date.  No accession
-    or period existence checks — the graph's check_period node sees whether
-    the exact fiscal period is already stored and schedules a deferred
-    replace.
+    resolves the filing URL, the accession, and the filing date.  No period
+    value is ever seeded into the state here: ``detected_period`` is written
+    ONLY by ``detect_period_node``.  No accession or period existence checks —
+    the graph's check_period node sees whether the exact fiscal period is
+    already stored and schedules a deferred replace.
 
     When *filing_url* is not provided, the function fetches the latest 8-K
-    from SEC EDGAR (CLI path).  When it IS provided (worker path), the
-    function skips the EDGAR lookup and uses the pre-resolved URL.
+    from SEC EDGAR (CLI path).  When it IS provided (worker path — manual
+    trigger with a press-release HTML or shareholder-letter PDF URL), the
+    function skips the EDGAR lookup and uses the pre-resolved URL directly;
+    *filing_date* (from the admin queue) still anchors the period agent's
+    sanity window for the manual path.
     """
     _base = {
         "ticker": ticker or cik,
@@ -337,36 +336,30 @@ def _build_8k_state(
         "exhibit_meta": [],
     }
 
-    if not _has_existing_period_data(ticker):
-        printer(
-            f"  [SKIP]   {company_name} ({ticker or cik}) — no existing normalize_data period data; skipping 8-K discovery"
-        )
-        return {
-            **_base,
-            "discovered_file_url": None,
-            "status": "skipped",
-            "error": "no existing normalize_data period data found for this company; skipping 8-K path.",
-        }
-
     # ── Resolve filing URL, accession, filing date, exhibit list ──────────
-    _edgar_report_date: str | None = None
-    _filing_date: str | None = None
+    _edgar_filing_date: str | None = None
     exhibits: list[dict] = []
     if not filing_url:
         printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
         (
             filing_url,
             supplemental_urls,
-            _edgar_report_date,
             accession,
-            _filing_date,
+            _edgar_filing_date,
             exhibits,
         ) = get_latest_earnings_url(cik)
+    else:
+        printer(
+            f"  [URL]    {company_name} ({ticker or cik}) using provided filing URL "
+            f"— EDGAR lookup skipped"
+        )
 
     if accession:
         _base["accession_number"] = accession
-    if _filing_date:
-        _base["filing_date"] = _filing_date
+    if _edgar_filing_date:
+        _base["filing_date"] = _edgar_filing_date
+    elif filing_date:
+        _base["filing_date"] = filing_date
     if exhibits:
         _base["exhibit_meta"] = exhibits
 
@@ -389,21 +382,35 @@ def _build_8k_state(
         **_base,
         "discovered_file_url": filing_url,
         "supplemental_file_urls": supplemental_urls or [],
-        "sec_report_date": sec_report_date_str,
         "status": "discovered",
     }
 
 
-def _build_initial_state(info: dict, printer=print, dry_run: bool = False) -> dict:
+def _build_initial_state(
+    info: dict,
+    printer=print,
+    dry_run: bool = False,
+    *,
+    filing_url: str | None = None,
+    supplemental_urls: list[str] | None = None,
+    accession: str | None = None,
+    filing_date: str | None = None,
+) -> dict:
     """Build the LangGraph initial state for one company (CLI path).
 
     Thin wrapper around :func:`_build_8k_state` — resolves the filing URL
     from SEC EDGAR and delegates all period detection to the shared function.
+    When *filing_url* is provided (Redis worker manual trigger), the EDGAR
+    lookup is skipped and the given URL is used directly.
     """
     return _build_8k_state(
         ticker=info.get("ticker") or "",
         company_name=info["company_name"],
         cik=info["cik"],
+        filing_url=filing_url,
+        supplemental_urls=supplemental_urls,
+        accession=accession,
+        filing_date=filing_date,
         printer=printer,
         dry_run=dry_run,
     )
@@ -494,8 +501,7 @@ def _dry_run_company(
     if verdict == "blocked":
         printer(f"  Reason  : {state.get('error', 'URL resolution failed')}")
     elif verdict == "skipped":
-        printer(f"  Reason  : {state.get('error', 'No existing normalize_data period data found')}")
-        printer("  Action  : Skipping SEC 8-K discovery because no prior normalize_data period exists")
+        printer(f"  Reason  : {state.get('error', 'Filing discovery skipped')}")
     elif verdict == "warning":
         if not llm_ok:
             if LLM_PROVIDER == "ollama":

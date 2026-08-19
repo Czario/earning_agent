@@ -59,12 +59,10 @@ class EarningsAgentState(TypedDict):
     filing_date: NotRequired[Optional[str]]
     # ── Agent-detected reporting period (agent/period.py) ──────────────────
     # The reporting period is decided ONLY by the period agent reading the
-    # filing document (Q4 == annual).  detected_period_type drives concept
-    # loading; the rest drives check_period and save.
-    detected_period_type: NotRequired[Optional[str]]  # "annual" | "quarterly"
-    detected_quarter: NotRequired[Optional[int]]      # 1-3 quarterly; None annual
-    period_label: NotRequired[Optional[str]]          # exact column header text
-    detected_period: NotRequired[Optional[dict]]      # {period_type, period_end, quarter, period_label}
+    # filing document (Q4 == annual).  This is the sole period state record;
+    # downstream code consumes it through require_detected_period().
+    # {period_type, period_end, quarter, period_label, fiscal_year}
+    detected_period: NotRequired[Optional[dict]]
     # Keys in metrics{} that were successfully matched to a concept_id during
     # extraction (Tier 0/1). Populated by agent pipeline.
     mapped_metric_keys: NotRequired[Optional[list[str]]]
@@ -80,11 +78,6 @@ class EarningsAgentState(TypedDict):
     missing_concept_labels: NotRequired[Optional[list[str]]]   # all unmapped
     missing_segment_labels: NotRequired[Optional[list[str]]]   # dimensional only
     missing_toplevel_labels: NotRequired[Optional[list[str]]]  # non-dimensional only
-    # ── Reporting period ───────────────────────────────────────────────
-    # The period-end date ("YYYY-MM-DD") as READ BY THE PERIOD AGENT from the
-    # document header — the single source of truth for period typing.  Set by
-    # detect_period_node; absent when period detection has not run.
-    sec_report_date: NotRequired[Optional[str]]
     # Populated by the agent pipeline when HTML tables are extracted.
     raw_sections: NotRequired[Optional[dict]]
     # Per-metric chunk provenance (informational).
@@ -93,17 +86,11 @@ class EarningsAgentState(TypedDict):
     # Consumed by ``check_source_grounding`` in analyze_metrics_node to flag
     # values that cannot be grounded in the source document.
     metric_source_snippets: NotRequired[Optional[dict]]  # str → str
-    # ── Period type (annual vs quarterly) ───────────────────────────────────
-    # Inferred at concept-load time from sec_report_date + fiscal_year_end_month.
-    # ``"annual"`` when the report period ends in the fiscal year-end month;
-    # ``"quarterly"`` otherwise (default).  Drives which normalized_concepts_*
-    # collection is queried for targeted extraction.
-    detected_period_type: NotRequired[Optional[str]]  # "annual" | "quarterly"
     # ── Deferred replace (internal) ─────────────────────────────────────────
     # Set by check_period_node when the period already exists in
     # normalize_data.  mongodb_save_node deletes old data before upserting
     # fresh data, ensuring no data loss if the pipeline fails mid-run.
-    _pending_replace: NotRequired[Optional[dict]]  # {"cik", "fiscal_year", "quarter"}
+    _pending_replace: NotRequired[Optional[dict]]  # {"cik"}; period is canonical detected_period
     _replace_period_label: NotRequired[Optional[str]]  # human-readable period label
     # ── Multi-exhibit documents ──────────────────────────────────────────
     # Filing exhibits as resolved by EDGAR: [{exhibit: "EX-99.1",

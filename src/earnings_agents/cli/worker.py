@@ -9,6 +9,8 @@ only ever sees its own messages — no re-queue loops.
 Pipeline mirrors ``uv run earnings --ticker X`` exactly:
   CLI    → ticker arg → EDGAR lookup → Exhibit 99.1 → pipeline
   Worker → Redis msg  → accession  → Exhibit 99.1 → pipeline
+  Manual → Redis msg  → filing_url (PDF letter / press HTML) → pipeline
+            (worker skips the EDGAR lookup when ``filing_url`` is present)
 
 Progress events are published to the ``sec:worker:events`` Redis pub/sub
 channel so admin_backend can stream them to the frontend in real time.
@@ -115,6 +117,11 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     company_name = company.get("name", ticker)
 
     # ── 3. Build state via shared function (identical to CLI path) ──────────
+    # A manual trigger may carry a direct filing_url (press-release HTML or
+    # shareholder-letter PDF from the admin panel).  When present, the EDGAR
+    # lookup is skipped inside _build_8k_state and the URL is used directly;
+    # the queue's filing_date (queued-day) still anchors the period agent's
+    # sanity window.  When absent, the behavior is the classic CLI auto-fetch.
     from earnings_agents.cli.earnings import _build_initial_state
 
     state = _build_initial_state(
@@ -123,6 +130,8 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
             "company_name": company_name,
             "cik": cik,
         },
+        filing_url=payload.get("filing_url"),
+        filing_date=payload.get("filing_date"),
     )
 
     # The reporting period is decided by the period agent INSIDE the graph —
@@ -133,6 +142,18 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         pub.publish("skip", f"skipped — {reason}")
         pub.close()
         return True
+
+    # Visible source differentiator: manual triggers carry a direct filing URL
+    # (press-release HTML or PDF shareholder letter) and skipped the EDGAR
+    # lookup inside _build_8k_state.  Publish an explicit event line so the
+    # admin panel's live log shows WHY the URL differs from the EDGAR path.
+    manual_url = payload.get("filing_url")
+    if manual_url:
+        pub.publish(
+            "progress",
+            "[source]  manual filing URL provided — extracting from it "
+            "directly (EDGAR lookup skipped)",
+        )
 
     logger.info("Processing 8-K for %s  url=%s", ticker, state.get("discovered_file_url"))
 
@@ -187,10 +208,14 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     status = final.get("status", "")
     llm_tag = f"  ({llm_call_count[0]} LLM calls)" if llm_call_count[0] else ""
 
-    # Period comes from the graph (period agent) — store on payload for the
-    # MongoDB status update; report replace action for UI visibility.
-    if final.get("sec_report_date"):
-        payload["sec_report_date"] = final["sec_report_date"]
+    # Period comes from the graph's canonical period-agent record.  Derive all
+    # external status metadata from that record; never read a duplicate date
+    # or period field from state.
+    from earnings_agents.agent.period import require_detected_period
+    try:
+        detected_period = require_detected_period(final)
+    except Exception:
+        detected_period = None
     if final.get("_pending_replace"):
         label = final.get("_replace_period_label", "?")
         if status == "saved":
@@ -211,38 +236,26 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
 
     if status == "saved":
         n = len(final.get("concept_metrics") or {})
-        period_out = final.get("sec_report_date") or ""
-        year = period_out[:4] if period_out else "?"
+        period_out = (
+            detected_period.period_end.isoformat()
+            if detected_period is not None else ""
+        )
+        year = str(detected_period.fiscal_year) if detected_period else "?"
         summary = f"✓ {ticker}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
         pub.publish("summary", summary, kind="summary")
-        # Build a human period label (FY2026 Q1 / FY2026 Annual) by reading
-        # fiscal_year + quarter that normalize_data already stored — no
-        # calculation here, just reading what was written by the pipeline.
+        # Use the exact canonical period context produced by the period agent.
+        # Do not re-query the latest database row: another job could win that
+        # race and relabel this filing with a different period.
         _period_label: str | None = None
-        try:
-            from earnings_agents.integrations.normalize import (
-                get_company_by_ticker,
-                get_latest_period,
-            )
-            _company = get_company_by_ticker(ticker) if ticker else None
-            if _company:
-                _lp = get_latest_period(_company["cik"])
-                if _lp:
-                    _fy = _lp.get("fiscal_year")
-                    _q  = _lp.get("quarter")
-                    _pt = _lp.get("period_type", "annual")
-                    if _pt == "quarterly" and _q and _fy:
-                        _period_label = f"FY{_fy} Q{_q}"
-                    elif _fy:
-                        _period_label = f"FY{_fy} Annual"
-        except Exception:  # noqa: BLE001
-            pass
+        if detected_period is not None:
+            from earnings_agents.agent.period import format_period_label
+            _period_label = format_period_label(detected_period)
         # Store in payload so main() passes it to _update_load_request_status.
         if _period_label:
             payload["_sec_period_label"] = _period_label
         logger.info(
             "8-K saved for %s — period=%s  concepts=%d  llm_calls=%d  elapsed=%s",
-            ticker, final.get("sec_report_date"), n, llm_call_count[0], elapsed_str,
+            ticker, period_out, n, llm_call_count[0], elapsed_str,
         )
         return True
 
@@ -375,15 +388,13 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("Unhandled error processing 8-K job for %s", payload.get("ticker"))
 
         if success:
-            # Write sec_period_of_report so the pipeline table shows the period.
-            # _sec_period_label (e.g. "FY2026 Q1" / "FY2026 Annual") is set by
-            # _process_payload after reading normalize_data; fall back to the
-            # raw EDGAR date if it wasn't computable.
-            _period = (
-                payload.pop("_sec_period_label", None)
-                or payload.get("sec_report_date")  # set by _process_payload (corrected)
-                or ""
-            )
+            # Write sec_period_of_report so the pipeline table shows the
+            # period.  _sec_period_label (e.g. "FY2026 Q1" / "FY2026 Annual")
+            # is set by _process_payload after reading the agent-selected
+            # collection.
+            # Do not fall back to EDGAR/report dates here; a completed job
+            # without the agent label must remain unlabeled, not misclassified.
+            _period = payload.pop("_sec_period_label", None) or ""
             _update_load_request_status(payload, "completed", period_of_report=_period)
         else:
             payload["attempts"] = attempts + 1

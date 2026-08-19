@@ -15,6 +15,7 @@ from typing import Any, Optional
 from bson import ObjectId
 from pymongo import MongoClient, UpdateOne
 
+from earnings_agents.agent.period import DetectedPeriod, format_period_label
 from earnings_agents.config import MONGODB_URI
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,26 @@ def get_company_by_ticker(ticker: str) -> dict[str, Any] | None:
         "fiscal_year_end_code": fy_code,
         "industry": doc.get("industry") or {},
     }
+
+
+# ── Collection routing — single source of truth ─────────────────────────────
+
+def _concepts_collection(period: DetectedPeriod) -> str:
+    """Return the normalized-concepts collection for the agent period."""
+    if period.period_type == "annual":
+        return "normalized_concepts_annual"
+    if period.period_type == "quarterly":
+        return "normalized_concepts_quarterly"
+    raise ValueError(f"Unsupported period_type: {period.period_type!r}")
+
+
+def _values_collection(period: DetectedPeriod) -> str:
+    """Return the concept-values collection for the agent period."""
+    if period.period_type == "annual":
+        return "concept_values_annual"
+    if period.period_type == "quarterly":
+        return "concept_values_quarterly"
+    raise ValueError(f"Unsupported period_type: {period.period_type!r}")
 
 
 # ── Concept lookup ───────────────────────────────────────────────────────────
@@ -174,14 +195,16 @@ def _distinguishing_parent_label(
 def get_statement_concepts(
     cik: str,
     statement_types: list[str] | None = None,
-    period_type: str = "quarterly",
+    *,
+    period: DetectedPeriod,
     concept_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return sorted concept dicts for *cik* and *statement_types*.
 
-    *period_type* selects the source collection:
-      - ``"quarterly"`` (default) → ``normalized_concepts_quarterly``
-      - ``"annual"``              → ``normalized_concepts_annual``
+    *period* is the canonical period-agent result and selects the source
+    collection from ``period.period_type``:
+      - ``"quarterly"`` → ``normalized_concepts_quarterly``
+      - ``"annual"``    → ``normalized_concepts_annual``
 
     *concept_ids* (optional) restricts the load to exactly those concept
     ``_id`` strings — the recent-value window filter is applied HERE, at query
@@ -194,15 +217,16 @@ def get_statement_concepts(
     rows.  All other rows — including calculated/system concepts, dimensional
     breakdown rows, and XBRL structural labels — are included.
 
-    Results are sorted by ``path`` so the prompt lists concepts in statement
-    order.
+    Results are sorted by ``path`` then ``order_key`` so the prompt lists
+    concepts in statement order deterministically, including same-path rows.
 
     Each returned dict has keys: ``_id`` (str), ``concept`` (GAAP name),
     ``label`` (cleaned, disambiguated only when needed), ``path``,
-    ``statement_type``, ``taxonomy_key`` (stable XBRL identity used as the
-    JSON key in the extraction prompt and as the mapping key back to
-    ``concept_id``), plus ``dimension`` / ``dimension_concept`` (bool) as
-    the authoritative dimensional-row signal.
+    ``order_key``, ``statement_type``, ``taxonomy_key`` (stable XBRL identity
+    used as the JSON key in the extraction prompt and as the mapping key back
+    to ``concept_id``), plus ``dimension`` / ``dimension_concept`` (bool) as
+    the authoritative dimensional-row signal.  ``(path, order_key)`` is the
+    row identity; path alone is not unique in normalized XBRL data.
 
     Rows whose ``label`` is empty after cleanup are dropped with a debug log.
     When two rows in the same statement collapse to the same base label, the
@@ -214,11 +238,7 @@ def get_statement_concepts(
     """
     if statement_types is None:
         statement_types = ["income"]
-    collection_name = (
-        "normalized_concepts_annual"
-        if period_type == "annual"
-        else "normalized_concepts_quarterly"
-    )
+    collection_name = _concepts_collection(period)
     db = _get_client()[_NORMALIZE_DB]
     from earnings_agents.hooks import report_call as _report_call
     _report_call(f"  [db]  query {collection_name}  concepts for CIK {cik}")
@@ -297,9 +317,9 @@ def get_statement_concepts(
         label_groups.setdefault(key, []).append(path)
         tkey = (f"{concept}|{member_tag}" if member_tag else concept).lower()
         base_key_counts[(st, tkey)] = base_key_counts.get((st, tkey), 0) + 1
-        # First row at a path wins: duplicate paths exist (sibling rows
-        # disambiguated by order_key), so last-write would be arbitrary and
-        # order-dependent.
+        # The first sorted row at a path is used only as the fallback parent
+        # label for label disambiguation.  The hierarchy builder retains every
+        # (path, order_key) row; this map must not be used for hierarchy edges.
         if path and path not in path_to_head:
             path_to_head[path] = head
 
@@ -337,12 +357,14 @@ def get_statement_concepts(
             taxonomy_key = f"{taxonomy_key}|{path}"
 
         # Drop only exact duplicates (same concept + path in the same statement).
-        dedup_key = (st, concept.lower(), path)
+        order_key = d.get("order_key")
+        order_key_identity = "" if order_key is None else str(order_key)
+        dedup_key = (st, concept.lower(), path, order_key_identity)
         if dedup_key in seen_final:
             logger.debug(
-                "get_statement_concepts: dropping duplicate concept/path %r "
-                "(cik=%s concept=%s path=%r)",
-                final_label, cik, concept, path,
+                "get_statement_concepts: dropping exact duplicate concept/path/order "
+                "%r (cik=%s concept=%s path=%r order_key=%r)",
+                final_label, cik, concept, path, order_key,
             )
             continue
         seen_final.add(dedup_key)
@@ -353,6 +375,7 @@ def get_statement_concepts(
                 "concept": concept,
                 "label": final_label,
                 "path": path,
+                "order_key": order_key,
                 "statement_type": st,
                 "taxonomy_key": taxonomy_key,
                 "dimension": bool(d.get("dimension")),
@@ -365,7 +388,8 @@ def get_statement_concepts(
 def get_calculated_concepts(
     cik: str,
     statement_types: list[str] | None = None,
-    period_type: str = "quarterly",
+    *,
+    period: DetectedPeriod,
 ) -> list[dict[str, Any]]:
     """Return calculated/system concept dicts for *cik*.
 
@@ -382,11 +406,7 @@ def get_calculated_concepts(
     """
     if statement_types is None:
         statement_types = ["income"]
-    collection_name = (
-        "normalized_concepts_annual"
-        if period_type == "annual"
-        else "normalized_concepts_quarterly"
-    )
+    collection_name = _concepts_collection(period)
     db = _get_client()[_NORMALIZE_DB]
     from earnings_agents.hooks import report_call as _report_call
     _report_call(f"  [db]  query {collection_name}  calculated concepts for CIK {cik}")
@@ -407,9 +427,10 @@ def get_calculated_concepts(
             "concept": 1,
             "label": 1,
             "path": 1,
+            "order_key": 1,
             "statement_type": 1,
         },
-    ).sort("path", 1)
+    ).sort([("path", 1), ("order_key", 1)])
 
     out: list[dict[str, Any]] = []
     for d in cursor:
@@ -428,6 +449,7 @@ def get_calculated_concepts(
                 "concept": d.get("concept", ""),
                 "label": head,
                 "path": d.get("path", ""),
+                "order_key": d.get("order_key"),
                 "statement_type": d.get("statement_type", ""),
             }
         )
@@ -440,19 +462,6 @@ def get_calculated_concepts(
 
 
 # ── Period helpers ───────────────────────────────────────────────────────────
-
-_MONTH_NAME_RE = re.compile(
-    r"(January|February|March|April|May|June|July|August|September|October|"
-    r"November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-    r"[.]?\s+(\d{1,2}),?\s+(\d{4})",
-    re.IGNORECASE,
-)
-
-# Keywords that indicate a full-year / annual period.
-_ANNUAL_PERIOD_RE = re.compile(
-    r"\b(year|twelve\s+months?|52\s+weeks?|53\s+weeks?|annual|full[- ]year)\b",
-    re.IGNORECASE,
-)
 
 # Number words that appear in US earnings period strings.
 _PERIOD_WORD_NUMS: dict[str, int] = {
@@ -476,14 +485,6 @@ _DURATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches "First Quarter", "Second Quarter", etc. or bare "Q1"–"Q4".
-_ORDINAL_QUARTER_RE = re.compile(
-    r"\b(first|second|third|fourth)\s+quarter\b|\bQ([1-4])\b",
-    re.IGNORECASE,
-)
-_ORDINAL_TO_NUM: dict[str, int] = {"first": 1, "second": 2, "third": 3, "fourth": 4}
-
-
 def _extract_duration(period_str: str) -> tuple[int, str] | None:
     """Return ``(count, unit)`` parsed from *period_str*, or ``None``.
 
@@ -503,200 +504,11 @@ def _extract_duration(period_str: str) -> tuple[int, str] | None:
     return count, unit
 
 
-def _quarter_from_period_str(period_str: str) -> int | None:
-    """Return the fiscal quarter (1–3) inferred from *period_str*, or ``None``.
+def parse_period_start_date(period: DetectedPeriod) -> date | None:
+    """Return the first calendar day of the canonical quarterly period.
 
-    Uses cumulative duration to determine the quarter:
-
-    * Week-based unambiguous values:
-      26 w → Q2, 39 w → Q3.  (13 weeks is ambiguous — falls back to date math.)
-    * Month-based unambiguous values:
-      6 m → Q2, 9 m → Q3.  (3 months is ambiguous — falls back to date math.)
-    * Ordinal words: "First Quarter" → Q1, etc.
-
-    ``"Thirteen Weeks"`` / ``"3 Months"`` is **never** inferred as Q1 because
-    many companies report non-cumulatively — they print the same duration
-    label for every quarter.  The caller must fall back to calendar-month
-    math using the company's ``fiscal_year_end_month`` and the period-end date.
-
-    Annual periods (52/53 weeks, 12 months) are handled by
-    ``detect_period_type`` upstream and never reach here.
-    """
-    if not period_str:
-        return None
-
-    # Explicit ordinal label takes priority.
-    m = _ORDINAL_QUARTER_RE.search(period_str)
-    if m:
-        if m.group(1):
-            return _ORDINAL_TO_NUM.get(m.group(1).lower())
-        return int(m.group(2))
-
-    duration = _extract_duration(period_str)
-    if duration is None:
-        return None
-    count, unit = duration
-
-    if unit == "weeks":
-        # 13 w is NOT inferred as Q1 — just like "3 months", it is
-        # ambiguous (non-cumulative reporters print "Thirteen Weeks"
-        # for every quarter).  Only cumulative durations are unambiguous.
-        if 25 <= count <= 27:
-            return 2
-        if 38 <= count <= 40:
-            return 3
-    elif unit == "months":
-        # 3 months is ambiguous — not inferred.  6/9 months are cumulative.
-        if count == 6:
-            return 2
-        if count == 9:
-            return 3
-    return None
-
-
-def detect_period_type(period_str: str) -> str:
-    """Return ``'annual'`` or ``'quarterly'`` based on *period_str*.
-
-    Annual indicators: "Year Ended", "Twelve Months Ended", "52/53 Weeks Ended".
-    Everything else (including "Three Months", "Thirteen Weeks") → quarterly.
-    """
-    return "annual" if _ANNUAL_PERIOD_RE.search(period_str) else "quarterly"
-
-
-def parse_period_end_date(period_str: str) -> date | None:
-    """Extract a ``date`` from a period string like "Three Months Ended March 31, 2026".
-
-    Handles both full month names ("March") and abbreviated forms ("Mar").
-    Returns ``None`` when no recognisable date pattern is found.
-    """
-    m = _MONTH_NAME_RE.search(period_str)
-    if m:
-        month_name = m.group(1)
-        date_str = f"{month_name} {m.group(2)} {m.group(3)}"
-        # Try full month name first ("March"), then abbreviated ("Mar").
-        for fmt in ("%B %d %Y", "%b %d %Y"):
-            try:
-                return datetime.strptime(date_str, fmt).date()
-            except ValueError:
-                continue
-    return None
-
-
-def compute_fiscal_period(
-    period_end_date: date,
-    fiscal_year_end_month: int,
-    period_str: str = "",
-) -> tuple[int, int]:
-    """Return ``(fiscal_year, quarter)`` for a period end date.
-
-    ``fiscal_year_end_month``: 1-12 (e.g. 6 for June, 12 for December).
-
-    *Fiscal year* is determined by comparing the period-end month against
-    ``fiscal_year_end_month``.  *Quarter* uses the company's
-    ``fiscal_year_end_month`` to divide the fiscal year into 3-month
-    blocks — no prediction from duration text (see below).
-
-    When *period_str* carries an unambiguous cumulative duration
-    (e.g. "Twenty-Six Weeks" → Q2, "Six Months" → Q2, "Nine Months" → Q3,
-    or an ordinal like "Second Quarter"), that value is used.
-    "Thirteen Weeks" and "Three Months" are **never** treated as Q1
-    because many companies report non-cumulatively — the same label
-    appears for every quarter.  The function falls back to calendar-month
-    math using *period_end_date* (or the date in *period_str*, which is
-    preferred when available).
-
-    The period_str **date** (e.g. "May 25, 2026" from "Three Months Ended
-    May 25, 2026") overrides *period_end_date* when both are present and
-    differ — the LLM reads the actual column header from the document,
-    which is more trustworthy than SEC EDGAR's company-set reportDate on 8-Ks.
-
-    Examples (MSFT, fy_end_month=6):
-      - 2026-03-31 → FY2026 Q3
-      - 2026-06-30 → FY2026 Q4
-      - 2025-09-30 → FY2026 Q1
-
-    Examples (SMPL, fy_end_month=8):
-      - "Three Months Ended May 30, 2026"   → FY2026 Q3
-      - "Thirteen Weeks Ended May 30, 2026"  → FY2026 Q3
-      - "Thirteen Weeks Ended Nov 30, 2025"  → FY2026 Q1
-    """
-    m = period_end_date.month
-    y = period_end_date.year
-
-    # Quarter is always derived from the period end date — no text-based
-    # extraction needed (avoids matching comparison quarters in the document
-    # body).  The period end date is unambiguous and compute_fiscal_period
-    # handles all fiscal year-end conventions correctly.
-
-    # The LLM's period_str date (e.g. "Three Months Ended May 25, 2026"
-    # read from the column header) may differ from SEC's reportDate when
-    # the LLM reads a comparison column by mistake.  SEC's reportDate
-    # (the *period_end_date* argument) is authoritative — only fall back
-    # to the LLM's date when no SEC date is available.
-    str_date = parse_period_end_date(period_str)
-    _has_sec_date = period_end_date is not None
-    if str_date is not None and str_date != period_end_date and not _has_sec_date:
-        logger.debug(
-            "compute_fiscal_period: no SEC date — using period_str date %s",
-            str_date,
-        )
-        m = str_date.month
-        y = str_date.year
-
-    # Fiscal year: if period month falls within the FY ending in fy_end_month
-    # of year y (i.e. m <= fy_end_month) → fiscal_year = y; otherwise y + 1.
-    fiscal_year = y if m <= fiscal_year_end_month else y + 1
-
-    # Quarter: prefer unambiguous period-string-derived value; fall back to
-    # calendar-month math (no guessing — "13 weeks"/"3 months" are ambiguous).
-    quarter = _quarter_from_period_str(period_str)
-    if quarter is None:
-        # Calendar-month fallback — exact for companies whose quarter ends
-        # align with calendar month boundaries (the vast majority).
-        fy_start_month = fiscal_year_end_month % 12 + 1
-        fy_month_offset = (m - fy_start_month) % 12
-        quarter = fy_month_offset // 3 + 1
-
-        # Boundary tolerance (Dec FY only): dates within 3 days after a
-        # standard quarter boundary may actually belong to the PREVIOUS
-        # quarter (e.g. July 3, 3 days after June 30 → should be Q2).
-        # Only for December fiscal year because non-Dec FY boundaries
-        # are naturally offset and standard math is correct.
-        _BOUNDARY_TOLERANCE = 3
-        if fiscal_year_end_month == 12:
-            for _q in range(1, 5):
-                _q_end_month = (fy_start_month + _q * 3 - 1) % 12 or 12
-                _boundary_years = [y]
-                if _q == 4 and m <= 3:
-                    _boundary_years.append(y - 1)
-                for _by in _boundary_years:
-                    try:
-                        if _q_end_month == 12:
-                            _boundary = date(_by, 12, 31)
-                        else:
-                            _boundary = date(_by, _q_end_month + 1, 1) - timedelta(days=1)
-                    except (ValueError, OverflowError):
-                        continue
-                    _diff_days = (period_end_date - _boundary).days
-                    if 0 <= _diff_days <= _BOUNDARY_TOLERANCE and _q != quarter:
-                        logger.debug(
-                            "compute_fiscal_period: end_date %s is %d days after "
-                            "Q%d boundary %s — snapping quarter %d → %d",
-                            period_end_date, _diff_days, _q, _boundary, quarter, _q,
-                        )
-                        quarter = _q
-                        if _q == 4 and _by == y - 1:
-                            fiscal_year = _by
-                        break
-
-    return fiscal_year, quarter
-
-
-def parse_period_start_date(period_str: str, end_date: date) -> date | None:
-    """Return the first calendar day of the reporting period, or ``None``.
-
-    Uses the cumulative duration encoded in *period_str* to count backwards
-    from *end_date*:
+    Uses the cumulative duration encoded in the agent's period label to count
+    backwards from the agent's period end:
 
     * Week-based: ``end_date - (weeks * 7) + 1 day``
       e.g. "Thirteen Weeks Ended May 2, 2026" → Feb 1, 2026
@@ -704,9 +516,12 @@ def parse_period_start_date(period_str: str, end_date: date) -> date | None:
       end month (inclusive of the period).
       e.g. "Six Months Ended June 30, 2026" → Jan 1, 2026
 
-    Returns ``None`` when no duration can be parsed from *period_str*.
+    Returns ``None`` when no duration can be parsed from the period label.
     """
-    duration = _extract_duration(period_str)
+    if period.period_type != "quarterly":
+        return None
+    duration = _extract_duration(period.period_label or "")
+    end_date = period.period_end
     if duration is None:
         return None
     count, unit = duration
@@ -721,136 +536,47 @@ def parse_period_start_date(period_str: str, end_date: date) -> date | None:
     return date(start_y, start_m, 1)
 
 
-# ── Latest period lookup ─────────────────────────────────────────────────────
+# ── Exact-period operations ──────────────────────────────────────────────────
 
-def get_latest_period(cik: str) -> dict[str, Any] | None:
-    """Return the most recently stored period for *cik* across both collections.
-
-    Queries ``concept_values_annual`` and ``concept_values_quarterly`` and
-    returns the record with the latest ``reporting_period.end_date``.
-
-    Returned dict has keys:
-      ``period_type``  — ``"annual"`` or ``"quarterly"``
-      ``fiscal_year``  — int
-      ``quarter``      — int | None  (None for annual)
-      ``end_date``     — ``datetime`` (UTC)
-
-    Returns ``None`` when no data exists for *cik* in either collection.
-    """
+def fiscal_period_exists(cik: str, period: DetectedPeriod) -> bool:
+    """Return whether the canonical agent period already has values."""
     db = _get_client()[_NORMALIZE_DB]
-    best: dict[str, Any] | None = None
-    best_end: datetime | None = None
-
-    for period_type in ("quarterly", "annual"):
-        col = db[f"concept_values_{period_type}"]
-        doc = col.find_one(
-            {"cik": cik, "statement_type": "income"},
-            {"reporting_period.end_date": 1, "reporting_period.fiscal_year": 1,
-             "reporting_period.quarter": 1},
-            sort=[("reporting_period.end_date", -1)],
-        )
-        if doc is None:
-            continue
-        rp = doc.get("reporting_period", {})
-        end_dt: datetime | None = rp.get("end_date")
-        if end_dt is None:
-            continue
-        if best_end is None or end_dt > best_end:
-            best_end = end_dt
-            best = {
-                "period_type": period_type,
-                "fiscal_year": rp.get("fiscal_year"),
-                "quarter": rp.get("quarter"),  # None for annual
-                "end_date": end_dt,
-            }
-
-    return best
-
-
-def fiscal_period_exists(
-    cik: str,
-    fiscal_year: int,
-    quarter: int | None = None,
-) -> bool:
-    """Return True when concept values already exist for *cik* + *fiscal_year* (+ *quarter*).
-
-    When *quarter* is None the check is against ``concept_values_annual``
-    (annual / full-year filings); otherwise ``concept_values_quarterly``.
-    """
-    db = _get_client()[_NORMALIZE_DB]
-    collection_name = (
-        "concept_values_annual" if quarter is None else "concept_values_quarterly"
-    )
     filt: dict[str, Any] = {
         "cik": cik,
         "statement_type": "income",
-        "reporting_period.fiscal_year": fiscal_year,
+        "reporting_period.fiscal_year": period.fiscal_year,
     }
-    if quarter is not None:
-        filt["reporting_period.quarter"] = quarter
-    return db[collection_name].count_documents(filt, limit=1) > 0
+    if period.quarter is not None:
+        filt["reporting_period.quarter"] = period.quarter
+    return db[_values_collection(period)].count_documents(
+        filt, limit=1
+    ) > 0
 
 
-def count_fiscal_period_values(
-    cik: str,
-    fiscal_year: int,
-    quarter: int | None = None,
-) -> int:
-    """Return the number of concept values stored for *cik* + *fiscal_year* (+ *quarter*).
-
-    When *quarter* is None the count is against ``concept_values_annual``
-    (annual / full-year filings); otherwise ``concept_values_quarterly``.
-    """
+def delete_fiscal_period(cik: str, period: DetectedPeriod) -> int:
+    """Delete values for the canonical agent period."""
     db = _get_client()[_NORMALIZE_DB]
-    collection_name = (
-        "concept_values_annual" if quarter is None else "concept_values_quarterly"
-    )
+    collection_name = _values_collection(period)
     filt: dict[str, Any] = {
         "cik": cik,
         "statement_type": "income",
-        "reporting_period.fiscal_year": fiscal_year,
+        "reporting_period.fiscal_year": period.fiscal_year,
     }
-    if quarter is not None:
-        filt["reporting_period.quarter"] = quarter
-    return db[collection_name].count_documents(filt)
-
-
-def delete_fiscal_period(
-    cik: str,
-    fiscal_year: int,
-    quarter: int | None = None,
-) -> int:
-    """Delete all concept values for *cik* + *fiscal_year* (+ *quarter*).
-
-    When *quarter* is None the delete is against ``concept_values_annual``
-    (annual / full-year filings); otherwise ``concept_values_quarterly``.
-
-    Returns the number of documents deleted.
-    """
-    db = _get_client()[_NORMALIZE_DB]
-    collection_name = (
-        "concept_values_annual" if quarter is None else "concept_values_quarterly"
-    )
-    filt: dict[str, Any] = {
-        "cik": cik,
-        "statement_type": "income",
-        "reporting_period.fiscal_year": fiscal_year,
-    }
-    if quarter is not None:
-        filt["reporting_period.quarter"] = quarter
+    if period.quarter is not None:
+        filt["reporting_period.quarter"] = period.quarter
     result = db[collection_name].delete_many(filt)
     if result.deleted_count:
-        period_label = f"FY{fiscal_year} Q{quarter}" if quarter is not None else f"FY{fiscal_year} (annual)"
         logger.info(
             "delete_fiscal_period: removed %d document(s) from %s for CIK %s %s",
-            result.deleted_count, collection_name, cik, period_label,
+            result.deleted_count, collection_name, cik,
+            format_period_label(period),
         )
     return result.deleted_count
 
 
 def get_recently_valued_concept_ids(
     cik: str,
-    period_type: str = "quarterly",
+    period: DetectedPeriod,
     n_periods: int = 3,
 ) -> set[str]:
     """Return concept_id strings that had a value in the last *n_periods* periods.
@@ -868,10 +594,7 @@ def get_recently_valued_concept_ids(
     Returns an **empty set** when no history exists; the caller skips the run
     (nothing to extract).
     """
-    col_name = (
-        "concept_values_annual" if period_type == "annual"
-        else "concept_values_quarterly"
-    )
+    col_name = _values_collection(period)
     db = _get_client()[_NORMALIZE_DB]
     col = db[col_name]
     periods = col.distinct(
@@ -896,37 +619,18 @@ def upsert_concept_values(
     cik: str,
     company_name: str,
     concept_metrics: dict[str, float],
-    period_str: str,
-    fiscal_year_end_month: int,
-    fiscal_year_end_code: str = "1231",
+    period: DetectedPeriod,
     statement_type: str = "income",
-    report_date: date | None = None,
-    period_type_override: str | None = None,
     derived_concept_ids: set[str] | None = None,
     accession_number: str | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
-    Routes to ``concept_values_quarterly`` or ``concept_values_annual``.
-    Routing precedence (highest first):
-
-    1. *period_type_override* — when the caller already resolved the period
-       type upstream (``state["detected_period_type"]`` from
-       ``load_company_concepts_node``), it is authoritative.  This keeps the
-       prompt's period selection and the save collection in lock-step from a
-       single source of truth.
-    2. **Fiscal year-end month** — when the resolved period-end month equals
-       the company's *fiscal_year_end_month*, the filing is annual.
-    3. **Duration keywords** in *period_str* (``detect_period_type``):
-      - "Three Months Ended …" / "Thirteen Weeks Ended …" → quarterly
-      - "Year Ended …" / "Twelve Months Ended …" / "52/53 Weeks Ended …" → annual
-
-    *report_date*: when provided (sourced from the SEC submissions API
-    ``reportDate`` field), it overrides the end date that would otherwise be
-    parsed from *period_str* via ``parse_period_end_date``.  This ensures the
-    stored ``end_date`` is the exact period-end date declared to the SEC rather
-    than an LLM-extracted approximation.  *period_str* is still used for
-    duration detection (quarterly vs annual, quarter number, start date).
+    Routes to ``concept_values_quarterly`` or ``concept_values_annual`` using
+    the supplied canonical period-agent result.  No duration, filename,
+    cadence, EDGAR metadata, or month-based period decision is made here.
+    The agent's period label is used only for the stored label and quarterly
+    ``start_date`` calculation.
 
     Documents are written to match the existing schema used by the SEC-based
     pipeline, with ``concept_id`` stored as ``ObjectId`` and ``end_date`` as
@@ -939,33 +643,16 @@ def upsert_concept_values(
         logger.debug("upsert_concept_values: empty concept_metrics — nothing to do")
         return 0
 
-    # ── Resolve the period end date ──────────────────────────────────────
-    # LLM __period__ is the sole source — it reads the actual document header
-    # and identifies the correct column.  No SEC fallback.
-    end_date = parse_period_end_date(period_str)
-    if end_date is None:
-        logger.warning(
-            "upsert_concept_values: LLM __period__ not parseable from %r — refusing to save",
-            period_str,
-        )
-        return 0
-
-    # ── Annual vs quarterly routing ─────────────────────────────────────
-    # Uses LLM's __period__ duration ("Three Months Ended" vs "Year Ended")
-    # with fiscal-year-end-month as fallback.
-    if period_type_override in ("annual", "quarterly"):
-        period_type = period_type_override
-    elif period_str:
-        period_type = detect_period_type(period_str)
-    elif end_date.month == fiscal_year_end_month:
-        period_type = "annual"
-    else:
-        period_type = "quarterly"
-    collection_name = f"concept_values_{period_type}"
+    # The period agent owns every reporting-period dimension.  This function
+    # only persists the canonical result; it never parses or infers a period.
+    period_type = period.period_type
+    collection_name = _values_collection(period)
     form_type = "10-K" if period_type == "annual" else "10-Q"
-
-    fiscal_year, quarter = compute_fiscal_period(end_date, fiscal_year_end_month, period_str)
-    start_date = parse_period_start_date(period_str, end_date) if period_str else None
+    fiscal_year = period.fiscal_year
+    quarter = period.quarter
+    end_date = period.period_end
+    period_str = period.period_label or ""
+    start_date = parse_period_start_date(period) if period_str else None
     # Store end_date as a native UTC datetime to match the existing collection schema.
     end_datetime = datetime(end_date.year, end_date.month, end_date.day, 0, 0, 0,
                             tzinfo=timezone.utc)
@@ -1048,13 +735,12 @@ def upsert_concept_values(
     _del_count = collection.delete_many(_del_filt).deleted_count
     if _del_count:
         logger.info(
-            "upsert_concept_values: deleted %d stale doc(s) for CIK %s FY%d %s",
-            _del_count, cik, fiscal_year,
-            f"Q{quarter}" if period_type == "quarterly" else "(annual)",
+            "upsert_concept_values: deleted %d stale doc(s) for CIK %s %s",
+            _del_count, cik, format_period_label(period),
         )
 
     from earnings_agents.hooks import report_call
-    period_label = f"FY{fiscal_year} Q{quarter}" if period_type == "quarterly" else f"FY{fiscal_year}"
+    period_label = format_period_label(period)
     collection.bulk_write(ops, ordered=False)
     report_call(
         f"  [db]  ✓ upserted {len(ops)} concept(s) → {collection_name}  {period_label}"

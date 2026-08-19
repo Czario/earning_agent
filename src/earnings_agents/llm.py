@@ -248,6 +248,7 @@ def build_llm(
     format_json: bool = False,
     json_schema: dict | None = None,
     request_timeout: float | None = None,
+    max_retries: int = 2,
     provider: str | None = None,
 ) -> Any:
     """Build an LLM client for the configured provider.
@@ -264,6 +265,12 @@ def build_llm(
             When provided, takes precedence over ``format_json``.
         request_timeout: Per-request HTTP timeout in seconds. Falls back to
             sensible per-provider defaults when None.
+        max_retries: How many times ChatOpenAI-backed providers (groq/deepseek)
+            retry a failed/timed-out request.  The LangChain default of 2 means
+            a hung request rides out ``timeout × 3`` — a multi-minute stall
+            (observed live: a 120s derive call taking 5m01s).  Callers that own
+            their own retry loop (e.g. the derivation pass) pass 0 so the stall
+            is bounded by a single timeout.
         provider: Explicit provider override (``"ollama"``, ``"groq"`` or
             ``"gemini"``). When given, takes precedence over the
             ``LLM_PROVIDER`` env var. Used by the extraction node to escalate
@@ -286,6 +293,7 @@ def build_llm(
             "api_key": GROQ_API_KEY,
             "base_url": GROQ_BASE_URL,
             "timeout": request_timeout if request_timeout is not None else GROQ_REQUEST_TIMEOUT,
+            "max_retries": max_retries,
         }
         if json_schema is not None or format_json:
             # llama-4-scout supports json_object but not strict json_schema mode.
@@ -311,6 +319,7 @@ def build_llm(
             "api_key": DEEPSEEK_API_KEY,
             "base_url": DEEPSEEK_BASE_URL,
             "timeout": request_timeout if request_timeout is not None else DEEPSEEK_REQUEST_TIMEOUT,
+            "max_retries": max_retries,
         }
         if json_schema is not None or format_json:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}

@@ -6,8 +6,8 @@ income-statement concepts from the appropriate normalized_concepts collection:
   - ``normalized_concepts_annual``    for annual filings (Q4 / year-end 8-Ks)
 
 The period type is NOT inferred here — it comes from the period agent
-(``detect_period_node``, state field ``detected_period_type``), which read it
-from the filing document.  Q4 is always annual.
+(``detect_period_node``, canonical state field ``detected_period``), which read
+it from the filing document.  Q4 is always annual.
 
 Populates ``cik``, ``target_concepts``, ``fiscal_year_end_month``,
 and ``recent_concept_ids`` in state so the agent pipeline
@@ -27,6 +27,7 @@ from earnings_agents.integrations.normalize import (
     get_recently_valued_concept_ids,
     get_statement_concepts,
 )
+from earnings_agents.agent.period import require_detected_period
 from earnings_agents.state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,9 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             "cik": None,
             "fiscal_year_end_month": None,
             "fiscal_year_end_code": None,
-            "detected_period_type": "quarterly",
+            # No period fallback on a skipped path; the period agent remains
+            # the only source of period throughout the pipeline.
+            "detected_period": state.get("detected_period"),
         }
         skipped.update(extra)
         return skipped  # type: ignore[return-value]
@@ -79,17 +82,26 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     cik: str = company["cik"]
     fy_end_month: int = company["fiscal_year_end_month"]
     fy_end_code: str | None = company.get("fiscal_year_end_code")
-    sec_report_date_str: str | None = state.get("sec_report_date")  # type: ignore[assignment]
 
-    # Period type — decided upstream by the PERIOD AGENT (detect_period_node),
-    # which read the current column header from the filing document.  Q4 is
-    # always annual.  No inference happens here.
-    period_type: str = state.get("detected_period_type") or "quarterly"
+    # The period type is decided upstream by the period agent, which read the
+    # current column header from the filing.  Q4 is always annual.  No period
+    # fallback or inference happens here.
+    try:
+        period = require_detected_period(state)
+    except Exception as exc:
+        return _skip(
+            f"Period agent did not provide a valid period for {ticker}: {exc}",
+            cik=cik,
+            fiscal_year_end_month=fy_end_month,
+            fiscal_year_end_code=fy_end_code,
+        )
+    period_type = period.period_type
+    period_end_str = period.period_end.isoformat()
 
     logger.info(
         "load_company_concepts: %s (CIK %s) — period_type=%s (from period agent, "
-        "sec_report_date=%s)",
-        ticker, cik, period_type, sec_report_date_str,
+        "period_end=%s)",
+        ticker, cik, period_type, period_end_str,
     )
 
     # ── 1. Recent-value window FIRST — the rule: extract ONLY concepts that
@@ -100,7 +112,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     # (system:/calculated concepts are exempt: always loaded for derivation.)
     try:
         recent = get_recently_valued_concept_ids(
-            cik, period_type=period_type, n_periods=PROMPT_HISTORY_PERIODS
+            cik, period=period, n_periods=PROMPT_HISTORY_PERIODS
         )
     except Exception as exc:  # noqa: BLE001
         return _skip(
@@ -109,7 +121,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
-            detected_period_type=period_type,
+            detected_period=state.get("detected_period"),
         )
 
     recent_concept_ids: list[str] = sorted(recent)
@@ -120,7 +132,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
-            detected_period_type=period_type,
+            detected_period=state.get("detected_period"),
         )
 
     # ── 2. Load ONLY the recently-valued concepts (query-level filter) ─────
@@ -128,7 +140,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         concepts = get_statement_concepts(
             cik,
             statement_types=["income"],
-            period_type=period_type,
+            period=period,
             concept_ids=recent_concept_ids,
         )
     except Exception as exc:  # noqa: BLE001
@@ -138,7 +150,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
-            detected_period_type=period_type,
+            detected_period=state.get("detected_period"),
         )
 
     from earnings_agents.hooks import report_call
@@ -160,7 +172,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
-            detected_period_type=period_type,
+            detected_period=state.get("detected_period"),
         )
 
     return {
@@ -172,5 +184,5 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         "calculated_concepts": [],
         "fiscal_year_end_month": fy_end_month,
         "fiscal_year_end_code": company.get("fiscal_year_end_code"),
-        "detected_period_type": period_type,
+        "detected_period": state.get("detected_period"),
     }

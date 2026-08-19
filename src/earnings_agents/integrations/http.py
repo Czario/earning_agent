@@ -4,14 +4,17 @@ Centralises headers, timeout handling, and error normalisation so nodes do not
 import ``requests`` directly.  Two header presets are provided:
 
 - ``SEC_HEADERS``  — programmatic User-Agent required by SEC EDGAR.
-- ``BROWSER_HEADERS`` — generic browser User-Agent for non-SEC pages.
+- ``BROWSER_HEADERS`` — generic browser headers for non-SEC HTML pages.
+- ``PDF_HEADERS`` — minimal headers for static binary assets.
 
 Public functions
 ----------------
 head(url) -> requests.Response
     Issue a HEAD request and return the response.
 get(url, *, sec=False) -> requests.Response
-    Issue a GET request, automatically choosing the correct header preset.
+    Issue an HTML GET request, automatically choosing the correct header preset.
+get_binary(url, *, sec=False) -> requests.Response
+    Issue a static binary GET without spoofing a browser User-Agent.
 """
 from __future__ import annotations
 
@@ -28,10 +31,19 @@ SEC_HEADERS: dict[str, str] = {
 # Generic browser User-Agent for non-SEC pages.
 BROWSER_HEADERS: dict[str, str] = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Static assets should not be sent with a spoofed browser User-Agent.  Some
+# CDNs treat a Chrome UA from a plain HTTP client differently from the browser
+# TLS fingerprint it normally comes with and leave the request hanging.
+PDF_HEADERS: dict[str, str] = {
+    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
 }
 
 
@@ -62,3 +74,21 @@ def get(url: str, *, sec: bool = False) -> requests.Response:
     """
     headers = SEC_HEADERS if sec else BROWSER_HEADERS
     return requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+
+
+def get_binary(url: str, *, sec: bool = False) -> requests.Response:
+    """Fetch a static binary document with the smallest useful header set.
+
+    HTML pages benefit from browser headers, but PDF downloads do not need
+    JavaScript, cookies, or a spoofed browser identity.  Keeping this separate
+    from :func:`get` also avoids changing the HTML fetching behavior.
+    """
+    headers = SEC_HEADERS if sec else PDF_HEADERS
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=HTTP_TIMEOUT,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    return response

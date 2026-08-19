@@ -171,24 +171,21 @@ def normalize_cik(cik: str) -> str:
 
 def get_latest_earnings_url(
     cik: str,
-) -> tuple[Optional[str], list[str], Optional[str], Optional[str], Optional[str], list[dict]]:
-    """Return ``(filing_url, supplemental_urls, report_date, accession,
-    filing_date, exhibits)`` for the most recent earnings press release.
+) -> tuple[Optional[str], list[str], Optional[str], Optional[str], list[dict]]:
+    """Return ``(filing_url, supplemental_urls, accession, filing_date,
+    exhibits)`` for the most recent earnings press release.
 
     ``filing_url`` is the URL to the primary earnings release (Exhibit 99.1).
     ``supplemental_urls`` is a list of additional exhibit URLs (EX-99.2, EX-99.3,
     etc.) that contain supplemental financial data.
-    ``report_date`` is the EDGAR ``reportDate`` field (``"YYYY-MM-DD"`` string) —
-    informational only; the reporting period itself is determined by the period
-    agent from the document, not from EDGAR metadata.
-    ``accession`` / ``filing_date`` identify the filing for dedup and the
+    ``accession`` / ``filing_date`` identify the filing and the
     period sanity window.
     ``exhibits`` is the full exhibit list in filing-index order:
     ``[{exhibit, description, url}]`` — e.g. EX-99.1 "The Press Release",
     EX-99.2 "The Presentation Materials", EX-99.3 "The Supplemental Information".
 
     Falls back to the most recent 8-K primary document if no Exhibit 99.1 is found.
-    Returns ``(None, [], None, None, None, [])`` if no 8-K filing is available.
+    Returns ``(None, [], None, None, [])`` if no 8-K filing is available.
     """
     cik_padded = normalize_cik(cik)
     cik_int = str(int(cik_padded))  # no leading zeros for archive paths
@@ -201,14 +198,13 @@ def get_latest_earnings_url(
         data = resp.json()
     except requests.RequestException as exc:
         logger.error("EDGAR submissions fetch failed for CIK %s: %s", cik_padded, exc)
-        return None, [], None, None, None, []
+        return None, [], None, None, []
 
     recent = data.get("filings", {}).get("recent", {})
     forms: list[str] = recent.get("form", [])
     items_list: list[str] = recent.get("items", [])
     accessions: list[str] = recent.get("accessionNumber", [])
     primary_docs: list[str] = recent.get("primaryDocument", [])
-    report_dates: list[str] = recent.get("reportDate", [])
     filing_dates: list[str] = recent.get("filingDate", [])
 
     # ── 2. Find latest 8-K with Item 2.02 (earnings results) ─────────────────
@@ -234,13 +230,10 @@ def get_latest_earnings_url(
 
     if target_idx is None:
         logger.warning("No 8-K filings found for CIK %s", cik_padded)
-        return None, [], None, None, None, []
+        return None, [], None, None, []
 
     acc = accessions[target_idx]       # e.g. "0000320193-26-000011"
     acc_nodash = acc.replace("-", "")  # e.g. "000032019326000011"
-    report_date: Optional[str] = (
-        report_dates[target_idx] if target_idx < len(report_dates) else None
-    )
     filing_date_str: Optional[str] = (
         filing_dates[target_idx] if target_idx < len(filing_dates) else None
     )
@@ -256,149 +249,15 @@ def get_latest_earnings_url(
                 "Found %d supplemental exhibit(s) for CIK %s: %s",
                 len(supplemental_urls), cik_padded, supplemental_urls,
             )
-        return primary_url, supplemental_urls, report_date, acc, filing_date_str, exhibits
+        return primary_url, supplemental_urls, acc, filing_date_str, exhibits
 
     # ── 4. Last resort: primary document from submissions metadata ────────────
     primary_doc = primary_docs[target_idx] if target_idx < len(primary_docs) else ""
     if primary_doc:
         url = f"{_EDGAR_ARCHIVES_BASE.format(cik_int=cik_int, acc_nodash=acc_nodash)}/{primary_doc}"
         logger.info("EDGAR primary doc fallback for CIK %s: %s", cik_padded, url)
-        return url, [], report_date, acc, filing_date_str, []
+        return url, [], acc, filing_date_str, []
 
     logger.warning("Could not resolve document URL for CIK %s accession %s", cik_padded, acc)
-    return None, [], None, None, None, []
-
-
-def get_next_8k_status(
-    cik: str,
-    last_stored_report_date_str: str,
-) -> dict:
-    """Check SEC EDGAR for an 8-K filed *after* *last_stored_report_date_str*.
-
-    Fetches the EDGAR submissions JSON (one rate-limited request) and scans
-    8-K Item\u202002.02 filings.
-
-    Returns a dict with:
-      ``available``       \u2014 True if a newer earnings 8-K is already on SEC
-      ``sec_report_date`` \u2014 period-end date of that filing (``"YYYY-MM-DD"`` or None)
-      ``filing_url``      \u2014 Exhibit\u202099.1 URL (or primary-doc fallback, or None)
-      ``estimated_date``  \u2014 projected filing date if not yet available (or None)
-    """
-    from datetime import date as _d, timedelta
-    import calendar
-
-    _empty: dict = {"available": False, "sec_report_date": None,
-                    "filing_url": None, "estimated_date": None}
-
-    cik_padded = normalize_cik(cik)
-    cik_int = str(int(cik_padded))
-
-    try:
-        resp = _edgar_get(_EDGAR_SUBMISSIONS.format(cik=cik_padded), timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        logger.warning("get_next_8k_status: submissions fetch failed CIK %s: %s", cik, exc)
-        return _empty
-
-    recent = data.get("filings", {}).get("recent", {})
-    forms: list[str] = recent.get("form", [])
-    items_list: list[str] = recent.get("items", [])
-    accessions: list[str] = recent.get("accessionNumber", [])
-    primary_docs: list[str] = recent.get("primaryDocument", [])
-    report_dates: list[str] = recent.get("reportDate", [])
-    filing_dates: list[str] = recent.get("filingDate", [])
-
-    try:
-        last_stored = _d.fromisoformat(last_stored_report_date_str)
-    except (ValueError, TypeError):
-        return _empty
-
-    # Capture the most recent 8-K report_date from any 8-K — used as a
-    # fallback to detect the "already stored" case even when the company
-    # doesn't tag its earnings 8-K as Item 2.02 in EDGAR submissions.
-    latest_any_8k_report_date: Optional[str] = None
-    for i, form in enumerate(forms):
-        if form != "8-K":
-            continue
-        rd_str = report_dates[i] if i < len(report_dates) else ""
-        if rd_str:
-            latest_any_8k_report_date = rd_str
-            break
-
-    # Collect 8-K Item 2.02 filings in chronological-desc order (as EDGAR returns them)
-    earnings_8ks: list[dict] = []
-    for i, form in enumerate(forms):
-        if form != "8-K":
-            continue
-        item_str = items_list[i] if i < len(items_list) else ""
-        if "2.02" not in item_str:
-            continue
-        rd_str = report_dates[i] if i < len(report_dates) else ""
-        fd_str = filing_dates[i] if i < len(filing_dates) else ""
-        earnings_8ks.append({
-            "report_date": rd_str,
-            "filing_date": fd_str,
-            "accession": accessions[i] if i < len(accessions) else "",
-            "primary_doc": primary_docs[i] if i < len(primary_docs) else "",
-        })
-
-    # ── Next expected period end ≈ last_stored + 3 months ────────────────────
-    # EDGAR report_date on an 8-K Item 2.02 is the *earnings announcement* date,
-    # not the period end date. The announcement for the already-stored period
-    # arrives ~14-45 days after that period ends — well before the next period
-    # ends. Requiring rd >= expected_next_period_end - 30 days filters out the
-    # current-period announcement and only matches the next quarter's filing.
-    try:
-        nm = last_stored.month + 3
-        ny = last_stored.year + (nm - 1) // 12
-        nm = (nm - 1) % 12 + 1
-        last_day = calendar.monthrange(ny, nm)[1]
-        expected_next_period_end = _d(ny, nm, min(last_stored.day, last_day))
-    except Exception:
-        return _empty
-
-    min_next_report_date = expected_next_period_end - timedelta(days=30)
-
-    latest_edgar_report_date: Optional[str] = None
-    for filing in earnings_8ks:  # most-recent first
-        rd_str = filing["report_date"]
-        if not rd_str:
-            continue
-        try:
-            rd = _d.fromisoformat(rd_str)
-        except ValueError:
-            continue
-        # Capture the most recent 8-K report date regardless of whether it
-        # clears the threshold — used to detect the "already stored" case.
-        latest_edgar_report_date = rd_str
-        if rd >= min_next_report_date:
-            acc = filing["accession"]
-            acc_nodash = acc.replace("-", "")
-            ex99_urls = _find_all_ex_99_urls(cik_int, acc, acc_nodash)
-            url = ex99_urls[0] if ex99_urls else None
-            if not url:
-                pdoc = filing["primary_doc"]
-                if pdoc:
-                    url = (
-                        f"{_EDGAR_ARCHIVES_BASE.format(cik_int=cik_int, acc_nodash=acc_nodash)}"
-                        f"/{pdoc}"
-                    )
-            return {
-                "available": True,
-                "sec_report_date": rd_str,
-                "filing_url": url,
-                "latest_edgar_report_date": rd_str,
-            }
-        break  # first entry is most recent; once we've seen it, stop
-
-    return {
-        "available": False,
-        "sec_report_date": None,
-        "filing_url": None,
-        # Prefer the Item 2.02 date; fall back to latest any-8-K date so
-        # companies that don't tag Item 2.02 still trigger the "already stored"
-        # detection in the coverage display.
-        "latest_edgar_report_date": latest_edgar_report_date or latest_any_8k_report_date,
-    }
+    return None, [], None, None, []
 
