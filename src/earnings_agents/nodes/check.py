@@ -1,9 +1,10 @@
 """Period existence check + deferred replace scheduling.
 
 Runs AFTER the period agent (``detect_period``) — the check has a
-trustworthy ``(fiscal_year, quarter)`` derived from the agent-read period end.
+trustworthy ``(fiscal_year, quarter)`` returned by the period agent.
 
-No accession checks — only exact-period existence:
+No accession checks — only exact-period existence using the canonical
+period-agent result:
 
   • same fiscal period stored  → schedule ``_pending_replace`` and CONTINUE —
     the delete itself stays deferred to ``mongodb_save``, which removes the

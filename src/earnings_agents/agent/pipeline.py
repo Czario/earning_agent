@@ -19,6 +19,7 @@ from earnings_agents.agent.industry import (
 from earnings_agents.agent.derive import (
     load_prior_values,
     map_concepts,
+    semantically_map_unmapped_metrics,
     prescan_document,
     SCALE_MULTIPLIERS,
 )
@@ -266,6 +267,14 @@ def agent_document_pipeline_node(state: EarningsAgentState) -> EarningsAgentStat
     metrics.pop("__derived__", None)
 
     concept_metrics, _reverse_map, mapped_keys = map_concepts(metrics, target_concepts)
+
+    # Exact taxonomy/label mapping is preferred.  Resolve only leftover
+    # numeric keys semantically (without changing their values) so filing
+    # wording such as "Revenue" vs "Total revenue" does not silently vanish.
+    concept_metrics, semantic_mapped_keys = semantically_map_unmapped_metrics(
+        metrics, target_concepts, concept_metrics,
+    )
+    mapped_keys.update(semantic_mapped_keys)
 
     # ── Deterministic derivation ───────────────────────────────────────
     from earnings_agents.agent.derive import derive_missing_concepts

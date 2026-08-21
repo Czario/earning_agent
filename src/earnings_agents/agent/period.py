@@ -20,7 +20,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 
 from earnings_agents.agent.loop import run_agent_loop
@@ -28,12 +28,6 @@ from earnings_agents.agent.tools import build_pi_tools
 from earnings_agents.state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
-
-# Sanity window for the agent-reported period end, relative to the 8-K filing
-# date.  A period end must be in the recent past (or at most ~1 week ahead for
-# edge drift) — anything else is a wrong column or a hallucination.
-_SANITY_MAX_FUTURE_DAYS = 7
-_SANITY_MAX_BACK_DAYS = 450
 
 _PERIOD_RECOVERY_RX = re.compile(r'\{[^{}]*"period_type"[^{}]*\}', re.DOTALL)
 
@@ -43,7 +37,9 @@ You are a period-detection agent.  Your ONLY job is to determine the CURRENT
 reporting period of an SEC earnings press release (plain text).
 
 The company's fiscal year-end is {fy_end} (MMDD format — e.g. 1231 = December
-31, 0630 = June 30).
+31, 0630 = June 30).  Use this as context for interpreting the company's
+fiscal calendar, but do not calculate the fiscal year from the filing date.
+The filing's current fiscal-year/quarter header is authoritative.
 
 STEPS
   1. get_document_info() for an overview — the text may be a BUNDLE of
@@ -65,16 +61,22 @@ RULES — CRITICAL
     column, report the FISCAL-YEAR (annual) column — never Q4.
   • period_end is the current period's end date — MUST be YYYY-MM-DD
     (e.g. "2026-07-26").
+  • fiscal_year is the company's fiscal year shown by the current filing,
+    not necessarily the calendar year of period_end. Read it from the
+    current fiscal-year header or the filing's explicit fiscal-year language.
+  • quarter is the company's fiscal quarter shown by the filing. Do not
+    calculate it from the number of months or days since the fiscal year-end.
   • period_label is the exact current column header text, and MUST include
     the full month name and year (e.g. "Three Months Ended July 26, 2026",
     "Fiscal Year Ended July 25, 2026").
-  • If you cannot find the period, say so in your final JSON as best you can
-    — do not guess dates you have not read.
+  • If the fiscal year or quarter cannot be established from the filing and
+    the fiscal-year-end context, do not guess; the run must be rejected.
 
 Call finalize_period with a JSON string:
   {{"period_type": "quarterly" | "annual",
     "period_end": "YYYY-MM-DD",
     "quarter": 1|2|3|null,
+    "fiscal_year": 2026,
     "period_label": "exact column header text"}}
 """
 
@@ -84,6 +86,7 @@ FINALIZE_PERIOD_DESCRIPTION = (
     '  - period_type: "quarterly" or "annual" (Q4 is ALWAYS annual)\n'
     '  - period_end: "YYYY-MM-DD" (current period end date, e.g. "2026-07-26")\n'
     "  - quarter: 1, 2, 3, or null (null for annual)\n"
+    "  - fiscal_year: the company fiscal year shown by the filing, as an integer\n"
     '  - period_label: the exact current column header text with full month '
     'name and year (e.g. "Three Months Ended July 26, 2026")'
 )
@@ -97,9 +100,9 @@ class PeriodDetectionError(RuntimeError):
 class DetectedPeriod:
     """The one canonical period contract produced by the period agent.
 
-    ``fiscal_year`` is resolved once, immediately after the agent has read and
-    validated ``period_end``.  Downstream code must consume this object via
-    :func:`require_detected_period`; it must not reconstruct a period from
+    All reporting-period dimensions, including ``fiscal_year``, come from the
+    validated period-agent result.  Downstream code must consume this object
+    via :func:`require_detected_period`; it must not reconstruct a period from
     legacy scalar state fields or filing metadata.
     """
 
@@ -132,21 +135,13 @@ def parse_period_end_date(period_str: str) -> date | None:
     return None
 
 
-def compute_fiscal_year(period_end: date, fiscal_year_end_month: int) -> int:
-    """Compute fiscal year from the period-agent's validated end date only."""
-    return (
-        period_end.year
-        if period_end.month <= fiscal_year_end_month
-        else period_end.year + 1
-    )
-
-
 def require_detected_period(state: Any) -> DetectedPeriod:
     """Return the validated, canonical period-agent result from *state*.
 
     This is the only downstream period contract.  It reads ``detected_period``
-    exclusively: no legacy scalar fields, filing dates, cadence, or database
-    state can supply or alter the reporting period.
+    exclusively: no legacy scalar fields, filing dates, fiscal-year-end
+    calculations, cadence, or database state can supply or alter the
+    reporting period.
     """
     raw = state.get("detected_period")
     if not isinstance(raw, dict):
@@ -178,7 +173,11 @@ def require_detected_period(state: Any) -> DetectedPeriod:
         )
 
     fiscal_year = raw.get("fiscal_year")
-    if isinstance(fiscal_year, bool) or not isinstance(fiscal_year, int):
+    if (
+        isinstance(fiscal_year, bool)
+        or not isinstance(fiscal_year, int)
+        or fiscal_year < 1
+    ):
         raise PeriodDetectionError(
             "period-agent result missing/invalid detected_period.fiscal_year"
         )
@@ -305,20 +304,31 @@ def _parse_period_result(result_str: str) -> dict[str, Any] | None:
         if quarter not in (1, 2, 3, 4):
             return None
 
+    fiscal_year = parsed.get("fiscal_year")
+    if isinstance(fiscal_year, bool):
+        return None
+    if isinstance(fiscal_year, int):
+        pass
+    elif isinstance(fiscal_year, str) and fiscal_year.strip().isdigit():
+        fiscal_year = int(fiscal_year.strip())
+    else:
+        return None
+    if fiscal_year < 1:
+        return None
+
     label = str(parsed.get("period_label", "")).strip() or None
 
     return {
         "period_type": period_type,
         "period_end": period_end,
         "quarter": quarter,
+        "fiscal_year": fiscal_year,
         "period_label": label,
     }
 
 
 def apply_period_business_rules(
     parsed: dict[str, Any],
-    *,
-    filing_date: date | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Validate the agent's period and apply the Q4→annual business rule.
 
@@ -329,12 +339,12 @@ def apply_period_business_rules(
     Rules:
       • quarter == 4 or a "fourth quarter" label → coerce to annual, quarter None
       • annual periods never carry a quarter
-      • period_end must fall inside the sanity window vs the filing date
       • quarterly periods must name a quarter (1–3)
     """
     period_type = parsed["period_type"]
     period_end: date = parsed["period_end"]
     quarter: int | None = parsed["quarter"]
+    fiscal_year: int = parsed["fiscal_year"]
     label: str | None = parsed["period_label"]
 
     # Business rule: Q4 == annual.  We never extract a fourth-quarter column.
@@ -369,20 +379,6 @@ def apply_period_business_rules(
         )
         label = normalized
 
-    if filing_date is not None:
-        if period_end > filing_date + timedelta(days=_SANITY_MAX_FUTURE_DAYS):
-            return None, (
-                f"period_end {period_end.isoformat()} is more than "
-                f"{_SANITY_MAX_FUTURE_DAYS} days after the filing date "
-                f"{filing_date.isoformat()} — wrong column or hallucination"
-            )
-        if period_end < filing_date - timedelta(days=_SANITY_MAX_BACK_DAYS):
-            return None, (
-                f"period_end {period_end.isoformat()} is more than "
-                f"{_SANITY_MAX_BACK_DAYS} days before the filing date "
-                f"{filing_date.isoformat()} — wrong column or hallucination"
-            )
-
     if period_type == "quarterly" and quarter is None:
         return None, "period_type=quarterly but quarter is null"
 
@@ -390,6 +386,7 @@ def apply_period_business_rules(
         "period_type": period_type,
         "period_end": period_end,
         "quarter": quarter,
+        "fiscal_year": fiscal_year,
         "period_label": label,
     }, None
 
@@ -405,7 +402,6 @@ def run_period_detection(
     cik: str | None = None,
     fy_end_month: int | None = None,
     fy_end_code: str | None = None,
-    filing_date: date | None = None,
     document_map: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Run the period-detection agent over *raw_text*.
@@ -417,7 +413,7 @@ def run_period_detection(
 
     Raises :class:`PeriodDetectionError` when the agent produces nothing usable.
     Returns the validated period dict:
-    ``{period_type, period_end, quarter, period_label}``.
+    ``{period_type, period_end, quarter, fiscal_year, period_label}``.
     """
     fy_end = fy_end_code or (f"{fy_end_month:02d}00" if fy_end_month else "unknown")
     system_prompt = PERIOD_SYSTEM_PROMPT.format(fy_end=fy_end)
@@ -448,16 +444,15 @@ def run_period_detection(
             f"period agent produced no result for {ticker}"
         )
 
-    validated, error = apply_period_business_rules(
-        result, filing_date=filing_date,
-    )
+    validated, error = apply_period_business_rules(result)
     if validated is None:
         raise PeriodDetectionError(f"period agent output rejected: {error}")
 
     logger.info(
-        "period detection for %s: type=%s end=%s quarter=%s label=%r",
+        "period detection for %s: type=%s end=%s FY=%s quarter=%s label=%r",
         ticker, validated["period_type"], validated["period_end"],
-        validated["quarter"], validated["period_label"],
+        validated["fiscal_year"], validated["quarter"],
+        validated["period_label"],
     )
     return validated
 
@@ -490,12 +485,6 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
         }
 
     report_call(f"  [period]  agent period detection ({ticker})")
-    filing_date = state.get("filing_date")
-    if isinstance(filing_date, str):
-        try:
-            filing_date = date.fromisoformat(filing_date)
-        except ValueError:
-            filing_date = None
     try:
         period = run_period_detection(
             raw_text,
@@ -505,7 +494,6 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
             cik=company.get("cik"),
             fy_end_month=company.get("fiscal_year_end_month"),
             fy_end_code=company.get("fiscal_year_end_code"),
-            filing_date=filing_date,
             document_map=state.get("document_map"),
         )
     except PeriodDetectionError as exc:
@@ -515,23 +503,21 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
 
     report_call(
         f"  [period]  ✓ {period['period_type']}  "
+        f"FY{period['fiscal_year']}  "
         f"{period['period_label'] or period['period_end'].isoformat()}"
     )
     fy_end_month = company.get("fiscal_year_end_month")
-    if not isinstance(fy_end_month, int):
-        error = f"Company {ticker} has no valid fiscal year-end month"
-        report_call(f"  [period]  ✗ {error}")
-        return {**state, "status": "failed", "error": error}
 
-    fiscal_year = compute_fiscal_year(period["period_end"], fy_end_month)
-    # Store one complete, immutable-in-contract period record.  All downstream
-    # nodes consume this record through require_detected_period().
+    # Store one complete, immutable-in-contract period record.  Every
+    # reporting-period dimension, including fiscal_year, comes from the
+    # validated period-agent result.  All downstream nodes consume this
+    # record through require_detected_period().
     detected_period = {
         "period_type": period["period_type"],
         "period_end": period["period_end"].isoformat(),
         "quarter": period["quarter"],
         "period_label": period["period_label"],
-        "fiscal_year": fiscal_year,
+        "fiscal_year": period["fiscal_year"],
     }
     return {
         **state,

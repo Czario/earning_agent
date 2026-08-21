@@ -171,21 +171,21 @@ def normalize_cik(cik: str) -> str:
 
 def get_latest_earnings_url(
     cik: str,
-) -> tuple[Optional[str], list[str], Optional[str], Optional[str], list[dict]]:
-    """Return ``(filing_url, supplemental_urls, accession, filing_date,
-    exhibits)`` for the most recent earnings press release.
+) -> tuple[Optional[str], list[str], Optional[str], list[dict]]:
+    """Return ``(filing_url, supplemental_urls, accession, exhibits)`` for
+    the most recent earnings press release.
 
     ``filing_url`` is the URL to the primary earnings release (Exhibit 99.1).
     ``supplemental_urls`` is a list of additional exhibit URLs (EX-99.2, EX-99.3,
     etc.) that contain supplemental financial data.
-    ``accession`` / ``filing_date`` identify the filing and the
-    period sanity window.
+    ``accession`` identifies the filing for traceability.  Reporting-period
+    identity is determined only by the period agent after the document is read.
     ``exhibits`` is the full exhibit list in filing-index order:
     ``[{exhibit, description, url}]`` — e.g. EX-99.1 "The Press Release",
     EX-99.2 "The Presentation Materials", EX-99.3 "The Supplemental Information".
 
     Falls back to the most recent 8-K primary document if no Exhibit 99.1 is found.
-    Returns ``(None, [], None, None, [])`` if no 8-K filing is available.
+    Returns ``(None, [], None, [])`` if no 8-K filing is available.
     """
     cik_padded = normalize_cik(cik)
     cik_int = str(int(cik_padded))  # no leading zeros for archive paths
@@ -198,14 +198,13 @@ def get_latest_earnings_url(
         data = resp.json()
     except requests.RequestException as exc:
         logger.error("EDGAR submissions fetch failed for CIK %s: %s", cik_padded, exc)
-        return None, [], None, None, []
+        return None, [], None, []
 
     recent = data.get("filings", {}).get("recent", {})
     forms: list[str] = recent.get("form", [])
     items_list: list[str] = recent.get("items", [])
     accessions: list[str] = recent.get("accessionNumber", [])
     primary_docs: list[str] = recent.get("primaryDocument", [])
-    filing_dates: list[str] = recent.get("filingDate", [])
 
     # ── 2. Find latest 8-K with Item 2.02 (earnings results) ─────────────────
     target_idx: Optional[int] = None
@@ -230,14 +229,10 @@ def get_latest_earnings_url(
 
     if target_idx is None:
         logger.warning("No 8-K filings found for CIK %s", cik_padded)
-        return None, [], None, None, []
+        return None, [], None, []
 
     acc = accessions[target_idx]       # e.g. "0000320193-26-000011"
     acc_nodash = acc.replace("-", "")  # e.g. "000032019326000011"
-    filing_date_str: Optional[str] = (
-        filing_dates[target_idx] if target_idx < len(filing_dates) else None
-    )
-
     # ── 3. Parse HTML filing index to find ALL EX-99 exhibits ────────────────
     exhibits = _find_all_ex_99_exhibits(cik_int, acc, acc_nodash)
 
@@ -249,15 +244,15 @@ def get_latest_earnings_url(
                 "Found %d supplemental exhibit(s) for CIK %s: %s",
                 len(supplemental_urls), cik_padded, supplemental_urls,
             )
-        return primary_url, supplemental_urls, acc, filing_date_str, exhibits
+        return primary_url, supplemental_urls, acc, exhibits
 
     # ── 4. Last resort: primary document from submissions metadata ────────────
     primary_doc = primary_docs[target_idx] if target_idx < len(primary_docs) else ""
     if primary_doc:
         url = f"{_EDGAR_ARCHIVES_BASE.format(cik_int=cik_int, acc_nodash=acc_nodash)}/{primary_doc}"
         logger.info("EDGAR primary doc fallback for CIK %s: %s", cik_padded, url)
-        return url, [], acc, filing_date_str, []
+        return url, [], acc, []
 
     logger.warning("Could not resolve document URL for CIK %s accession %s", cik_padded, acc)
-    return None, [], None, None, []
+    return None, [], None, []
 

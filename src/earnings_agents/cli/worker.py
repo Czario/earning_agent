@@ -23,6 +23,7 @@ import logging
 import os
 import signal
 import time
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -73,6 +74,22 @@ def _update_load_request_status(
         logger.warning("Failed to update load_request status → %s: %s", status, exc)
 
 
+def _cleanup_temporary_filing(payload: dict[str, Any]) -> None:
+    """Delete an uploaded admin PDF directly from the shared worker mount."""
+    filing_id = payload.get("temporary_filing_id")
+    if not filing_id:
+        return
+
+    try:
+        temp_dir = os.getenv("IR_TEMP_FILINGS_DIR", "/app/uploads/ir-filings")
+        file_path = Path(temp_dir) / str(filing_id)
+        file_path.unlink(missing_ok=True)
+        logger.info("Deleted temporary uploaded PDF %s", file_path)
+    except Exception as exc:  # noqa: BLE001
+        # The admin backend also has a six-hour expiry sweeper.
+        logger.warning("Temporary PDF cleanup failed for %s: %s", filing_id, exc)
+
+
 # ── Core processing — mirrors CLI's _build_initial_state + _run_company ───────
 
 def _process_payload(graph, payload: dict[str, Any]) -> bool:
@@ -100,6 +117,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     if not ticker:
         pub.publish("skip", "message missing ticker — cannot look up filing")
         pub.close()
+        _cleanup_temporary_filing(payload)
         logger.warning("8-K message missing ticker — skipping")
         return True
 
@@ -110,6 +128,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     if company is None:
         pub.publish("skip", f"ticker {ticker} not found in normalize_data — skipping")
         pub.close()
+        _cleanup_temporary_filing(payload)
         logger.warning("8-K message for %s — company not in DB, skipping", ticker)
         return True
 
@@ -117,11 +136,19 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     company_name = company.get("name", ticker)
 
     # ── 3. Build state via shared function (identical to CLI path) ──────────
+    # Uploaded IR PDFs are mounted into worker-8k and read directly from
+    # disk. They do not use requests, curl, or Playwright.
+    temporary_filing_id = payload.get("temporary_filing_id")
+    local_filing_path = None
+    if temporary_filing_id:
+        temp_dir = os.getenv("IR_TEMP_FILINGS_DIR", "/app/uploads/ir-filings")
+        local_filing_path = str(Path(temp_dir) / str(temporary_filing_id))
+
     # A manual trigger may carry a direct filing_url (press-release HTML or
-    # shareholder-letter PDF from the admin panel).  When present, the EDGAR
-    # lookup is skipped inside _build_8k_state and the URL is used directly;
-    # the queue's filing_date (queued-day) still anchors the period agent's
-    # sanity window.  When absent, the behavior is the classic CLI auto-fetch.
+    # shareholder-letter PDF from the admin panel). When present, the EDGAR
+    # lookup is skipped inside _build_8k_state and the URL is used directly.
+    # When absent, the behavior is the classic CLI auto-fetch.  The reporting
+    # period is determined only by the period agent after fetching the filing.
     from earnings_agents.cli.earnings import _build_initial_state
 
     state = _build_initial_state(
@@ -130,8 +157,8 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
             "company_name": company_name,
             "cik": cik,
         },
-        filing_url=payload.get("filing_url"),
-        filing_date=payload.get("filing_date"),
+        filing_url=payload.get("filing_url") if not temporary_filing_id else None,
+        local_filing_path=local_filing_path,
     )
 
     # The reporting period is decided by the period agent INSIDE the graph —
@@ -141,6 +168,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         reason = state.get("error") or state.get("status")
         pub.publish("skip", f"skipped — {reason}")
         pub.close()
+        _cleanup_temporary_filing(payload)
         return True
 
     # Visible source differentiator: manual triggers carry a direct filing URL
@@ -148,7 +176,13 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     # lookup inside _build_8k_state.  Publish an explicit event line so the
     # admin panel's live log shows WHY the URL differs from the EDGAR path.
     manual_url = payload.get("filing_url")
-    if manual_url:
+    if temporary_filing_id:
+        pub.publish(
+            "progress",
+            "[source]  uploaded IR PDF mounted locally — reading file directly "
+            "(no URL download)",
+        )
+    elif manual_url:
         pub.publish(
             "progress",
             "[source]  manual filing URL provided — extracting from it "
@@ -198,6 +232,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         set_node_callback(None)
         set_call_callback(None)
         pub.close()
+        _cleanup_temporary_filing(payload)
 
     elapsed_s = perf_counter() - t0
     elapsed_str = (

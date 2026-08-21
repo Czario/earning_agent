@@ -24,6 +24,8 @@ services:
       # Redis: use host-published port — Redis is in admin_backend's internal network.
       REDIS_URL:        redis://host.docker.internal:6379/0
       REDIS_QUEUE_NAME: sec:filings:8k
+      # Uploaded IR PDFs are read directly from this shared filesystem mount.
+      IR_TEMP_FILINGS_DIR: /app/uploads/ir-filings
       # MongoDB: use the Docker service name — worker is on the shared backend network.
       # directConnection=true bypasses replica-set redirect to internal hostname.
       MONGODB_URI:      mongodb://mongo:27017/?directConnection=true
@@ -36,6 +38,9 @@ services:
       # from this mount at runtime.  After editing, run:
       #   docker compose restart worker-8k
       - ./src:/app/src
+      # Same host directory mounted by admin_backend. Uploaded IR PDFs are
+      # read directly from this mount and never downloaded over HTTP.
+      - ../admin_backend/uploads/ir-filings:/app/uploads/ir-filings
     restart: unless-stopped
     networks:
       - backend_true_grids_backend_network

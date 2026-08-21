@@ -295,9 +295,9 @@ def _build_8k_state(
     cik: str,
     *,
     filing_url: str | None = None,
+    local_filing_path: str | None = None,
     supplemental_urls: list[str] | None = None,
     accession: str | None = None,
-    filing_date: str | None = None,
     printer=print,
     dry_run: bool = False,
 ) -> dict:
@@ -309,24 +309,25 @@ def _build_8k_state(
 
     Period detection does NOT happen here — the period agent reads the filing
     document inside the graph (detect_period node).  This function only
-    resolves the filing URL, the accession, and the filing date.  No period
-    value is ever seeded into the state here: ``detected_period`` is written
-    ONLY by ``detect_period_node``.  No accession or period existence checks —
+    resolves the filing URL and accession.  No period value is ever seeded
+    into the state here: ``detected_period`` is written ONLY by
+    ``detect_period_node``.  No accession or period existence checks —
     the graph's check_period node sees whether the exact fiscal period is
     already stored and schedules a deferred replace.
 
     When *filing_url* is not provided, the function fetches the latest 8-K
     from SEC EDGAR (CLI path).  When it IS provided (worker path — manual
     trigger with a press-release HTML or shareholder-letter PDF URL), the
-    function skips the EDGAR lookup and uses the pre-resolved URL directly;
-    *filing_date* (from the admin queue) still anchors the period agent's
-    sanity window for the manual path.
+    function skips the EDGAR lookup and uses the pre-resolved URL directly.
+    Reporting-period identity is determined only by the period agent after the
+    filing is fetched.
     """
     _base = {
         "ticker": ticker or cik,
         "company_name": company_name,
         "file_type": None,
         "raw_text": None,
+        "local_filing_path": local_filing_path,
         "metrics": None,
         "error": None,
         "extraction_attempts": 0,
@@ -336,34 +337,33 @@ def _build_8k_state(
         "exhibit_meta": [],
     }
 
-    # ── Resolve filing URL, accession, filing date, exhibit list ──────────
-    _edgar_filing_date: str | None = None
+    # ── Resolve filing URL, accession, and exhibit list ───────────────────
     exhibits: list[dict] = []
-    if not filing_url:
+    if not filing_url and not local_filing_path:
         printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
         (
             filing_url,
             supplemental_urls,
             accession,
-            _edgar_filing_date,
             exhibits,
         ) = get_latest_earnings_url(cik)
-    else:
+    elif filing_url:
         printer(
             f"  [URL]    {company_name} ({ticker or cik}) using provided filing URL "
+            f"— EDGAR lookup skipped"
+        )
+    else:
+        printer(
+            f"  [file]   {company_name} ({ticker or cik}) using local PDF "
             f"— EDGAR lookup skipped"
         )
 
     if accession:
         _base["accession_number"] = accession
-    if _edgar_filing_date:
-        _base["filing_date"] = _edgar_filing_date
-    elif filing_date:
-        _base["filing_date"] = filing_date
     if exhibits:
         _base["exhibit_meta"] = exhibits
 
-    if not filing_url:
+    if not filing_url and not local_filing_path:
         return {
             **_base,
             "discovered_file_url": None,
@@ -381,6 +381,7 @@ def _build_8k_state(
     return {
         **_base,
         "discovered_file_url": filing_url,
+        "local_filing_path": local_filing_path,
         "supplemental_file_urls": supplemental_urls or [],
         "status": "discovered",
     }
@@ -392,9 +393,9 @@ def _build_initial_state(
     dry_run: bool = False,
     *,
     filing_url: str | None = None,
+    local_filing_path: str | None = None,
     supplemental_urls: list[str] | None = None,
     accession: str | None = None,
-    filing_date: str | None = None,
 ) -> dict:
     """Build the LangGraph initial state for one company (CLI path).
 
@@ -408,9 +409,9 @@ def _build_initial_state(
         company_name=info["company_name"],
         cik=info["cik"],
         filing_url=filing_url,
+        local_filing_path=local_filing_path,
         supplemental_urls=supplemental_urls,
         accession=accession,
-        filing_date=filing_date,
         printer=printer,
         dry_run=dry_run,
     )

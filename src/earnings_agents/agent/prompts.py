@@ -104,7 +104,11 @@ PDF letters, presentations):
   • Never invent a sign the document does not show, and never drop a minus.
 
 EXTRACTION RULES
-  • Use the EXACT bracketed key from the concept list — e.g. [us-gaap:Revenue]
+  • Use the EXACT bracketed key copied from the concept list.  The key is
+    canonical and case-sensitive: never invent, shorten, singularize, or
+    pluralize it (for example, if the list says [us-gaap:Revenues], do not
+    return [us-gaap:Revenue]).  Match the filing row to the concept by meaning,
+    then emit that concept's exact bracketed key.
   • Report raw table numbers exactly as printed — do NOT multiply
   • Percentages and per-share values are always as-is (never scaled)
   • "(1,234)" means negative: -1234
@@ -165,7 +169,8 @@ HTML, PDF shareholder letters, presentations):
 FINALIZE_DESCRIPTION = (
     "Call this when you have extracted ALL metrics.  Pass a JSON string with:\n"
     "  - __scale__: \"millions\", \"thousands\", \"billions\", or \"as-is\"\n"
-    "  - Each concept's value, keyed by its EXACT bracketed key (e.g. [us-gaap:Revenue])\n"
+    "  - Each concept's value, keyed by the EXACT bracketed key copied from the\n"
+    "    concept list (never invent or alter a taxonomy key)\n"
     'Negative amounts ("(1,234)" in the filing) must carry the minus sign: -1234.\n'
     "If the document does NOT belong to the target company, set "
     '\"__company_mismatch__\": true and return NO metric values.\n'

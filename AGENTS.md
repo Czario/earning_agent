@@ -54,8 +54,10 @@ fetch_filing → detect_period → check_period → load_company_concepts
 - Runs through the **shared agent loop + tools** (`get_document_info`, `search`,
   `read_lines`, `get_company_info` + terminal `finalize_period`), **open-ended** —
   no step cap.
-- Given `fiscal_year_end` (MMDD from `normalize_data.companies`); returns strict JSON
-  `{period_type, period_end, quarter, period_label}`; the graph stores this as the canonical `detected_period` record after resolving `fiscal_year`. Multi-exhibit bundles are
+- Given `fiscal_year_end` (MMDD from `normalize_data.companies`) as fiscal-calendar context; returns strict JSON
+  `{period_type, period_end, quarter, fiscal_year, period_label}`. The filing's
+  fiscal-year/quarter evidence is authoritative; the graph stores the complete
+  agent result as the canonical `detected_period` record. Multi-exhibit bundles are
   surfaced via the `get_document_info` exhibit map — the FIRST document is the
   press release carrying the period header.
 - Robust parsing: `period_end` accepts ISO, `M/D/YYYY`, and month-name forms;
@@ -64,7 +66,6 @@ fetch_filing → detect_period → check_period → load_company_concepts
 - **Business rules** (`apply_period_business_rules`, a gate — not a fallback):
   - **Q4 == annual**: `quarter=4` or "Fourth Quarter" label → `annual`, `quarter=null`.
     When a release shows both Q4 and fiscal-year columns, the fiscal-year column wins.
-  - `period_end` must fall in the sanity window vs the 8-K `filing_date` (+7d / −450d).
   - Quarterly periods must name a quarter (1–3).
 - Any failure (LLM error, unparseable output, rule rejection) → `status="failed"`, END.
   Deleted: `_infer_period_type`, cadence `get_next_period_type`, EDGAR
@@ -125,10 +126,10 @@ reused automatically.
   prior-value loads, and the upsert). Every production read/write API receives
   the explicit period-agent type or the canonical `DetectedPeriod` object; there
   is no quarter-only or default-quarter routing. Fiscal-year math lives in
-  `agent/period.py::compute_fiscal_year(end_date, fy_end_month)`; the display
-  label `FY2026 Q3` / `FY2026 (annual)` is formatted by one shared
+  the period agent's returned `fiscal_year` and `quarter`; the display label
+  `FY2026 Q3` / `FY2026 (annual)` is formatted by one shared
   `agent/period.py::format_period_label(period)` — no node recomputes
-  it. All downstream period consumers call `require_detected_period(state)` and
+  period identity. All downstream period consumers call `require_detected_period(state)` and
   use the canonical `detected_period` record; no node reads duplicate scalar
   period fields or EDGAR/report dates for period identity.
 - `upsert_concept_values` — accepts the canonical `DetectedPeriod`, routes
@@ -152,9 +153,8 @@ src/earnings_agents/
 - `progress.py` — `WorkerProgressPublisher` (Redis pub/sub `sec:worker:events`), heartbeat
 - `registry.py` — CIK/ticker lookup from `data/reference/sec_company_tickers.json` (24 h disk cache)
 - `integrations/edgar.py` — submissions API → 8-K Item 2.02 → filing index → EX-99.1 URLs;
-  `get_latest_earnings_url` returns `(url, supplemental, accession, filing_date,
-  exhibits)`; the period agent alone reads the document for reporting period
-  identity; token bucket (`EDGAR_RATE_LIMIT`, default 8 req/s); retry on 429/5xx
+  `get_latest_earnings_url` returns `(url, supplemental, accession, exhibits)`;
+  the period agent alone reads the document for reporting-period identity; token bucket (`EDGAR_RATE_LIMIT`, default 8 req/s); retry on 429/5xx
 - `integrations/mongo.py` — raw earnings collection (`earnings_db.earnings`)
 
 ## Guardrails & invariants — do not break
@@ -192,9 +192,9 @@ src/earnings_agents/
 - **Manual filing URLs (admin panel)** — the worker honors a `filing_url` in the
   queue payload (press-release HTML or **PDF shareholder letter**; passed through
   from `POST /api/sec-rss/trigger-filing` → `sec:filings:8k`). When present, the
-  EDGAR lookup is skipped inside `_build_8k_state`; the queue's `filing_date`
-  (queued-day, also passed through) still anchors the period agent's sanity
-  window. No accession is stamped for manual URLs (informational only). PDFs use
+  EDGAR lookup is skipped inside `_build_8k_state`; no filing date is passed to
+  the worker or used for period identity. No accession is stamped for manual
+  URLs (informational only). PDFs use
   a minimal static-asset request first (important for CDNs such as Adobe that
   stall on a spoofed Chrome UA), then curl, then native-fingerprint Playwright
   as fallbacks; they are converted via pdfplumber with the same caps, headers,

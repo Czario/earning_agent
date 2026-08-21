@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -134,8 +135,147 @@ def map_concepts(
     return concept_metrics, reverse_map, mapped_keys
 
 
-# ── Agent-based post-extraction derivation ───────────────────────────────────
+def semantically_map_unmapped_metrics(
+    metrics: dict[str, Any],
+    target_concepts: list[dict],
+    concept_metrics: dict[str, float],
+) -> tuple[dict[str, float], set[str]]:
+    """Resolve numeric extraction keys that did not map exactly.
 
+    Press releases frequently use a business label that is semantically the
+    same as an XBRL-normalized label but not textually identical (for example,
+    ``Revenue`` vs ``Total revenue`` or ``Cloud and software`` vs a longer
+    normalized expense label).  Asking the model to resolve only these leftover
+    *keys* is safer than fuzzy string matching: values are never changed, and
+    the model may only choose from the supplied concept IDs.
+
+    This is a repair step, not an extraction step.  Exact taxonomy/label
+    mapping always wins, one concept can be selected at most once, and only
+    high-confidence mappings returned by the resolver are accepted.  If the
+    resolver is unavailable or uncertain, the metric remains observable in the
+    existing missing-concept fields rather than being guessed.
+    """
+    mapped_ids = set(concept_metrics)
+    unmapped: dict[str, float] = {
+        key: float(value)
+        for key, value in metrics.items()
+        if not key.startswith("__")
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and key not in {"__scale__", "__derived__"}
+    }
+    # Remove keys already handled by exact Tier 0/Tier 1 mapping.  The
+    # resolver should see only genuine leftovers, both to reduce prompt size
+    # and to prevent it from remapping a canonical extraction key.
+    direct_keys: set[str] = set()
+    for key, value in unmapped.items():
+        for concept in target_concepts:
+            cid = concept.get("_id")
+            taxonomy_key = concept.get("taxonomy_key") or concept.get("concept") or ""
+            label = concept.get("label") or ""
+            if (
+                key in {taxonomy_key, f"[{taxonomy_key}]", label}
+                or re.sub(r"\s+", " ", key).strip().lower()
+                == re.sub(r"\s+", " ", label).strip().lower()
+            ) and cid in mapped_ids:
+                direct_keys.add(key)
+                break
+    unresolved = {key: value for key, value in unmapped.items() if key not in direct_keys}
+    if not unresolved:
+        return concept_metrics, set()
+
+    candidates = [
+        {
+            "concept_id": str(c.get("_id", "")),
+            "label": c.get("label", ""),
+            "taxonomy_key": c.get("taxonomy_key") or c.get("concept", ""),
+            "path": c.get("path", ""),
+        }
+        for c in target_concepts
+        if c.get("_id") not in mapped_ids
+        and not str(c.get("concept") or c.get("taxonomy_key") or "").lower().startswith("system:")
+        and c.get("_id")
+    ]
+    if not candidates:
+        return concept_metrics, set()
+
+    prompt = """\
+You are a conservative accounting concept mapper. Map extracted filing
+metric names to the normalized concepts below by MEANING, not by substring or
+keyword overlap. Filing labels may be abbreviated, reordered, or use a normal
+business synonym; use the surrounding accounting meaning and statement
+hierarchy (path) to distinguish similarly named rows.
+
+Do not calculate, alter, rescale, or rename any value. Do not map a metric just
+because one word overlaps. If the meaning is not clearly the same, omit it.
+Each metric may map to at most one concept, and each concept may be used at most
+once. Return only HIGH-confidence mappings.
+
+UNMAPPED EXTRACTED METRICS (key: value):
+{metrics}
+
+AVAILABLE TARGET CONCEPTS:
+{targets}
+
+Return strict JSON only:
+{{"mappings": [{{"metric_key": "exact extracted key", "concept_id":
+"exact target concept_id", "confidence": "high"}}]}}
+""".format(
+        metrics=json.dumps(unresolved, ensure_ascii=False),
+        targets=json.dumps(candidates, ensure_ascii=False),
+    )
+
+    try:
+        from earnings_agents.hooks import report_call
+        report_call("  [llm]  semantic concept mapping  → calling llm")
+        from earnings_agents.llm import build_llm
+        response = build_llm(format_json=True, max_retries=0).invoke(prompt)
+        if not isinstance(response, str):
+            response = str(response)
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", cleaned).strip()
+        # JSON mode normally returns the object directly, but tolerate a
+        # short explanatory prefix/suffix without accepting arbitrary text.
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end >= start:
+            cleaned = cleaned[start : end + 1]
+        parsed = json.loads(cleaned)
+        mappings = parsed.get("mappings", []) if isinstance(parsed, dict) else []
+    except Exception as exc:  # noqa: BLE001 — semantic repair is best effort
+        logger.warning("semantic concept mapping unavailable: %s", exc)
+        return concept_metrics, set()
+
+    if not isinstance(mappings, list):
+        return concept_metrics, set()
+    candidate_ids = {c["concept_id"] for c in candidates}
+    used_ids = set(mapped_ids)
+    resolved: set[str] = set()
+    updated = dict(concept_metrics)
+    for item in mappings:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("metric_key")
+        cid = str(item.get("concept_id", ""))
+        if (
+            not isinstance(key, str)
+            or key not in unresolved
+            or cid not in candidate_ids
+            or cid in used_ids
+            or str(item.get("confidence", "")).lower() != "high"
+        ):
+            continue
+        updated[cid] = unresolved[key]
+        used_ids.add(cid)
+        resolved.add(key)
+        logger.info(
+            "semantic concept mapping: %r → %s (high confidence)", key, cid
+        )
+    return updated, resolved
+
+
+# ── Agent-based post-extraction derivation ───────────────────────────────────
 _DERIVATION_PROMPT = """\
 You are a financial derivation agent.  Given values extracted from an SEC
 earnings filing and a concept hierarchy, compute missing derived values.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup
@@ -130,8 +131,9 @@ def fetch_filing_node(state: EarningsAgentState) -> EarningsAgentState:
     from earnings_agents.hooks import report_call
 
     url = state.get("discovered_file_url") or ""
-    if not url:
-        return {**state, "status": "failed", "error": "No filing URL available"}
+    local_filing_path = state.get("local_filing_path") or ""
+    if not url and not local_filing_path:
+        return {**state, "status": "failed", "error": "No filing URL or local PDF available"}
 
     # ── Assemble the exhibit target list ─────────────────────────────────
     exhibit_meta: list[dict] = state.get("exhibit_meta") or []  # type: ignore[assignment]
@@ -146,7 +148,11 @@ def fetch_filing_node(state: EarningsAgentState) -> EarningsAgentState:
         if not targets or targets[0]["url"] != url:
             targets.insert(0, {"url": url, "meta": {}})
     else:
-        targets.append({"url": url, "meta": {}})
+        targets.append({
+            "url": url or f"file://{local_filing_path}",
+            "local_path": local_filing_path or None,
+            "meta": {},
+        })
         for u in state.get("supplemental_file_urls") or []:
             if isinstance(u, str) and u != url:
                 targets.append({"url": u, "meta": {}})
@@ -187,46 +193,54 @@ def fetch_filing_node(state: EarningsAgentState) -> EarningsAgentState:
             })
             continue
 
-        report_call(f"  [http]  GET {u[:80]}")
+        if not target.get("local_path"):
+            report_call(f"  [http]  GET {u[:80]}")
         is_pdf = ext in _PDF_EXTENSIONS
         try:
             if is_pdf:
-                is_sec = "sec.gov" in u
-                direct_exc: Exception | None = None
-                try:
-                    # Start with a narrow static-asset request.  In
-                    # particular, do not force the HTML browser User-Agent:
-                    # Adobe's CDN can stall a requests connection when it sees
-                    # Chrome/124 without the matching browser TLS fingerprint.
-                    report_call(f"  [http]  PDF download  {u[:80]}")
-                    response = _http_get_binary(u, sec=is_sec)
-                    pdf_bytes = response.content
+                local_path = target.get("local_path")
+                if local_path:
+                    # Admin-uploaded IR PDFs are mounted into the worker and
+                    # read directly. Do not issue HTTP, curl, or Playwright
+                    # requests for a local upload.
+                    report_call(f"  [file]  PDF read  {local_path}")
+                    pdf_bytes = Path(local_path).read_bytes()
                     if not pdf_bytes:
-                        raise ValueError("empty PDF response")
+                        raise ValueError("empty local PDF")
                     if not pdf_bytes.lstrip().startswith(b"%PDF"):
-                        raise ValueError("response is not a PDF")
-                except Exception as exc:
-                    direct_exc = exc
-                    pdf_bytes = b""
-
-                if not pdf_bytes:
-                    # curl is a useful second transport for static files.  It
-                    # intentionally keeps curl's native UA for non-SEC hosts;
-                    # see fetch_binary_curl for why this is not Chrome/124.
-                    report_call(f"  [curl]  PDF fallback  {u[:80]}")
-                    pdf_bytes = fetch_binary_curl(u, sec=is_sec)
-                    if pdf_bytes and not pdf_bytes.lstrip().startswith(b"%PDF"):
+                        raise ValueError("local file is not a PDF")
+                else:
+                    is_sec = "sec.gov" in u
+                    direct_exc: Exception | None = None
+                    try:
+                        # Start with a narrow static-asset request. In
+                        # particular, do not force the HTML browser User-Agent.
+                        report_call(f"  [http]  PDF download  {u[:80]}")
+                        response = _http_get_binary(u, sec=is_sec)
+                        pdf_bytes = response.content
+                        if not pdf_bytes:
+                            raise ValueError("empty PDF response")
+                        if not pdf_bytes.lstrip().startswith(b"%PDF"):
+                            raise ValueError("response is not a PDF")
+                    except Exception as exc:
+                        direct_exc = exc
                         pdf_bytes = b""
 
-                if not pdf_bytes:
-                    report_call(f"  [playwright]  PDF fallback  {u[:80]}")
-                    pdf_bytes = fetch_binary(u)
                     if not pdf_bytes:
-                        if direct_exc is not None:
-                            raise direct_exc
-                        raise ValueError("empty PDF response")
-                    if not pdf_bytes.lstrip().startswith(b"%PDF"):
-                        raise ValueError("browser response is not a PDF")
+                        report_call(f"  [curl]  PDF fallback  {u[:80]}")
+                        pdf_bytes = fetch_binary_curl(u, sec=is_sec)
+                        if pdf_bytes and not pdf_bytes.lstrip().startswith(b"%PDF"):
+                            pdf_bytes = b""
+
+                    if not pdf_bytes:
+                        report_call(f"  [playwright]  PDF fallback  {u[:80]}")
+                        pdf_bytes = fetch_binary(u)
+                        if not pdf_bytes:
+                            if direct_exc is not None:
+                                raise direct_exc
+                            raise ValueError("empty PDF response")
+                        if not pdf_bytes.lstrip().startswith(b"%PDF"):
+                            raise ValueError("browser response is not a PDF")
 
                 text = _pdf_to_plain_text(pdf_bytes)
                 any_pdf = True

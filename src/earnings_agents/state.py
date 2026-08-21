@@ -9,6 +9,9 @@ class EarningsAgentState(TypedDict):
     ticker: str
     company_name: str
     discovered_file_url: Optional[str]
+    # Local PDF path used for admin uploads. Local files are read directly;
+    # they must never go through HTTP/curl/Playwright URL fetching.
+    local_filing_path: NotRequired[Optional[str]]
     supplemental_file_urls: NotRequired[Optional[list[str]]]
     file_type: Optional[str]   # "pdf" | "html"
     raw_text: Optional[str]
@@ -54,9 +57,6 @@ class EarningsAgentState(TypedDict):
     derived_concept_ids: NotRequired[Optional[list[str]]]  # concept_ids filled by Tier-3 derivation
     fiscal_year_end_month: NotRequired[Optional[int]]
     fiscal_year_end_code: NotRequired[Optional[str]]  # raw MMDD string, e.g. "0130" or "1231"
-    # 8-K filing date ("YYYY-MM-DD") from EDGAR submissions — sanity-window
-    # anchor for the period agent's output.
-    filing_date: NotRequired[Optional[str]]
     # ── Agent-detected reporting period (agent/period.py) ──────────────────
     # The reporting period is decided ONLY by the period agent reading the
     # filing document (Q4 == annual).  This is the sole period state record;
