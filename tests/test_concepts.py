@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from earnings_agents.agent.prompts import build_concept_list
+from earnings_agents.integrations.normalize import _is_polluted_path
 from earnings_agents.nodes.concepts import _is_garbage_concept
 
 
@@ -54,8 +55,7 @@ if __name__ == "__main__":
 class TestGarbageConceptFilter(unittest.TestCase):
     """Malformed rows from upstream normalizer pollution (label "404" — a
     page/footnote number, observed live on PDD) must never reach the target
-    list: no filing prints them, and the verifier re-flags them as missing
-    every audit round, burning the whole retry loop on a phantom."""
+    list: no filing prints them."""
 
     def test_numeric_only_labels_are_garbage(self):
         self.assertTrue(_is_garbage_concept({"label": "404"}))
@@ -69,3 +69,25 @@ class TestGarbageConceptFilter(unittest.TestCase):
         self.assertFalse(_is_garbage_concept(
             {"label": "Earnings per ADS (4 ordinary shares equal 1 ADS)"}
         ))
+
+
+class TestPollutedPathFilter(unittest.TestCase):
+    """Concepts whose path carries a bare page-number segment (404/555) are
+    skipped at fetch time — they are page/status numbers that leaked into the
+    normalizer, never real income-statement rows."""
+
+    def test_bare_page_numbers_are_polluted(self):
+        self.assertTrue(_is_polluted_path("404"))
+        self.assertTrue(_is_polluted_path("555"))
+
+    def test_page_number_segments_are_polluted(self):
+        self.assertTrue(_is_polluted_path("001.404.002"))
+        self.assertTrue(_is_polluted_path("404.001"))
+        self.assertTrue(_is_polluted_path("001.555.002"))
+
+    def test_real_paths_are_kept(self):
+        self.assertFalse(_is_polluted_path(""))
+        self.assertFalse(_is_polluted_path("001.002.003"))
+        self.assertFalse(_is_polluted_path("1404"))
+        self.assertFalse(_is_polluted_path("4040"))
+        self.assertFalse(_is_polluted_path("001.4040.002"))

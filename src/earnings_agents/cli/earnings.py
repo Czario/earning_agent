@@ -330,7 +330,6 @@ def _build_8k_state(
         "local_filing_path": local_filing_path,
         "metrics": None,
         "error": None,
-        "extraction_attempts": 0,
         "exhibit_meta": [],
     }
 

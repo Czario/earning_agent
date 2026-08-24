@@ -1,12 +1,12 @@
 # AGENTS.md — SEC 8-K Earnings Extraction Pipeline
 
 Agent-based pipeline that fetches SEC 8-K Exhibit 99.1 press releases and extracts
-income-statement metrics into MongoDB `normalize_data`. Three tool-calling agents run per
-filing — a **period agent** (decides the reporting period), an **extraction agent**
-(navigates the plain text, extracts metrics with per-value evidence), and an independent
-**verifier agent** (second-read audit that drives a bounded targeted-retry loop).
+income-statement metrics into MongoDB `normalize_data`. Two tool-calling agents run per
+filing — a **period agent** (decides the reporting period) and an **extraction agent**
+(navigates the plain text, extracts metrics with per-value evidence). There is no
+verifier agent and no retry loop — the pipeline is a single extraction pass.
 Deterministic guardrails (scale pre-scan + per-value scale/currency evidence, Tier 0/1
-concept mapping + `map_concept`, CALC derivation + `compute`, company-identity cross-check,
+concept mapping + `map_concept`, in-loop CALC derivation via `compute`, company-identity cross-check,
 atomic period replace, strict save gate) keep it accurate.
 
 - **Stack**: Python 3.12+, `uv`, LangChain + LangGraph, MongoDB, Redis
@@ -17,7 +17,7 @@ atomic period replace, strict save gate) keep it accurate.
 ```bash
 uv sync                                  # install deps
 uv sync --extra dev                      # + pytest (test suite)
-uv run pytest tests/ -q                  # run the test suite (73 tests)
+uv run pytest tests/ -q                  # run the test suite (69 tests)
 uv run earnings --ticker MSFT            # CLI run (SEC EDGAR path)
 uv run earnings --ticker MSFT --dry-run  # connectivity check, no LLM
 uv run earnings --ticker MSFT -v         # DEBUG logging
@@ -42,8 +42,8 @@ fetch_filing → detect_period → check_period → load_company_concepts
 | 1 | `fetch_filing` | `nodes/fetch.py` | Fetch **ALL** EX-99 text exhibits AND PDF documents (press release + presentation + supplemental — income statements often live in a supplemental exhibit, e.g. BofA's 99.3; manually-triggered shareholder letters arrive as PDFs, e.g. on Q4CDN), convert each to plain text (HTML via BeautifulSoup, PDF via pdfplumber with `PDF page n of m` separators), concatenate with `DOCUMENT n OF m` headers; records `document_map` (doc line ranges, truncation, skips) in state. Non-fetchable exhibits (images) skipped; per-exhibit/total size caps; `file_type` = `pdf` when any PDF was fetched, else `html`. |
 | 2 | `detect_period` | `agent/period.py` | **The period agent** (below). Reads the document header and writes the canonical `detected_period` record `{period_type, period_end, quarter, period_label, fiscal_year}`. Failure = run failure — **no deterministic period inference anywhere**. |
 | 3 | `check_period` | `nodes/check.py` | Consumes the canonical agent-detected period (including its already-resolved `fiscal_year` and `quarter`) and checks **exact-period existence only** (no accession checks): same fiscal period stored → schedule `_pending_replace` and **continue** (replacement stays deferred to save — atomic write-first inside `upsert_concept_values`); else proceed. An annual period is checked/replaced in `concept_values_annual` only — a quarterly Q4 record for the same fiscal year is never checked or touched. |
-| 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes the canonical `detected_period` (no period decision here). Loads the **full eligible concept universe**, then builds the target as **recent concepts ∪ all dimensional (segment/breakdown) rows ∪ `system:`/`calculated` concepts**. The recent-value window (`get_recently_valued_concept_ids`, last `PROMPT_HISTORY_PERIODS` periods) is a *prioritization* signal, not an eligibility filter — new segments/newly disclosed rows stay extractable without history. `system:`/`calculated` concepts are CALC derivation targets and never in the agent's extraction list. No history → full-universe bootstrap; no concepts at all → skip. Malformed upstream rows (labels with no alphabetic word, e.g. `custom:404` page-number pollution) are dropped before the target is built — no filing prints them and the verifier re-flags them every audit round. |
-| 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop → map → derive → **independent verifier audit → bounded targeted-retry loop** (below). |
+| 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes the canonical `detected_period` (no period decision here). Loads the **full eligible concept universe**, then builds the target as **recent concepts ∪ all dimensional (segment/breakdown) rows ∪ `system:`/`calculated` concepts**. The recent-value window (`get_recently_valued_concept_ids`, last `PROMPT_HISTORY_PERIODS` periods) is a *prioritization* signal, not an eligibility filter — new segments/newly disclosed rows stay extractable without history. `system:`/`calculated` concepts are CALC derivation targets — rendered to the agent as compute-only (not extracted verbatim from the filing). No history → full-universe bootstrap; no concepts at all → skip. Malformed upstream rows (labels with no alphabetic word, e.g. `custom:404` page-number pollution) and rows whose hierarchy `path` carries a bare page-number segment (`404`/`555`) are dropped before the target is built — no filing prints them. |
+| 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop (single pass) → map → derive → findings (below). No verifier agent, no retry loop. |
 | 6 | `mongodb_save` | `nodes/save.py` | STRICT_ACCURACY gate → currency gate → **atomic period replace** inside `upsert_concept_values` (write-first, then a stale sweep deletes only docs not carrying the current save token — no delete-before-write window) → upsert into `concept_values_{quarterly\|annual}`. |
 
 > **Job-level retry only.** The graph runs **once per filing**; there is no
@@ -52,11 +52,9 @@ fetch_filing → detect_period → check_period → load_company_concepts
 > queue). Deterministic provider failures (billing/auth — e.g. DeepSeek 402
 > Insufficient Balance) are classified non-retryable and go straight to the DLQ.
 > **Job-level retry is also the only safety net for period-agent failures.**
-> The retired agent⇄analyze loop's leftovers (`needs_reextract`,
-> `extraction_notes`, `skill_effectiveness`, `build_retry_briefing()`) were
-> deleted; `state.findings` is now the LIVE save-gate input populated by the
+> `state.findings` is the LIVE save-gate input populated by the
 > pipeline (currency, incomplete exhibits, missing concepts, hierarchy
-> ambiguity, verifier issues).
+> ambiguity).
 
 ### Period agent (`agent/period.py`) — the single source of truth
 
@@ -86,21 +84,26 @@ fetch_filing → detect_period → check_period → load_company_concepts
 1. `prescan_document` (`agent/derive.py`) — deterministic **scale** detection only
    (thousands/millions/billions); period is the period agent's job
 2. `load_prior_values` — prior-period DB values for the agent's `get_prior_value` tool
-3. Prompt = `PIPELINE_SYSTEM_PROMPT` + `build_concept_list` (`system:` and
-   `calculated` concepts excluded — the agent never extracts them; the target list
-   itself is recent ∪ dimensional ∪ system/calculated from the concepts node, not a
+3. Prompt = `PIPELINE_SYSTEM_PROMPT` + `build_concept_list` (the verbatim
+   extract list) + `build_calc_derivation_block` (CALC `system:`/`calculated`
+   concepts rendered as COMPUTE-ONLY with their rollup formulas — the agent
+   computes them with `compute()`, never extracts them; the target list itself
+   is recent ∪ dimensional ∪ system/calculated from the concepts node, not a
    hard recent-only filter) + period hints from the detected period
    (incl. the Q4→annual column rule) + company-identity rule + advisory industry
    context (`agent/industry.py::build_industry_context` — SIC code/description from
-   `companies.industry`, injected on EVERY pass incl. retries)
+   `companies.industry`, injected on the extraction pass); the system prompt also
+   teaches the agent to read segment/brand revenue from the narrative
+   "Business Segment Results" section (prose, mixed units) rather than only
+   the income-statement table
 4. `run_agent_loop` (ReAct; `agent/loop.py`) until `finalize_extraction` —
    **open-ended, no step cap**; fallback recovers a final JSON blob from the last
    AI message. In-loop the agent uses `detect_scale()`/`detect_currency()` per
    table, `map_concept()` for label mismatches, and `calculate()`/`compute()` for
    derived arithmetic; the finalize JSON carries `__scale__`, `__currency__` +
    `__currency_evidence__`, `__company_name__` (identity cross-check),
-   `__evidence__` (per-value `{lines, scale, currency}`), `__missing__`, and an
-   optional `__company_mismatch__` flag
+   `__evidence__` (per-value `{lines, scale, currency}`), `__missing__`,
+   `__derived__` (computed keys), and an optional `__company_mismatch__` flag
 5. `_parse_llm_response` applies the `__scale__` multiplier — **never** scales keys
    matching percentage/per-share/share-count regexes and **never** touches any
    `__*` metadata key (currency/evidence/company fields pass through verbatim)
@@ -111,38 +114,23 @@ fetch_filing → detect_period → check_period → load_company_concepts
    high-confidence-only resolver, absent/uncertain → stays in `missing_*`)
 7. Per-value evidence → `value_metadata_by_id` (`source_lines`, per-value
    `scale`/`currency` from `__evidence__`, dimension identity, calculated status)
-8. `derive_missing_concepts` — one lightweight LLM pass computes missing `system:`
-   (CALC) parents from the path hierarchy; never overrides extracted values.
-   Margins/ratios are excluded from the `GP = Rev − CoR` shortcut (bug observed live).
-   When Gross Profit is missing, BOTH operands are surfaced in the lean prompt —
-   Revenue AND the Cost-of-Revenue leaf (an extracted leaf never arrives via
-   descendant expansion; omitting it left GP deterministically "not computable",
-   observed live on PDD) — and the prompt teaches the sign convention
-   (GP = Rev − |CoR|; CoR is stored negative, so never subtract a negative:
-   15,400 − (−6,798) = 22,198 is WRONG, 8,602 is right).
-   `[derived]` lines report each computed concept's label + value and each
-   omitted one by name (`[llm] derive missing CALC — <names> → calling llm` lists
-   the candidates). Paths with **multiple same-path parent rows** are marked
-   ambiguous: children are NOT auto-derived there and the path is surfaced to the
-   verifier (`hierarchy_ambiguity` finding + `ambiguous_paths` state)
+8. `build_calc_derivation_block` (`agent/derive.py`) — renders CALC
+   (`system:`/`calculated`) concepts to the agent as COMPUTE-ONLY (marked "not
+   printed in the filing"), each with its rollup formula: Gross Profit =
+   Revenue − |Cost of Revenue| (sign convention taught: CoR is stored negative,
+   so 15,400 − (−6,798) = 22,198 is WRONG, 8,602 is right; margins/ratios are
+   excluded from the GP shortcut), every other parent = sum of its children.
+   The agent computes them in-loop with `compute()` and reports them under
+   their bracketed keys, listing them in `__derived__`; the pipeline marks
+   those concept_ids as derived (`derived_concept_ids`).  Paths with
+   **multiple same-path parent rows** are ambiguous: the block gives no sum
+   formula there and the path is surfaced as a `hierarchy_ambiguity` finding +
+   `ambiguous_paths` state (observability)
 9. Company-identity gates: the agent may flag `__company_mismatch__` (hard fail);
    the pipeline additionally runs a deterministic `check_company_identity()` on
    the agent-reported `__company_name__` (normalized token overlap — a disjoint
    set means a wrong-document upload, e.g. a Netflix letter fed with ticker ORCL)
-10. **Verifier loop** (`agent/verify.py`) — an independent second-read agent with
-    the same navigation tools audits the extraction (values vs cited lines,
-    missing rows, scale/currency per table, segment parent attribution, company
-    identity). Issues → `_findings_from_verifier` → high-severity issues block
-    the save; actionable ones build a **targeted retry briefing** scoped to
-    ONLY the flagged + still-missing concepts (`retry_concept_ids`) and the
-    extraction agent runs ONE more pass that searches/re-extracts just those —
-    the concept list, tools, and scale guardrails all see only that subset, so
-    the agent never re-runs the full extraction (values merge across passes).
-    Loop bounded by `min(VERIFIER_MAX_ROUNDS, MAX_EXTRACTION_ATTEMPTS)`; when
-    rounds exhaust with issues unresolved, the final verifier report becomes
-    blocking findings. A verifier that produces no report yields a
-    `verification_unavailable` medium finding — never a free pass
-11. Observability: `missing_concept_labels` / `missing_toplevel_labels` /
+10. Observability: `missing_concept_labels` / `missing_toplevel_labels` /
     `missing_segment_labels` — dimensionality from DB flags `dimension` /
     `dimension_concept`, **not** `"|" in taxonomy_key`
 
@@ -202,14 +190,14 @@ StructuredTools). Tool results truncated to 8000 chars.
 ```
 src/earnings_agents/
   graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py
-  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py · verify.py
+  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py
   integrations/ edgar.py · normalize.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
 ```
 
-- `llm.py` — provider factory (`build_llm` → `invoke(str)->str` for the derive pass;
-  `build_chat_llm` → `bind_tools()` for the agent loops)
+- `llm.py` — provider factory (`build_llm` → `invoke(str)->str` for the
+  semantic-mapping pass; `build_chat_llm` → `bind_tools()` for the agent loops)
 - `hooks.py` — `with_hooks` + per-thread callbacks (`report_call` drives CLI/worker progress)
 - `progress.py` — `WorkerProgressPublisher` (Redis pub/sub `sec:worker:events`), heartbeat
 - `registry.py` — CIK/ticker lookup from `data/reference/sec_company_tickers.json` (24 h disk cache)
@@ -228,8 +216,8 @@ src/earnings_agents/
   eligibility filter. The target is recent concepts ∪ all dimensional (segment/
   breakdown) rows ∪ `system:`/`calculated` concepts, so new segments and newly
   disclosed rows stay extractable even without history. `system:`/`calculated`
-  concepts are always loaded for the CALC derivation pass but never in the
-  agent's extraction list. No history → full-universe bootstrap.
+  concepts are always loaded as CALC derivation targets — rendered compute-only
+  to the agent, never extracted verbatim. No history → full-universe bootstrap.
 - **Currency is agent-decided, USD-only persisted.** There is no deterministic
   whole-document currency decision. The extraction agent inspects each
   table/section with the `detect_currency()` tool and reports `__currency__`
@@ -248,7 +236,7 @@ src/earnings_agents/
 - **Pipeline never edits extracted numbers** — identity checks are detection-only; the
   agent fixes its own mistakes via tools, never the code
 - **`calculated` contract** — `false` = verbatim from filing; `true` = computed by the
-  derivation pass (`derived_concept_ids` tracked in state)
+  agent via `compute()` (tracked in `derived_concept_ids`)
 - **Save gate** — `STRICT_ACCURACY` (default on) refuses the upsert on unresolved
   high-severity findings; a confirmed non-USD currency additionally fails the
   save unconditionally (hard invariant, not bypassable by relaxed accuracy).
@@ -256,8 +244,8 @@ src/earnings_agents/
   at runtime and `mongodb_save_node` reads the knob lazily, so the override is
   honored — the currency gate still blocks.
 - **Missing metrics never block the save.** Whatever values WERE found are
-  always persisted — absence-only findings (agent `missing_concept`, verifier
-  `missing_row`/`absent_ok`) are excluded from the save gate, so a few
+  always persisted — absence-only findings (agent `missing_concept`) are
+  excluded from the save gate, so a few
   not-found metrics can never drop the whole period. Only findings that
   corrupt the values being stored block: wrong value/scale/currency, wrong
   segment parent, wrong-company document, truncated exhibit, non-USD currency.
@@ -271,29 +259,14 @@ src/earnings_agents/
   stay until the new ones are fully written. No accession checks anywhere —
   re-runs always replace the same exact period; a quarterly Q4 record is never
   checked or deleted by annual processing.
-- **Independent verification (bounded loop)** — every extraction is audited by
-  the verifier agent before save. Unresolved high-severity *integrity* verifier
-  issues (wrong value/scale/currency, wrong segment parent, identity) block the
-  save; `missing_row`/`absent_ok` are recorded but never block — the found
-  values are saved, and `missing_row`/`needs_confirmation` are CAPPED at
-  non-blocking severity regardless of the verifier LLM's severity label (a
-  phantom high-severity missing_row must not drop a period of correct
-  values — observed live: PDD blocked by a polluted `custom:404` row).
-  Actionable issues trigger ONE **scoped** retry pass per
-  round (the agent searches ONLY the flagged + still-missing concepts, never
-  re-running the full extraction; `calculated`/`system:` derivation targets are
-  excluded from the retry scope and from the verifier's missing list, and
-  `needs_confirmation` never drives a retry), bounded by
-  `min(VERIFIER_MAX_ROUNDS, MAX_EXTRACTION_ATTEMPTS)`; a verifier that
-  produces no report is never treated as verified. A **non-convergence
-  guard** (`_issue_signatures`) stops the loop early when an audit reports
-  exactly the issues the previous round already flagged (same type/concept/
-  values) — the last retry changed nothing, so another cannot converge —
-  recording the current report's findings instead of burning the remaining
-  passes. The verifier's extracted-values block renders values with
-  decimals preserved (`format_value_for_llm`) — integer formatting showed
-  EPS 0.32/8.94 as "0"/"9" and generated unfalsifiable value_mismatch
-  flags (the PDD EPS loop).
+- **Single-pass extraction (no verifier, no retry)** — the pipeline runs exactly
+  one extraction-agent pass per filing. There is no independent second-read and
+  no re-extraction loop: metrics that are not present in the filing are simply
+  recorded as `missing_concept` observability and never retried. The save gate
+  still enforces the deterministic guards produced by the single pass — non-USD
+  currency, wrong-company document (identity cross-check), and truncated/
+  incomplete exhibits — but it cannot catch wrong-value/scale/currency or wrong
+  segment-parent mistakes that the extraction agent itself does not catch.
 - **Company identity is cross-checked deterministically.** The extraction agent
   reports `__company_name__` (and may flag `__company_mismatch__`); the
   pipeline runs `check_company_identity()` (normalized token overlap) on the
@@ -302,7 +275,7 @@ src/earnings_agents/
 - **Per-value evidence travels with every value.** The finalize contract carries
   `__evidence__` (`{lines, scale, currency}` per metric key); the pipeline
   stores it as `value_metadata_by_id.source_lines`/`scale`/`currency`, persists
-  it, and hands it to the verifier so it can jump straight to the cited lines.
+  it for traceability.
 - **Manual filing URLs (admin panel)** — the worker honors a `filing_url` in the
   queue payload (press-release HTML or **PDF shareholder letter**; passed through
   from `POST /api/sec-rss/trigger-filing` → `sec:filings:8k`). When present, the
@@ -351,7 +324,7 @@ src/earnings_agents/
 
 ⚠ **Gemini cannot run the agent loops** — `build_chat_llm()` raises `ValueError`
 (no LangChain chat model for google-genai); with Gemini configured, period detection,
-extraction, AND verification all fail → the run fails (worker retries are the only
+extraction both fail → the run fails (worker retries are the only
 net). The derive/semantic-mapping passes (`build_llm`) still work.
 
 ## Config env vars (`config.py`)
@@ -369,9 +342,6 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `STRICT_ACCURACY` | `1` | Refuse save on unresolved high-severity findings |
 | `EXTRACTION_MAX_CHARS` | `400000` | Cap on `raw_text` stored in state |
 | `PROMPT_HISTORY_PERIODS` | `3` | Window (stored periods) used as an extraction *prioritization* signal, not an eligibility filter |
-| `MAX_EXTRACTION_ATTEMPTS` | `3` | Caps the extract → verify → targeted-retry loop (`min(VERIFIER_MAX_ROUNDS, MAX_EXTRACTION_ATTEMPTS)`) |
-| `VERIFIER_MAX_ROUNDS` | `2` | Bounds the verifier audit rounds (each round = one independent audit + one targeted retry pass) |
-| `VERIFIER_MAX_STEPS` | `30` | Tool-calling step cap per verifier audit |
 | `LLM_CACHE` | `0` | Dev-only LLM response disk cache |
 | `EDGAR_RATE_LIMIT` | `8` | SEC token-bucket req/s (in `edgar.py`, not config) |
 | `FETCH_EXHIBIT_MAX_CHARS` / `FETCH_TOTAL_MAX_CHARS` | 400000 / 1200000 | Per-exhibit and total text caps for multi-exhibit fetching |
@@ -405,8 +375,10 @@ state construction are identical by design.
   from XBRL labels → unmapped keys land in `missing_concept_labels` observability.
 - **Upstream data quality** (normalizer pipeline, not fixed here): cross-company
   contamination (`meta:*` members from other CIKs), trailing-whitespace label variants,
-  geography members as income rows. Recent-period pruning masks most of it for
+  geography members as income rows, and page-number rows leaking into the hierarchy
+  path (bare `404`/`555` segments). Recent-period pruning masks most of it for
   established companies; bootstrap companies (no history) see the full polluted list.
+  Page-number path rows are excluded at fetch time (`get_statement_concepts`).
 - **`--allow-inconsistent` is wired to the real config knob.** The CLI flag
   sets `config.STRICT_ACCURACY = False` at runtime; `mongodb_save_node` reads
   the knob lazily from the config module, so the override is honored (the

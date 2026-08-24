@@ -342,55 +342,8 @@ Return strict JSON only:
     return updated, resolved
 
 
-# ── Agent-based post-extraction derivation ───────────────────────────────────
-_DERIVATION_PROMPT = """\
-You are a financial derivation agent.  Given values extracted from an SEC
-earnings filing and a concept hierarchy, compute missing derived values.
 
-EXTRACTED VALUES (verbatim from the filing):
-{extracted_block}
-
-CONCEPT HIERARCHY — each parent is computed from its children:
-{hierarchy_block}
-
-RULES:
-  • Gross Profit = Revenue − |Cost of Revenue|.  BOTH operand values are in
-    EXTRACTED VALUES (when Cost of Revenue appears as a hierarchy parent,
-    compute it from its children first, then subtract it from Revenue).
-  • SIGN CONVENTION (SEC/IR): cost/expense rows are stored as NEGATIVE
-    numbers — the filing prints them parenthesized, "(6,798)" is -6,798.
-    So with Revenue 15,400 and Cost of Revenue -6,798:
-    Gross Profit = 15,400 − 6,798 = 8,602.  NEVER subtract a negative:
-    15,400 − (−6,798) = 22,198 is WRONG.  If Cost of Revenue is stored
-    positive (uncommon), subtract it as-is — the result is identical.
-  • Every other parent = sum of its children USING THEIR SIGNS AS GIVEN —
-    e.g. children -4,896, -229, -640 → parent -5,765 (not +5,765).
-  • Sanity check: |Gross Profit| can never exceed |Revenue|; a larger
-    Gross Profit means a sign mistake — redo the arithmetic.
-  • If ALL children of a parent are present in the extracted or computed
-    values, ALWAYS compute the parent as their sum — do not omit a value
-    you can compute exactly.
-  • Every parent whose children are ALL present MUST appear in your JSON —
-    a missing computable parent is an error, not an omission.
-  • When the filing printed ONE combined row for a parent that the HIERARCHY
-    splits into children (e.g. "Restructuring and other" = 1,838 splits into
-    "Restructuring Charges" + "Acquisition related and other"; or "Costs
-    and Expenses" = Cost of Revenue + Operating Expenses), ALLOCATE the
-    combined total across the children: a missing child = combined total −
-    sum of the extracted children, then compute the parent as the children's
-    sum.  Do not leave such a parent uncomputed.
-  • If a combined "Costs and Expenses" line was extracted, it covers BOTH
-    Cost of Revenue AND Operating Expenses.  Split it using the hierarchy:
-    the children under each parent tell you how to allocate the total.
-  • NEVER compute a value that is already in EXTRACTED VALUES.
-  • Only return values for the parent concepts listed in the HIERARCHY.
-  • If you can't compute a value (missing children, etc.), OMIT it.
-  • Use the EXACT amounts from the extracted values.  Ignore the
-    "Sum if all available" hint — it is informational only.
-
-Return ONLY a JSON object mapping concept_id to computed value:
-  {{"concept_id_1": 123456, "concept_id_2": 789012}}
-"""
+# ── CALC (system:/calculated) concept derivation ─────────────────────────────
 
 _SYSTEM_PREFIX_RX = re.compile(r"^system:", re.I)
 
@@ -456,344 +409,58 @@ def _build_id_label_map(target_concepts: list[dict]) -> dict[str, str]:
     return {c["_id"]: c.get("label", "?") for c in target_concepts}
 
 
-def _build_derivation_prompt(
-    concept_metrics: dict[str, float],
+def build_calc_derivation_block(
     target_concepts: list[dict],
-) -> str:
-    """Build the derivation prompt: extracted values + hierarchy.
+) -> tuple[str, set[str]]:
+    """Render CALC (system:/calculated) concepts as compute-only instructions.
 
-    LEAN PROMPT: the extracted block carries only the values the derivation
-    actually references — descendants of the missing CALC parents, the
-    Revenue operand when Gross Profit is missing, and the combined-costs
-    concept for row-allocation.  The hierarchy block already embeds every
-    missing parent's child values, so the rest is history-size noise that
-    only slows the LLM call (observed live: 33 values → 49.9s derive).
+    The extraction agent never reads these rows from the filing (they are
+    rollup targets, usually not printed).  The block tells the agent to
+    COMPUTE each one with compute() after extracting the verbatim rows, and
+    returns ``(block_text, ambiguous_paths)`` — *ambiguous_paths* are
+    hierarchy paths with multiple same-path parent rows whose children cannot
+    be attributed deterministically (surfaced as observability).
+
+    Returns an empty block string when there are no CALC concepts.
     """
+    parent_children, ambiguous_paths = _build_hierarchy(target_concepts)
     id_label = _build_id_label_map(target_concepts)
-    parent_children, _ambiguous = _build_hierarchy(target_concepts)
-    present_ids = set(concept_metrics)
-
-    # ── Extracted block — restricted to referenced values ─────────────
-    missing_calc_ids = {
-        c["_id"] for c in target_concepts
-        if (
-            _SYSTEM_PREFIX_RX.match(
-                (c.get("concept") or c.get("taxonomy_key") or "").strip()
-            )
-            or c.get("calculated")
-        )
-        and c["_id"] not in present_ids
-    }
-
-    referenced: set[str] = set()
-    dependency_uncertain = False
-    uncertainty_reasons: list[str] = []
-    path_counts: dict[str, int] = {}
+    lines: list[str] = []
     for c in target_concepts:
-        p = (c.get("path") or "").strip()
-        if p:
-            path_counts[p] = path_counts.get(p, 0) + 1
-
-    if missing_calc_ids:
-        # (a) All descendants of the missing parents — nested parents and
-        # their leaves (e.g. Restructuring Charges under Restructure and
-        # Other under Operating Expenses).
-        missing_paths = {
-            (c.get("path") or "").strip()
-            for c in target_concepts if c["_id"] in missing_calc_ids
-        }
-        if not all(missing_paths):
-            dependency_uncertain = True
-            uncertainty_reasons.append("missing CALC parent has no path")
-        for c in target_concepts:
-            p = (c.get("path") or "").strip()
-            if any(p.startswith(mp + ".") for mp in missing_paths if mp):
-                referenced.add(c["_id"])
-                if path_counts.get(p, 0) > 1:
-                    dependency_uncertain = True
-                    uncertainty_reasons.append(f"duplicate dependency path {p}")
-        for mp in missing_paths:
-            if mp and path_counts.get(mp, 0) > 1:
-                dependency_uncertain = True
-                uncertainty_reasons.append(f"duplicate CALC path {mp}")
-
-        # (b) Gross Profit operands when GP is missing — GP = Revenue − |CoR|.
-        # BOTH operand VALUES must be shown: Cost of Revenue is usually an
-        # extracted LEAF (not a hierarchy parent), so it never arrives via
-        # descendant expansion — a lean prompt without it leaves GP
-        # deterministically "not computable" every pass (observed live on PDD).
-        for c in target_concepts:
-            if c["_id"] not in missing_calc_ids:
-                continue
-            ll = (c.get("label") or "").lower()
-            if "gross" in ll and "profit" in ll and not (
-                "margin" in ll or "ratio" in ll or "%" in ll
-            ):
-                revenue_candidates = [
-                    t for t in target_concepts
-                    if "RevenueFromContract" in (
-                        t.get("taxonomy_key") or t.get("concept") or ""
-                    )
-                ]
-                if len(revenue_candidates) != 1:
-                    dependency_uncertain = True
-                    uncertainty_reasons.append("Revenue operand is ambiguous or absent")
-                cor_candidates = [
-                    t for t in target_concepts
-                    if t["_id"] not in missing_calc_ids
-                    and (
-                        any(
-                            frag in (
-                                t.get("taxonomy_key") or t.get("concept") or ""
-                            ).lower()
-                            for frag in (
-                                "costofrevenue", "costofgoods", "costofservices",
-                            )
-                        )
-                        or any(
-                            phrase in (t.get("label") or "").lower()
-                            for phrase in (
-                                "cost of revenue", "costs of revenue",
-                                "cost of sales", "cost of goods",
-                            )
-                        )
-                    )
-                ]
-                if not cor_candidates:
-                    dependency_uncertain = True
-                    uncertainty_reasons.append("Cost-of-Revenue operand is absent")
-                for t in revenue_candidates + cor_candidates:
-                    referenced.add(t["_id"])
-
-    # (c) Combined costs concept — the row-allocation rule needs its total.
-    combined_candidates = [
-        c for c in target_concepts
-        if (c.get("taxonomy_key") or c.get("concept") or "").strip()
-        == "us-gaap:CostsAndExpenses"
-        or "costs and expenses" in (c.get("label") or "").lower()
-    ]
-    if len(combined_candidates) > 1:
-        dependency_uncertain = True
-        uncertainty_reasons.append("combined-costs operand is ambiguous")
-    referenced.update(c["_id"] for c in combined_candidates)
-
-    allowed = referenced & present_ids
-    if dependency_uncertain:
-        # Full context is a safety fallback only when the dependency graph is
-        # ambiguous or incomplete — never merely because the referenced set
-        # happens to contain fewer than an arbitrary number of values.
-        allowed = present_ids
-        logger.debug(
-            "derive prompt: dependency uncertainty; keeping full block (%s)",
-            "; ".join(dict.fromkeys(uncertainty_reasons)),
-        )
-
-    extracted_lines: list[str] = []
-    for cid, val in sorted(concept_metrics.items(), key=lambda x: str(x[0])):
-        if cid not in allowed:
-            continue
-        label = id_label.get(cid, cid)
-        extracted_lines.append(f"  • {label} = {format_value_for_llm(val)}")
-    extracted_block = "\n".join(extracted_lines) if extracted_lines else "  (none)"
-    if len(allowed) < len(present_ids):
-        logger.debug(
-            "derive prompt: %d of %d extracted values referenced (%s)",
-            len(allowed), len(present_ids),
-            ", ".join(sorted(id_label.get(i, i) for i in allowed))[:200],
-        )
-
-    # ── Hierarchy block ──────────────────────────────────────────────
-    # Only show CALC (system:) concepts that are MISSING and have children —
-    # parents already present are not the LLM's problem, and a leaner prompt
-    # means a faster derivation call (observed live: a bloated prompt riding
-    # LangChain's x3 retries took 5m01s).
-    hierarchy_lines: list[str] = []
-    for c in target_concepts:
-        cid = c["_id"]
         concept = (c.get("concept") or c.get("taxonomy_key") or "").strip()
-        if not (_SYSTEM_PREFIX_RX.match(concept) or c.get("calculated")) or cid in present_ids:
+        if not (_SYSTEM_PREFIX_RX.match(concept) or c.get("calculated")):
             continue
-        label = c.get("label", "?")
-        child_ids = parent_children.get(cid, [])
-
-        # Determine if GP (special formula) or regular parent.
-        # Margin/ratio concepts are NEVER the dollar Gross Profit subtotal —
-        # computing Rev − CoR for "Gross Profit Margin" would store a dollar
-        # value in a percentage concept (observed live: 16,800,000 stored for
-        # system:GrossProfitMargin).  Margins stay underived until the proper
-        # calculated_row_formulas wiring.
+        key = (c.get("taxonomy_key") or concept).strip()
+        label = c.get("label") or "?"
+        key_str = f"[{key}]" if key else f'"{label}"'
         label_lower = label.lower()
         is_margin_or_ratio = (
             "margin" in label_lower or "ratio" in label_lower or "%" in label_lower
         )
         if "gross" in label_lower and "profit" in label_lower and not is_margin_or_ratio:
-            hierarchy_lines.append(
-                f"  {cid} — \"{label}\"  ← Gross Profit = Revenue − |Cost of "
-                "Revenue|  (Cost of Revenue is usually stored NEGATIVE — "
-                "subtract its magnitude: 15,400 with -6,798 → 8,602, "
-                "NEVER 22,198)"
+            lines.append(
+                f'  • {key_str} — "{label}"  ← COMPUTE: Gross Profit = '
+                "Revenue − |Cost of Revenue|.  Cost of Revenue is usually "
+                "stored NEGATIVE, so NEVER subtract a negative — with Revenue "
+                "15,400 and CoR -6,798 → 8,602, NEVER 22,198."
             )
             continue
-
+        child_ids = parent_children.get(c["_id"], [])
         if not child_ids:
-            continue
-
-        hierarchy_lines.append(f"  {cid} — \"{label}\"  ← sum of:")
-        child_sum = 0.0
-        all_available = True
-        for child_id in child_ids:
-            child_label = id_label.get(child_id, child_id)
-            if child_id in concept_metrics:
-                child_val = concept_metrics[child_id]
-                child_sum += child_val
-                hierarchy_lines.append(
-                    f"      ✓ {child_label} = {format_value_for_llm(child_val)}"
-                )
-            else:
-                hierarchy_lines.append(f"      ✗ {child_label} (not extracted)")
-                all_available = False
-        if all_available:
-            hierarchy_lines.append(f"      → Sum = {format_value_for_llm(child_sum)}")
-
-    hierarchy_block = "\n".join(hierarchy_lines) if hierarchy_lines else "  (no derived concepts)"
-
-    return _DERIVATION_PROMPT.format(
-        extracted_block=extracted_block,
-        hierarchy_block=hierarchy_block,
-    )
-
-
-def derive_missing_concepts(
-    concept_metrics: dict[str, float],
-    target_concepts: list[dict],
-) -> tuple[dict[str, float], set[str], set[str]]:
-    """Compute missing CALC concepts via a lightweight LLM call.
-
-    The agent receives extracted values + the concept hierarchy (which
-    children roll up to which parent) and returns JSON with computed
-    values.  This is more flexible than deterministic heuristics — the
-    LLM can reason about combined-costs splits, different naming
-    conventions, and partial-child scenarios.
-
-    Returns ``(updated_concept_metrics, derived_concept_ids,
-    ambiguous_paths)`` — *ambiguous_paths* are hierarchy paths with
-    multiple same-path parent rows, which the caller surfaces to the
-    verifier so child→parent attribution is confirmed against the filing.
-    """
-    # ── Quick check: is there any work to do? ────────────────────────
-    parent_children, ambiguous_paths = _build_hierarchy(target_concepts)
-    calc_ids: set[str] = set()
-    for c in target_concepts:
-        concept = (c.get("concept") or c.get("taxonomy_key") or "").strip()
-        if _SYSTEM_PREFIX_RX.match(concept) or c.get("calculated"):
-            calc_ids.add(c["_id"])
-
-    missing_calc = [cid for cid in calc_ids if cid not in concept_metrics]
-    # Also check for combined costs (non-system concepts that contain
-    # both CoR and OpEx).
-    has_combined = any(
-        "costsandexpenses" in (c.get("concept") or "").lower()
-        or "costs and expenses" in (c.get("label") or "").lower()
-        for c in target_concepts
-        if c["_id"] in concept_metrics
-    )
-
-    if not missing_calc and not has_combined:
-        # Nothing to derive — all CALC concepts already present.
-        return concept_metrics, set(), ambiguous_paths
-
-    # ── Build prompt and call LLM ────────────────────────────────────
-    prompt = _build_derivation_prompt(concept_metrics, target_concepts)
-
-    try:
-        from earnings_agents.hooks import report_call as _report_call
-        from earnings_agents.llm import build_llm
-        from earnings_agents.config import LLM_PROVIDER as _LP
-        labels = _build_id_label_map(target_concepts)
-        names = ", ".join(labels.get(cid, cid) for cid in missing_calc[:6])
-        if names:
-            extra = (
-                f" (+{len(missing_calc) - 6} more)" if len(missing_calc) > 6 else ""
+            lines.append(
+                f'  • {key_str} — "{label}"  ← COMPUTE from the related rows you extracted.'
             )
-            derive_msg = f"derive missing CALC — {names}{extra}"
-        else:
-            derive_msg = "derive (combined-costs split only)"
-        _report_call(
-            f"  [llm]  {derive_msg}  → calling llm  ({_LP or 'llm'})"
+            continue
+        child_labels = ", ".join(
+            f'"{id_label.get(cid, cid)}"' for cid in child_ids
         )
-        # Bounded, self-retried derive call: max_retries=0 disables LangChain's
-        # built-in x3 retries (a hung request would otherwise stall for
-        # timeout×3 — observed live: 120s × 3 ≈ 5m01s).  Our single retry
-        # bounds the worst case to ~2 × timeout while still surviving one
-        # transient failure.
-        response: str | None = None
-        for attempt in (1, 2):
-            try:
-                llm = build_llm(max_retries=0)
-                response = llm.invoke(prompt)
-                break
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Derivation LLM call failed (attempt %d/2): %s", attempt, exc,
-                )
-        if response is None:
-            return concept_metrics, set(), ambiguous_paths
-    except Exception as exc:
-        logger.warning("Derivation LLM call failed: %s", exc)
-        return concept_metrics, set(), ambiguous_paths
-
-    # ── Parse JSON response ──────────────────────────────────────────
-    cleaned = (
-        response.strip()
-        .removeprefix("```json")
-        .removeprefix("```")
-        .removesuffix("```")
-        .strip()
-    )
-    brace = cleaned.find("{")
-    if brace > 0:
-        cleaned = cleaned[brace:]
-    end_brace = cleaned.rfind("}")
-    if end_brace >= 0:
-        cleaned = cleaned[: end_brace + 1]
-
-    try:
-        import json
-        computed: dict[str, float] = json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Derivation JSON parse failed: %s", exc)
-        return concept_metrics, set(), ambiguous_paths
-
-    # ── Merge computed values (never override extracted) ─────────────
-    derived: set[str] = set()
-    metrics = dict(concept_metrics)
-    for cid, val in computed.items():
-        if cid in metrics:
-            logger.debug("derive: skipping %s — already extracted", cid)
-            continue
-        if not isinstance(val, (int, float)):
-            continue
-        if cid not in calc_ids:
-            logger.debug("derive: skipping %s — not a known CALC concept", cid)
-            continue
-        metrics[cid] = float(val)
-        derived.add(cid)
-        label = labels.get(cid, cid)
-        logger.info("derive: %s = %.0f (agent-computed)", label, val)
-
-    # ── Report what was computed / omitted, with concept names ───────
-    from earnings_agents.hooks import report_call
-    for cid in sorted(derived):
-        report_call(
-            f"  [derived]  ✓ {labels.get(cid, cid)} = {metrics[cid]:,.0f}"
+        lines.append(
+            f'  • {key_str} — "{label}"  ← COMPUTE = sum of: {child_labels} '
+            "(using each child's SIGN exactly as extracted)"
         )
-    for cid in missing_calc:
-        if cid not in derived:
-            report_call(
-                f"  [derived]  ✗ {labels.get(cid, cid)} — not computable (no data)"
-            )
+    return "\n".join(lines), ambiguous_paths
 
-    return metrics, derived, ambiguous_paths
+
 
 
 # ── Prior-value loader ───────────────────────────────────────────────────────

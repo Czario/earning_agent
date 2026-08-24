@@ -1,11 +1,10 @@
-"""Tests for the verifier agent, scale detection, and evidence contract."""
+"""Tests for scale detection and the per-value evidence contract."""
 from __future__ import annotations
 
 import unittest
 
 from earnings_agents.agent.loop import _parse_llm_response
 from earnings_agents.agent.scale import detect_scale, scale_multiplier
-from earnings_agents.agent.verify import _parse_verifier_report
 
 
 class TestDetectScale(unittest.TestCase):
@@ -55,38 +54,6 @@ class TestEvidenceContract(unittest.TestCase):
         )
         self.assertEqual(out["x"], 5_000)
         self.assertEqual(out["__evidence__"]["x"]["lines"], [1, 2])
-
-
-class TestVerifierReport(unittest.TestCase):
-    def test_valid_report(self):
-        report = _parse_verifier_report(
-            '{"__verifier_status__":"issues_found",'
-            '"__verifier_issues__":[{"type":"missing_row","severity":"high",'
-            '"concept":"[us-gaap:Revenues]","message":"row printed",'
-            '"lines":[300,302]}]}'
-        )
-        self.assertIsNotNone(report)
-        self.assertEqual(report["status"], "issues_found")
-        self.assertEqual(len(report["actionable_issues"]), 1)
-
-    def test_absent_ok_not_actionable(self):
-        report = _parse_verifier_report(
-            '{"__verifier_status__":"issues_found",'
-            '"__verifier_issues__":[{"type":"absent_ok","severity":"low",'
-            '"concept":"x","message":"absent"}]}'
-        )
-        self.assertEqual(report["status"], "verified")
-        self.assertEqual(report["actionable_issues"], [])
-
-    def test_invalid_type_rejected(self):
-        report = _parse_verifier_report(
-            '{"__verifier_status__":"issues_found",'
-            '"__verifier_issues__":[{"type":"bogus","severity":"high"}]}'
-        )
-        self.assertEqual(report["status"], "verified")
-
-    def test_garbage_returns_none(self):
-        self.assertIsNone(_parse_verifier_report("not json at all"))
 
 
 if __name__ == "__main__":

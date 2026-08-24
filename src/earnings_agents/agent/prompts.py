@@ -84,6 +84,23 @@ COMPLETENESS — CRITICAL (a missed row blocks cost derivation):
     total and its "available to common" / "continuing operations" variant,
     report BOTH under their respective concepts.
 
+SEGMENT / BREAKDOWN REVENUE IN PROSE — CRITICAL:
+  • Segment and product-line revenue is often NOT in the income-statement
+    table but in a NARRATIVE "Segment Results" / "Business Segment Results"
+    section near the TOP of the document.  Read that section BEFORE
+    "Capital Allocation", "Guidance", "Outlook", or "About <Company>".
+  • Locate it with search("Segment") or by searching the product/brand names
+    that appear in the concept list (e.g. search("TurboTax")).
+  • Prose figures use MIXED units — "Consumer revenue of $5.3 billion" vs
+    "Credit Karma revenue of $631 million".  Convert each to the statement's
+    dominant scale with calculate(): in a millions-scale statement,
+    "$5.3 billion" is calculate("5.3 * 1000").
+  • A line that only gives a growth rate ("grew 22%") has NO value — skip it;
+    report it in __missing__ only if no dollar figure exists anywhere.
+  • Match each dollar figure to its concept label by MEANING (brand/product
+    names often differ slightly, e.g. "Online Ecosystem" vs
+    "Online Ecosystem rev").
+
 WHAT TO IGNORE
   • Any section labeled "Non-GAAP", "Adjusted", "Reconciliation of GAAP"
   • Forward-looking guidance, outlook, or forecast tables
@@ -191,6 +208,9 @@ FINALIZE_DESCRIPTION = (
     "    table's declared scale/currency (use detect_scale()/detect_currency())\n"
     "  - __missing__: a comma-separated list of bracketed keys or labels you\n"
     "    searched for but could not locate in the document (omit if none)\n"
+    "  - __derived__: a comma-separated list of bracketed keys you COMPUTED\n"
+    "    (via compute()/calculate()) rather than read verbatim from the filing\n"
+    "    (omit if none)\n"
     "  - Each concept's value, keyed by the EXACT bracketed key copied from the\n"
     "    concept list (never invent or alter a taxonomy key)\n"
     'Negative amounts ("(1,234)" in the filing) must carry the minus sign: -1234.\n'

@@ -19,13 +19,10 @@ class EarningsAgentState(TypedDict):
     error: Optional[str]
     # pending → discovered → fetched → text_extracted → extracted → saved | failed
     status: str
-    # Agentic loop fields
-    extraction_attempts: int          # incremented before each extraction pass; caps verifier retry rounds
-    # Structured completeness/verifier findings: [{type, severity, message,
-    # evidence}].  Populated by the agent pipeline (currency, incomplete
-    # exhibits, missing concepts, hierarchy ambiguity, verifier issues) and
-    # consumed by mongodb_save — unresolved high-severity findings refuse the
-    # upsert under STRICT_ACCURACY.
+    # Structured completeness findings: [{type, severity, message, evidence}].
+    # Populated by the agent pipeline (currency, incomplete exhibits, missing
+    # concepts, hierarchy ambiguity) and consumed by mongodb_save — unresolved
+    # high-severity findings refuse the upsert under STRICT_ACCURACY.
     findings: Optional[list]
 
     # ── normalize_data targeted extraction ──────────────────────────────────
@@ -68,12 +65,8 @@ class EarningsAgentState(TypedDict):
     # extraction status.  Built by the agent pipeline from the agent's
     # __evidence__ block and consumed by mongodb_save / upsert_concept_values.
     value_metadata_by_id: NotRequired[Optional[dict]]
-    # Structured report from the independent verifier agent (second-read
-    # audit): {"status", "issues", "actionable_issues"}.  Populated by the
-    # agent pipeline's extract → verify → targeted-retry loop.
-    verifier_report: NotRequired[Optional[dict]]
     # Hierarchy paths that have multiple same-path parent rows.  Auto-derivation
-    # refuses to attach children there; the verifier confirms attribution.
+    # refuses to attach children there; surfaced as observability.
     ambiguous_paths: NotRequired[Optional[list[str]]]
     # ── Deferred replace (informational) ──────────────────────────────────
     # Set by check_period_node when the exact fiscal period already exists.

@@ -37,9 +37,8 @@ logger = logging.getLogger(__name__)
 # Malformed-row detector for upstream normalizer pollution.  Rows whose label
 # carries no words (e.g. label "404" from a page number / footnote marker —
 # observed live on PDD) are not financial metrics: no filing prints them, so
-# the extraction agent can never find them and the verifier re-flags them as
-# missing every audit round, burning the entire retry loop on a phantom.  A
-# real income-statement row always has an alphabetic word in its label.
+# the extraction agent can never find them.  A real income-statement row always
+# has an alphabetic word in its label.
 _GARBAGE_LABEL_RX = re.compile(r"^[\d\s.,()/%-]+$")
 
 

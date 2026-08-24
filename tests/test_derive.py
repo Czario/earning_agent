@@ -4,8 +4,8 @@ from __future__ import annotations
 import unittest
 
 from earnings_agents.agent.derive import (
-    _build_derivation_prompt,
     _build_hierarchy,
+    build_calc_derivation_block,
     format_value_for_llm,
 )
 
@@ -89,8 +89,8 @@ class TestFormatValueForLlm(unittest.TestCase):
         self.assertEqual(format_value_for_llm(1.30), "1.3")
 
 
-class TestDerivationPrompt(unittest.TestCase):
-    """Gross Profit derivation needs BOTH operands visible + sign teaching."""
+class TestCalcDerivationBlock(unittest.TestCase):
+    """CALC concepts render as compute-only instructions for the agent."""
 
     def _pdd_like(self):
         return [
@@ -101,33 +101,38 @@ class TestDerivationPrompt(unittest.TestCase):
                 calculated=True),
         ]
 
-    def test_gross_profit_prompt_shows_both_operands(self):
-        # Cost of Revenue is an extracted LEAF (not a hierarchy parent), so
-        # descendant expansion never surfaces it — it must be referenced
-        # explicitly or GP is deterministically "not computable".
-        prompt = _build_derivation_prompt(
-            {"rev": 15400.0, "cor": -6798.0}, self._pdd_like()
-        )
-        self.assertIn("Revenue = 15,400", prompt)
-        self.assertIn("Cost of Revenue = -6,798", prompt)
+    def test_gross_profit_teaches_sign_convention(self):
+        block, _ambiguous = build_calc_derivation_block(self._pdd_like())
+        self.assertIn("[system:GrossProfit]", block)
+        self.assertIn("Gross Profit", block)
+        self.assertIn("NEVER subtract a negative", block)
+        self.assertIn("NEVER 22,198", block)
 
-    def test_sign_convention_is_taught(self):
-        prompt = _build_derivation_prompt(
-            {"rev": 15400.0, "cor": -6798.0}, self._pdd_like()
-        )
-        self.assertIn("− |Cost of Revenue|", prompt)
-        self.assertIn("NEVER subtract a negative", prompt)
-        self.assertIn("NEVER 22,198", prompt)
-
-    def test_missing_cor_operand_falls_back_to_full_block(self):
+    def test_sum_children_formula_lists_children(self):
         concepts = [
-            _lc("rev", "Revenue", "001",
-                "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"),
-            _lc("gp", "Gross Profit", "003", "system:GrossProfit",
+            _lc("parent", "Operating Expenses", "001", "system:OperatingExpenses",
                 calculated=True),
+            _lc("child1", "Sales and marketing", "001.001", "custom:SalesAndMarketing"),
+            _lc("child2", "Research and development", "001.002", "custom:ResearchAndDevelopment"),
         ]
-        prompt = _build_derivation_prompt(
-            {"rev": 15400.0, "unrelated": 5.0}, concepts
+        block, _ambiguous = build_calc_derivation_block(concepts)
+        self.assertIn("[system:OperatingExpenses]", block)
+        self.assertIn("sum of", block)
+        self.assertIn("Sales and marketing", block)
+        self.assertIn("Research and development", block)
+
+    def test_non_calc_concepts_are_not_rendered(self):
+        block, _ambiguous = build_calc_derivation_block(
+            [_lc("rev", "Revenue", "001", "us-gaap:Revenues")]
         )
-        # Dependency uncertainty → full extracted block, not a lean one.
-        self.assertIn("unrelated = 5", prompt)
+        self.assertEqual(block, "")
+
+    def test_ambiguous_paths_are_returned(self):
+        concepts = [
+            _lc("p1", "Parent A", "001", "system:OperatingExpenses", calculated=True),
+            _lc("p2", "Parent B", "001", "system:OperatingExpenses", calculated=True),
+            _lc("child", "Child", "001.001", "custom:Child"),
+        ]
+        block, ambiguous = build_calc_derivation_block(concepts)
+        self.assertIn("001", ambiguous)
+        self.assertIn("[system:OperatingExpenses]", block)

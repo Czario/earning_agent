@@ -66,7 +66,7 @@ class TestAtomicUpsert(unittest.TestCase):
         )
         self.assertEqual(n, 1)
 
-    def test_dimensional_filter_includes_axis(self):
+    def test_dimensional_filter_is_unique_index_key(self):
         period = DetectedPeriod(
             period_type="quarterly",
             period_end=date(2026, 6, 30),
@@ -101,8 +101,19 @@ class TestAtomicUpsert(unittest.TestCase):
                 },
             )
         op = col.ops[0]
-        self.assertEqual(op._filter["dimension_member"], "us-gaap:ProductMember")
-        self.assertEqual(op._filter["dimension_axis"], "us-gaap:BusinessSegmentAxis")
+        # The upsert filter is EXACTLY the collection's unique index key
+        # (cik, concept_id, fiscal_year, quarter).  concept_id already
+        # identifies the row, so dimension_member/axis are metadata only and
+        # must NOT be in the filter (they caused E11000 collisions on re-runs).
+        self.assertEqual(op._filter["cik"], "000123")
+        self.assertEqual(str(op._filter["concept_id"]), "5072e8e0c9d3f4a1b2c3d4e5")
+        self.assertEqual(op._filter["reporting_period.fiscal_year"], 2026)
+        self.assertEqual(op._filter["reporting_period.quarter"], 2)
+        self.assertNotIn("dimension_member", op._filter)
+        self.assertNotIn("dimension_axis", op._filter)
+        # ...but the stored document still carries the member/axis metadata.
+        self.assertEqual(op._doc["$set"]["dimension_member"], "us-gaap:ProductMember")
+        self.assertEqual(op._doc["$set"]["dimension_axis"], "us-gaap:BusinessSegmentAxis")
 
 
 if __name__ == "__main__":

@@ -98,6 +98,27 @@ _FULL_MEMBER_RX = re.compile(
 )
 _CAMEL_SPLIT_RX = re.compile(r"(?<!^)(?=[A-Z])")
 
+# Page-number pollution in the hierarchy path (observed live: a ``custom:404``
+# row on PDD, OCI rows at ``555`` on INTU): a path segment that is a bare page
+# or HTTP status number (404/555) is not a real income-statement row.
+# Such rows are excluded at fetch time (and re-checked in the load loop) so
+# they never reach the extraction target.
+_POLLUTED_PATH_SEGMENTS = ("404", "555")
+_POLLUTED_PATH_RX = re.compile(r"(^|\.)(404|555)(\.|$)")
+
+
+def _is_polluted_path(path: str) -> bool:
+    """True when *path* carries a page-number segment (``404``/``555``).
+
+    Upstream normalizer pollution: page numbers leak into the row's hierarchy
+    path (observed live on PDD).  No real income-statement row has a path
+    segment that is a bare page/status number, so such rows are skipped at
+    fetch time and never enter the extraction target.
+    """
+    if not path:
+        return False
+    return any(seg in _POLLUTED_PATH_SEGMENTS for seg in path.split("."))
+
 
 def _extract_member_tag(raw: str) -> str:
     """Return the full XBRL member concept tag from a raw label string.
@@ -214,9 +235,11 @@ def get_statement_concepts(
     loaded regardless of the window — they are the CALC derivation targets,
     and excluding them would make them permanently underivable.
 
-    Filters out only abstract (``abstract: true``) and hidden (``hide: true``)
-    rows.  All other rows — including calculated/system concepts, dimensional
-    breakdown rows, and XBRL structural labels — are included.
+    Filters out abstract (``abstract: true``) and hidden (``hide: true``) rows,
+    and rows whose ``path`` carries a page-number segment (``404``/``555`` —
+    upstream normalizer pollution).  All other rows — including calculated/
+    system concepts, dimensional breakdown rows, and XBRL structural labels —
+    are included.
 
     Results are sorted by ``path`` then ``order_key`` so the prompt lists
     concepts in statement order deterministically, including same-path rows.
@@ -248,6 +271,9 @@ def get_statement_concepts(
         "cik": cik,
         "statement_type": {"$in": statement_types},
         "active": {"$ne": False},
+        # Never fetch page-number path rows (404/555 pollution) — excluded at
+        # query time so they never enter the target list.
+        "path": {"$not": _POLLUTED_PATH_RX},
         "$or": [
             # Regular concepts: not abstract, not hidden
             {"abstract": {"$ne": True}, "hide": {"$ne": True}},
@@ -312,6 +338,13 @@ def get_statement_concepts(
             continue
         member_tag = _extract_member_tag(raw_label)
         path = d.get("path", "") or ""
+        if _is_polluted_path(path):
+            logger.info(
+                "get_statement_concepts: skipping page-number path row "
+                "(cik=%s concept=%s path=%r)",
+                cik, concept, path,
+            )
+            continue
         st = d.get("statement_type", "")
         parsed.append((d, head, member, member_tag, path))
         key = (st, head.lower())
@@ -423,6 +456,7 @@ def get_calculated_concepts(
             "abstract": {"$ne": True},
             "hide": {"$ne": True},
             "active": {"$ne": False},
+            "path": {"$not": _POLLUTED_PATH_RX},
             "$or": [
                 {"concept": {"$regex": "^system:", "$options": "i"}},
                 {"calculated": {"$in": [True, "True", "true"]}},
@@ -450,6 +484,13 @@ def get_calculated_concepts(
                 "get_calculated_concepts: dropping concept with empty label "
                 "(cik=%s concept=%s raw_label=%r)",
                 cik, d.get("concept", ""), raw_label,
+            )
+            continue
+        if _is_polluted_path(d.get("path", "") or ""):
+            logger.info(
+                "get_calculated_concepts: skipping page-number path row "
+                "(cik=%s concept=%s path=%r)",
+                cik, d.get("concept", ""), d.get("path", ""),
             )
             continue
         out.append(
@@ -731,13 +772,15 @@ def upsert_concept_values(
         }
         if period_type == "quarterly":
             filter_doc["reporting_period.quarter"] = quarter
-        if dimension_value:
-            # Distinct dimensional rows must never overwrite one another:
-            # same member under DIFFERENT axes (e.g. BusinessSegmentAxis vs
-            # GeographicAxis both containing "Product") are different rows.
-            filter_doc["dimension_member"] = meta.get("dimension_member") or ""
-            if meta.get("dimension_axis"):
-                filter_doc["dimension_axis"] = meta["dimension_axis"]
+        # This filter is EXACTLY the collection's unique index key
+        # (cik, concept_id, fiscal_year, quarter).  ``concept_id`` is the
+        # concept row's unique ObjectId, so ``dimension_member`` /
+        # ``dimension_axis`` are descriptive metadata on the stored doc — NOT
+        # part of the row identity — and must stay OUT of the filter.  Adding
+        # them made the filter stricter than the unique index and asymmetric
+        # with the written doc (empty members are omitted from the doc but were
+        # written as ``""`` into the filter), producing E11000 duplicate-key
+        # collisions on re-runs of the same period.
 
         ops.append(
             UpdateOne(

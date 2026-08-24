@@ -15,17 +15,13 @@ from earnings_agents.agent.period import (
 logger = logging.getLogger(__name__)
 
 # Findings that concern metrics ABSENT from the extraction (the agent searched
-# but could not locate them, or the verifier says a row is printed but was not
-# extracted) must NEVER block the save — whatever WAS found is still correct
-# and gets persisted; a few not-found metrics must not drop the whole period.
-# Only findings that corrupt the values being stored (wrong number/scale/
-# currency, wrong segment parent, wrong-company document, truncated exhibit,
-# non-USD currency) remain blocking.
+# but could not locate them) must NEVER block the save — whatever WAS found is
+# still correct and gets persisted; a few not-found metrics must not drop the
+# whole period.  Only findings that corrupt the values being stored (wrong
+# number/scale/currency, wrong segment parent, wrong-company document,
+# truncated exhibit, non-USD currency) remain blocking.
 _ABSENCE_ONLY_FINDING_TYPES = frozenset({
     "missing_concept",         # agent: searched but could not locate
-    "verifier_missing_row",    # verifier: row printed but not extracted
-    "absent_ok",               # verifier: confirmed not in the filing
-    "verifier_absent_ok",
 })
 
 

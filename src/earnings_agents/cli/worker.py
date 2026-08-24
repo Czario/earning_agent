@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 # Dedicated queue — admin_backend publishes 8-K messages here only.
 _DEFAULT_QUEUE = "sec:filings:8k"
 
+# Error substrings that make a job non-retryable: deterministic failures that
+# re-running the same filing will reproduce identically (provider billing/auth
+# and DB write conflicts).  Everything else (timeouts, connection resets, 5xx)
+# stays retryable at the job level.
+_NON_RETRYABLE_MARKERS = (
+    "402", "insufficient balance", "payment required",
+    "invalid api key", "authentication", "unauthorized",
+    "duplicate key", "e11000",
+)
+
 
 # ── MongoDB helper ─────────────────────────────────────────────────────────────
 
@@ -450,11 +460,7 @@ def main(argv: list[str] | None = None) -> None:
             # Leave the payload in the DLQ immediately for operator action.
             last_error = str(payload.get("last_error") or "").lower()
             non_retryable = any(
-                marker in last_error
-                for marker in (
-                    "402", "insufficient balance", "payment required",
-                    "invalid api key", "authentication", "unauthorized",
-                )
+                marker in last_error for marker in _NON_RETRYABLE_MARKERS
             )
             payload["attempts"] = attempts + 1
             payload["failed_at"] = time.time()

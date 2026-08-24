@@ -22,8 +22,8 @@ def _state(**overrides):
         "company_name": "Test Co",
         "status": "extracted",
         "findings": [
-            {"type": "verifier_value_mismatch", "severity": "high",
-             "message": "Verifier: value differs"},
+            {"type": "incomplete_document", "severity": "high",
+             "message": "Exhibit incomplete"},
         ],
         "currency_metadata": {"currency": "USD"},
         "cik": "000123",
@@ -66,10 +66,6 @@ class TestSaveGate(unittest.TestCase):
         cases = [
             {"type": "missing_concept", "severity": "medium",
              "message": "Agent could not locate concept: [x]"},
-            {"type": "verifier_missing_row", "severity": "high",
-             "message": "Verifier: row printed but not extracted"},
-            {"type": "verifier_absent_ok", "severity": "low",
-             "message": "Verifier confirmed absent"},
         ]
         for finding in cases:
             with self.subTest(type=finding["type"]):
@@ -83,13 +79,14 @@ class TestSaveGate(unittest.TestCase):
                     out = mongodb_save_node(_state(findings=[finding]))
                 self.assertEqual(out["status"], "saved")
 
-    def test_wrong_value_finding_still_blocks(self):
-        # Integrity findings (a stored value is wrong) still block — the gate
-        # protects data that WOULD be written, not metrics that are absent.
+    def test_integrity_finding_still_blocks(self):
+        # Integrity findings (a stored value is wrong / exhibit incomplete)
+        # still block — the gate protects data that WOULD be written, not
+        # metrics that are absent.
         _config.STRICT_ACCURACY = True
         out = mongodb_save_node(_state(findings=[
-            {"type": "verifier_value_mismatch", "severity": "high",
-             "message": "Verifier: [us-gaap:Revenues] differs"},
+            {"type": "incomplete_document", "severity": "high",
+             "message": "Exhibit incomplete: EX-99.1"},
         ]))
         self.assertEqual(out["status"], "failed")
 
