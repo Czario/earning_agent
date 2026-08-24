@@ -331,9 +331,6 @@ def _build_8k_state(
         "metrics": None,
         "error": None,
         "extraction_attempts": 0,
-        "extraction_notes": None,
-        "needs_reextract": False,
-        "previous_high_finding_keys": None,
         "exhibit_meta": [],
     }
 
@@ -781,8 +778,14 @@ def main() -> None:
         parser.error("Provide at least one --cik or --ticker argument.")
 
     if args.allow_inconsistent:
-        import earnings_agents.graph as _wf
-        _wf.STRICT_ACCURACY = False
+        # Flip the REAL config knob — save.py reads it lazily from the config
+        # module at save time, so this override is honored.  (Setting
+        # graph.STRICT_ACCURACY did nothing: the graph never reads it.)
+        import earnings_agents.config as _cfg
+        _cfg.STRICT_ACCURACY = False
+        print("  [config]  --allow-inconsistent: STRICT_ACCURACY disabled "
+              "(high-severity findings will not block the save; non-USD "
+              "currency still blocks)")
 
     companies = _resolve_companies(args.cik, args.ticker)
     if not companies:

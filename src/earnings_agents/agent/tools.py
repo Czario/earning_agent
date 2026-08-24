@@ -32,6 +32,7 @@ def build_pi_tools(
     company_name: str = "",
     company_industry: dict | None = None,
     document_map: list[dict] | None = None,
+    target_concepts: list[dict] | None = None,
 ) -> list:
     """Build the pi-style tool set for raw document navigation.
 
@@ -256,23 +257,12 @@ def build_pi_tools(
             )
 
     # ── 6. Calculator (for derived metrics) ─────────────────────────────
-    @_lc_tool
-    def calculate(expression: str) -> str:
-        """Evaluate a simple arithmetic expression and return the result.
+    def _safe_eval_expression(expression: str) -> str:
+        """Evaluate a simple arithmetic expression via safe AST evaluation.
 
-        Use this to compute derived metrics AFTER extracting raw values from
-        the document.  For example:
-
-          calculate("1006300000 - 509800000")        → Gross Profit
-          calculate("(753214000 - 272411000) / 753214000 * 100")  → margin %
-          calculate("33900000000 / 15700000000")     → EPS
-
-        Supports: +, -, *, /, parentheses, decimal numbers.
-        No variables, no functions, no imports — pure arithmetic only.
-
-        NOTE: a parenthesized number on its own follows SEC/IR convention and
-        is NEGATIVE — calculate("(175,685)") → -175685, so passing a
-        negative-looking table row keeps its sign.
+        Shared by the ``calculate`` and ``compute`` tools (both are LangChain
+        StructuredTools, so the raw evaluator must live in a plain function
+        they can both call).
         """
         import ast
         import operator
@@ -287,8 +277,8 @@ def build_pi_tools(
         }
 
         def _eval(node):
-            if isinstance(node, ast.Num):
-                return node.n
+            # ast.Num/ast.Str are aliases of ast.Constant since Python 3.8;
+            # read .value (node.n is deprecated in 3.14).
             if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
                 return node.value
             if isinstance(node, ast.BinOp):
@@ -324,6 +314,26 @@ def build_pi_tools(
             return str(result)
         except Exception as exc:
             return f"Error evaluating '{expression}': {exc}"
+
+    @_lc_tool
+    def calculate(expression: str) -> str:
+        """Evaluate a simple arithmetic expression and return the result.
+
+        Use this to compute derived metrics AFTER extracting raw values from
+        the document.  For example:
+
+          calculate("1006300000 - 509800000")        → Gross Profit
+          calculate("(753214000 - 272411000) / 753214000 * 100")  → margin %
+          calculate("33900000000 / 15700000000")     → EPS
+
+        Supports: +, -, *, /, parentheses, decimal numbers.
+        No variables, no functions, no imports — pure arithmetic only.
+
+        NOTE: a parenthesized number on its own follows SEC/IR convention and
+        is NEGATIVE — calculate("(175,685)") → -175685, so passing a
+        negative-looking table row keeps its sign.
+        """
+        return _safe_eval_expression(expression)
 
     # ── 7. Company info lookup ──────────────────────────────────────────
     @_lc_tool
@@ -375,4 +385,158 @@ def build_pi_tools(
         except Exception as exc:
             return f"Error looking up company info: {exc}"
 
-    return [get_document_info, read_lines, search, get_prior_value, verify_identity, calculate, get_company_info]
+    # ── 8. Currency detection ──────────────────────────────────────────
+    @_lc_tool
+    def detect_currency(start: int | None = None, end: int | None = None) -> str:
+        """Detect the currency declared in a line range of the document.
+
+        Args:
+            start: First line (1-based, inclusive). Omit to scan the whole document.
+            end: Last line (1-based, inclusive). Omit to scan the whole document.
+
+        Returns the detected currency code, confidence, and evidence. Use
+        read_lines() to find a table's currency declaration first, then call
+        this on that line range to confirm it before extracting numbers.
+        """
+        from earnings_agents.agent.currency import detect_currency as _detect
+
+        if start is None or end is None:
+            snippet = document_text
+        else:
+            if start < 1 or end > total_lines or start > end:
+                return f"Invalid range. Document has {total_lines:,} lines."
+            snippet = "\n".join(lines[start - 1 : end])
+
+        res = _detect(snippet)
+        if not res["detected_codes"]:
+            return "No currency declaration detected in this range."
+        evidence = ", ".join(res["evidence"]) if res["evidence"] else "symbol only"
+        return (
+            f"Currency: {res['currency']} (confidence: {res['confidence']})\n"
+            f"Codes detected: {', '.join(res['detected_codes'])}\n"
+            f"Evidence: {evidence}"
+        )
+
+    # ── 9. Scale detection ─────────────────────────────────────────────
+    @_lc_tool
+    def detect_scale(start: int | None = None, end: int | None = None) -> str:
+        """Detect the numeric scale declared in a line range of the document.
+
+        Args:
+            start: First line (1-based, inclusive). Omit to scan the whole document.
+            end: Last line (1-based, inclusive). Omit to scan the whole document.
+
+        Returns the detected scale ("thousands" | "millions" | "billions" |
+        "mixed" | none), confidence, and evidence. Call this on each table's
+        declaration line range before extracting so reported values carry the
+        correct per-table scale.
+        """
+        from earnings_agents.agent.scale import detect_scale as _detect
+
+        if start is None or end is None:
+            snippet = document_text
+        else:
+            if start < 1 or end > total_lines or start > end:
+                return f"Invalid range. Document has {total_lines:,} lines."
+            snippet = "\n".join(lines[start - 1 : end])
+
+        res = _detect(snippet)
+        if not res["detected_scales"]:
+            return "No scale declaration detected in this range."
+        evidence = ", ".join(res["evidence"]) if res["evidence"] else "declaration only"
+        return (
+            f"Scale: {res['scale'] or 'unknown'} (confidence: {res['confidence']})\n"
+            f"Scales detected: {', '.join(res['detected_scales'])}\n"
+            f"Evidence: {evidence}"
+        )
+
+    # ── 10. Concept mapping (in-loop semantic mapping) ─────────────────
+    @_lc_tool
+    def map_concept(metric_label: str, candidates: list[str] | None = None) -> str:
+        """Map a filing row label to a concept from the target concept list.
+
+        Args:
+            metric_label: The row label as printed in the document, e.g.
+                "Total revenue" or "Cloud and software".
+            candidates: Optional list of concept labels to restrict the
+                search to. Omit to search the full target list.
+
+        Returns the matching concept's exact bracketed key (and concept id).
+        Use when a filing row's wording does not exactly match the concept
+        list label. The value is never changed by mapping — only the key.
+        """
+        if not target_concepts:
+            return "No target concepts available for mapping."
+        label_lower = metric_label.strip().lower()
+        if not label_lower:
+            return "Empty label — provide the filing row's label."
+
+        from earnings_agents.agent.derive import _norm_label
+
+        cands = target_concepts
+        if candidates:
+            cset = {c.strip().lower() for c in candidates}
+            cands = [
+                c for c in target_concepts
+                if (c.get("label") or "").strip().lower() in cset
+                or (c.get("taxonomy_key") or c.get("concept") or "").strip().lower() in cset
+            ]
+
+        exact: list[dict] = []
+        norm: list[dict] = []
+        for c in cands:
+            label = (c.get("label") or "").strip()
+            key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+            if label.lower() == label_lower or key.lower() == label_lower:
+                exact.append(c)
+            elif _norm_label(label) == _norm_label(metric_label):
+                norm.append(c)
+
+        pool = exact or norm
+        if not pool:
+            return (
+                "No concept found for this label. Check the concept list "
+                "and try a synonym or a different label."
+            )
+        if len(pool) > 1:
+            preview = "; ".join(
+                f"[{(c.get('taxonomy_key') or c.get('concept') or '?')}] "
+                f"\"{c.get('label')}\" (id={c.get('_id')})" for c in pool[:5]
+            )
+            return (
+                f"Multiple concepts match: {preview}. Pass candidates to "
+                "disambiguate, or read the filing to decide which row this is."
+            )
+        c = pool[0]
+        key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+        return (
+            f"Matched: [{(key or c.get('label'))}] — \"{c.get('label')}\" "
+            f"(concept_id={c.get('_id')})"
+        )
+
+    # ── 11. Deterministic arithmetic for derived concepts ──────────────
+    @_lc_tool
+    def compute(expression: str) -> str:
+        """Compute an exact arithmetic result for a derived metric.
+
+        Identical to calculate() but intended for building concept values
+        (e.g. Gross Profit = Revenue − Cost of Revenue, or a parent = sum of
+        its children). Arithmetic is exact and deterministic — never rounded
+        by the model. Call calculate()/compute() instead of doing arithmetic
+        yourself, and report the result under the concept's bracketed key.
+        """
+        return _safe_eval_expression(expression)
+
+    return [
+        get_document_info,
+        read_lines,
+        search,
+        get_prior_value,
+        verify_identity,
+        calculate,
+        get_company_info,
+        detect_currency,
+        detect_scale,
+        map_concept,
+        compute,
+    ]

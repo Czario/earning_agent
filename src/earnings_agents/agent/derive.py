@@ -10,6 +10,73 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _norm_label(s: str) -> str:
+    """Whitespace-normalized lowercase form of *s* (shared by mapping code)."""
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def format_value_for_llm(val: float) -> str:
+    """Human-readable value that preserves decimals for small as-is values.
+
+    ``f\"{val:,.0f}\"`` destroys per-share / ratio values (0.32 → "0",
+    8.94 → "9"); an LLM auditor then flags a CORRECT extraction as a
+    mismatch because its prompt disagrees with the printed document
+    (observed live: EPS false-positive loop on PDD).  Integral monetary
+    values keep thousands separators with no decimals.
+    """
+    if val == int(val) and abs(val) < 1e15:
+        return f"{val:,.0f}"
+    return f"{val:,.4f}".rstrip("0").rstrip(".")
+
+
+# ── As-is (never-scaled) concept labels ───────────────────────────────────────
+
+# Concepts whose values are inherently as-is — per-share amounts, percentages,
+# ratios, and share counts.  Applied to concept LABELS (not just metric keys)
+# because member-tagged taxonomy keys such as ``custom:Basic|014.001`` carry no
+# "per share" signal while their labels ("Basic (Earnings per ordinary share)")
+# do — the parser's key-based guardrail alone lets those keys get scaled
+# (observed live: EPS 4.85 stored as 4,850,000 under a millions multiplier).
+_LABEL_AS_IS_PATTERNS = re.compile(
+    r"per\s+(?:ordinary\s+|basic\s+|diluted\s+|common\s+)?(?:share|ads)\b"
+    r"|per-share|\beps\b|earnings\s+per"
+    r"|%|percent|\bpct\b|basis\s+points|percentage\s+points"
+    r"|margin|yield|growth\b|ratio|ratios\b|\brate\b"
+    r"|\bshares?\s+(?:outstanding|used|weighted|issued)\b"
+    r"|number\s+of\s+shares|weighted.{0,20}average.{0,15}shares"
+    r"|employee|headcount"
+    r"|production|deliveries\b|delivered"
+    r"|(?:super)?charger.{0,12}(?:station|connector)"
+    r"|\bstations?\b|\bconnectors?\b"
+    r"|\bdays.{0,5}supply\b|\blease count\b"
+    r"|\bactive\b.{0,20}\bsubscriptions?\b|\bfsd subscriptions?\b",
+    re.IGNORECASE,
+)
+
+
+def build_no_scale_keys(target_concepts: list[dict]) -> set[str]:
+    """Return bracket/raw metric keys whose values must NEVER be scaled.
+
+    The parser's key-based per-share/percentage guardrail cannot see concept
+    labels, so member-tagged keys whose as-is signal lives in the label
+    (``[custom:Basic|014.001]`` → "Basic (Earnings per ordinary share)") escape
+    it and get scaled.  This builds the as-is key set from the labels so the
+    parser can skip them regardless of the key string.  Both the raw taxonomy
+    key and its ``[bracketed]`` form are included (the agent emits the bracket
+    form from the concept list).
+    """
+    out: set[str] = set()
+    for c in target_concepts:
+        label = (c.get("label") or "").strip()
+        if not label or not _LABEL_AS_IS_PATTERNS.search(label):
+            continue
+        key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+        if key:
+            out.add(key)
+            out.add(f"[{key}]")
+    return out
+
+
 # ── Document pre-scan ────────────────────────────────────────────────────────
 
 _PRESCAN_HEADING_PREFIX = (
@@ -95,7 +162,7 @@ def map_concepts(
         mapped_keys:      set of metric keys that were successfully mapped
     """
     def _norm(s: str) -> str:
-        return re.sub(r"\s+", " ", s).strip().lower()
+        return _norm_label(s)
 
     taxonomy_key_to_id: dict[str, str] = {}
     bracket_key_to_id: dict[str, str] = {}
@@ -287,10 +354,19 @@ CONCEPT HIERARCHY — each parent is computed from its children:
 {hierarchy_block}
 
 RULES:
-  • Gross Profit = Revenue − Cost of Revenue (the Revenue value is in
-    EXTRACTED VALUES; compute Cost of Revenue from its own children in the
-    HIERARCHY, then subtract it from that Revenue).
-  • Every other parent = sum of its children.
+  • Gross Profit = Revenue − |Cost of Revenue|.  BOTH operand values are in
+    EXTRACTED VALUES (when Cost of Revenue appears as a hierarchy parent,
+    compute it from its children first, then subtract it from Revenue).
+  • SIGN CONVENTION (SEC/IR): cost/expense rows are stored as NEGATIVE
+    numbers — the filing prints them parenthesized, "(6,798)" is -6,798.
+    So with Revenue 15,400 and Cost of Revenue -6,798:
+    Gross Profit = 15,400 − 6,798 = 8,602.  NEVER subtract a negative:
+    15,400 − (−6,798) = 22,198 is WRONG.  If Cost of Revenue is stored
+    positive (uncommon), subtract it as-is — the result is identical.
+  • Every other parent = sum of its children USING THEIR SIGNS AS GIVEN —
+    e.g. children -4,896, -229, -640 → parent -5,765 (not +5,765).
+  • Sanity check: |Gross Profit| can never exceed |Revenue|; a larger
+    Gross Profit means a sign mistake — redo the arithmetic.
   • If ALL children of a parent are present in the extracted or computed
     values, ALWAYS compute the parent as their sum — do not omit a value
     you can compute exactly.
@@ -321,7 +397,7 @@ _SYSTEM_PREFIX_RX = re.compile(r"^system:", re.I)
 
 def _build_hierarchy(
     target_concepts: list[dict],
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], set[str]]:
     """Build parent-concept-id → list-of-child-concept-ids from the path hierarchy.
 
     Children are DIRECT only — exactly one path segment deeper.  Matching all
@@ -329,6 +405,12 @@ def _build_hierarchy(
     Operating Expenses must list "Restructure and Other" as one child, not
     also its grandchildren Restructuring Charges / Acquisition related and
     other, which roll up into Restructure and Other first).
+
+    Returns ``(parent_children, ambiguous_paths)``.  When several sibling rows
+    share the same path (common for dimensional members), the path alone cannot
+    attribute direct children to a specific sibling, so the path is recorded as
+    ambiguous and no parent under it receives children — deriving such a parent
+    would otherwise cross-sum a child into every sibling.
     """
     # Keep every row at a path.  ``order_key`` is part of the row identity;
     # path alone is not unique in normalized XBRL data (geographic members,
@@ -347,6 +429,7 @@ def _build_hierarchy(
         nodes.sort(key=_order_value)
 
     parent_children: dict[str, list[str]] = {}
+    ambiguous_paths: set[str] = set()
     for parent_path, parent_nodes in nodes_by_path.items():
         prefix = parent_path + "."
         parent_depth = parent_path.count(".")
@@ -358,14 +441,14 @@ def _build_hierarchy(
             ):
                 # Preserve every child row, ordered by (path, order_key).
                 child_ids.extend(c["_id"] for c in child_nodes)
-        if child_ids:
-            # A same-path parent row is a distinct (path, order_key) node, so
-            # retain the direct child group for each parent rather than
-            # arbitrarily attaching it to the first row only.
-            for parent in parent_nodes:
-                parent_children[parent["_id"]] = list(child_ids)
+        if not child_ids:
+            continue
+        if len(parent_nodes) > 1:
+            ambiguous_paths.add(parent_path)
+            continue
+        parent_children[parent_nodes[0]["_id"]] = list(child_ids)
 
-    return parent_children
+    return parent_children, ambiguous_paths
 
 
 def _build_id_label_map(target_concepts: list[dict]) -> dict[str, str]:
@@ -387,15 +470,19 @@ def _build_derivation_prompt(
     only slows the LLM call (observed live: 33 values → 49.9s derive).
     """
     id_label = _build_id_label_map(target_concepts)
-    parent_children = _build_hierarchy(target_concepts)
+    parent_children, _ambiguous = _build_hierarchy(target_concepts)
     present_ids = set(concept_metrics)
 
     # ── Extracted block — restricted to referenced values ─────────────
     missing_calc_ids = {
         c["_id"] for c in target_concepts
-        if _SYSTEM_PREFIX_RX.match(
-            (c.get("concept") or c.get("taxonomy_key") or "").strip()
-        ) and c["_id"] not in present_ids
+        if (
+            _SYSTEM_PREFIX_RX.match(
+                (c.get("concept") or c.get("taxonomy_key") or "").strip()
+            )
+            or c.get("calculated")
+        )
+        and c["_id"] not in present_ids
     }
 
     referenced: set[str] = set()
@@ -430,9 +517,11 @@ def _build_derivation_prompt(
                 dependency_uncertain = True
                 uncertainty_reasons.append(f"duplicate CALC path {mp}")
 
-        # (b) Revenue operand when Gross Profit is missing — GP = Revenue −
-        # CoR, and only Revenue's VALUE is pre-known (CoR is computed by the
-        # derivation itself, never pre-shown).
+        # (b) Gross Profit operands when GP is missing — GP = Revenue − |CoR|.
+        # BOTH operand VALUES must be shown: Cost of Revenue is usually an
+        # extracted LEAF (not a hierarchy parent), so it never arrives via
+        # descendant expansion — a lean prompt without it leaves GP
+        # deterministically "not computable" every pass (observed live on PDD).
         for c in target_concepts:
             if c["_id"] not in missing_calc_ids:
                 continue
@@ -449,7 +538,31 @@ def _build_derivation_prompt(
                 if len(revenue_candidates) != 1:
                     dependency_uncertain = True
                     uncertainty_reasons.append("Revenue operand is ambiguous or absent")
-                for t in revenue_candidates:
+                cor_candidates = [
+                    t for t in target_concepts
+                    if t["_id"] not in missing_calc_ids
+                    and (
+                        any(
+                            frag in (
+                                t.get("taxonomy_key") or t.get("concept") or ""
+                            ).lower()
+                            for frag in (
+                                "costofrevenue", "costofgoods", "costofservices",
+                            )
+                        )
+                        or any(
+                            phrase in (t.get("label") or "").lower()
+                            for phrase in (
+                                "cost of revenue", "costs of revenue",
+                                "cost of sales", "cost of goods",
+                            )
+                        )
+                    )
+                ]
+                if not cor_candidates:
+                    dependency_uncertain = True
+                    uncertainty_reasons.append("Cost-of-Revenue operand is absent")
+                for t in revenue_candidates + cor_candidates:
                     referenced.add(t["_id"])
 
     # (c) Combined costs concept — the row-allocation rule needs its total.
@@ -480,7 +593,7 @@ def _build_derivation_prompt(
         if cid not in allowed:
             continue
         label = id_label.get(cid, cid)
-        extracted_lines.append(f"  • {label} = {val:,.0f}")
+        extracted_lines.append(f"  • {label} = {format_value_for_llm(val)}")
     extracted_block = "\n".join(extracted_lines) if extracted_lines else "  (none)"
     if len(allowed) < len(present_ids):
         logger.debug(
@@ -498,7 +611,7 @@ def _build_derivation_prompt(
     for c in target_concepts:
         cid = c["_id"]
         concept = (c.get("concept") or c.get("taxonomy_key") or "").strip()
-        if not _SYSTEM_PREFIX_RX.match(concept) or cid in present_ids:
+        if not (_SYSTEM_PREFIX_RX.match(concept) or c.get("calculated")) or cid in present_ids:
             continue
         label = c.get("label", "?")
         child_ids = parent_children.get(cid, [])
@@ -515,7 +628,10 @@ def _build_derivation_prompt(
         )
         if "gross" in label_lower and "profit" in label_lower and not is_margin_or_ratio:
             hierarchy_lines.append(
-                f"  {cid} — \"{label}\"  ← Gross Profit = Revenue − Cost of Revenue"
+                f"  {cid} — \"{label}\"  ← Gross Profit = Revenue − |Cost of "
+                "Revenue|  (Cost of Revenue is usually stored NEGATIVE — "
+                "subtract its magnitude: 15,400 with -6,798 → 8,602, "
+                "NEVER 22,198)"
             )
             continue
 
@@ -531,13 +647,13 @@ def _build_derivation_prompt(
                 child_val = concept_metrics[child_id]
                 child_sum += child_val
                 hierarchy_lines.append(
-                    f"      ✓ {child_label} = {child_val:,.0f}"
+                    f"      ✓ {child_label} = {format_value_for_llm(child_val)}"
                 )
             else:
                 hierarchy_lines.append(f"      ✗ {child_label} (not extracted)")
                 all_available = False
         if all_available:
-            hierarchy_lines.append(f"      → Sum = {child_sum:,.0f}")
+            hierarchy_lines.append(f"      → Sum = {format_value_for_llm(child_sum)}")
 
     hierarchy_block = "\n".join(hierarchy_lines) if hierarchy_lines else "  (no derived concepts)"
 
@@ -550,7 +666,7 @@ def _build_derivation_prompt(
 def derive_missing_concepts(
     concept_metrics: dict[str, float],
     target_concepts: list[dict],
-) -> tuple[dict[str, float], set[str]]:
+) -> tuple[dict[str, float], set[str], set[str]]:
     """Compute missing CALC concepts via a lightweight LLM call.
 
     The agent receives extracted values + the concept hierarchy (which
@@ -559,14 +675,17 @@ def derive_missing_concepts(
     LLM can reason about combined-costs splits, different naming
     conventions, and partial-child scenarios.
 
-    Returns ``(updated_concept_metrics, derived_concept_ids)``.
+    Returns ``(updated_concept_metrics, derived_concept_ids,
+    ambiguous_paths)`` — *ambiguous_paths* are hierarchy paths with
+    multiple same-path parent rows, which the caller surfaces to the
+    verifier so child→parent attribution is confirmed against the filing.
     """
     # ── Quick check: is there any work to do? ────────────────────────
-    parent_children = _build_hierarchy(target_concepts)
+    parent_children, ambiguous_paths = _build_hierarchy(target_concepts)
     calc_ids: set[str] = set()
     for c in target_concepts:
         concept = (c.get("concept") or c.get("taxonomy_key") or "").strip()
-        if _SYSTEM_PREFIX_RX.match(concept):
+        if _SYSTEM_PREFIX_RX.match(concept) or c.get("calculated"):
             calc_ids.add(c["_id"])
 
     missing_calc = [cid for cid in calc_ids if cid not in concept_metrics]
@@ -581,7 +700,7 @@ def derive_missing_concepts(
 
     if not missing_calc and not has_combined:
         # Nothing to derive — all CALC concepts already present.
-        return concept_metrics, set()
+        return concept_metrics, set(), ambiguous_paths
 
     # ── Build prompt and call LLM ────────────────────────────────────
     prompt = _build_derivation_prompt(concept_metrics, target_concepts)
@@ -618,10 +737,10 @@ def derive_missing_concepts(
                     "Derivation LLM call failed (attempt %d/2): %s", attempt, exc,
                 )
         if response is None:
-            return concept_metrics, set()
+            return concept_metrics, set(), ambiguous_paths
     except Exception as exc:
         logger.warning("Derivation LLM call failed: %s", exc)
-        return concept_metrics, set()
+        return concept_metrics, set(), ambiguous_paths
 
     # ── Parse JSON response ──────────────────────────────────────────
     cleaned = (
@@ -643,7 +762,7 @@ def derive_missing_concepts(
         computed: dict[str, float] = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning("Derivation JSON parse failed: %s", exc)
-        return concept_metrics, set()
+        return concept_metrics, set(), ambiguous_paths
 
     # ── Merge computed values (never override extracted) ─────────────
     derived: set[str] = set()
@@ -659,12 +778,11 @@ def derive_missing_concepts(
             continue
         metrics[cid] = float(val)
         derived.add(cid)
-        label = _build_id_label_map(target_concepts).get(cid, cid)
+        label = labels.get(cid, cid)
         logger.info("derive: %s = %.0f (agent-computed)", label, val)
 
     # ── Report what was computed / omitted, with concept names ───────
     from earnings_agents.hooks import report_call
-    labels = _build_id_label_map(target_concepts)
     for cid in sorted(derived):
         report_call(
             f"  [derived]  ✓ {labels.get(cid, cid)} = {metrics[cid]:,.0f}"
@@ -675,7 +793,7 @@ def derive_missing_concepts(
                 f"  [derived]  ✗ {labels.get(cid, cid)} — not computable (no data)"
             )
 
-    return metrics, derived
+    return metrics, derived, ambiguous_paths
 
 
 # ── Prior-value loader ───────────────────────────────────────────────────────

@@ -22,6 +22,11 @@ from earnings_agents.llm import build_chat_llm
 
 logger = logging.getLogger(__name__)
 
+
+class AgentProviderError(RuntimeError):
+    """A provider/API failure that must remain visible to worker callers."""
+
+
 # ── Response parsing ────────────────────────────────────────────────────────
 
 _PCT_OR_PER_SHARE_PATTERNS = re.compile(
@@ -99,8 +104,17 @@ def _parse_llm_response(
     response: str,
     shares_multiplier: int = 1,
     prescan_dollar_multiplier: int = 0,
+    no_scale_keys: set[str] | None = None,
 ) -> dict[str, Any] | None:
-    """Strip markdown fences, parse JSON, and apply the __scale__ multiplier."""
+    """Strip markdown fences, parse JSON, and apply the __scale__ multiplier.
+
+    *no_scale_keys*: bracket/raw keys whose values are as-is (per-share
+    amounts, percentages, ratios, share counts) and must NEVER be scaled —
+    even when the key string itself does not match the per-share regex
+    (e.g. member-tagged keys like ``[custom:Basic|014.001]`` whose label
+    carries the "per share" signal).  The pipeline builds this set from the
+    concept labels.
+    """
     from earnings_agents.agent.derive import SCALE_MULTIPLIERS
 
     cleaned = (
@@ -130,6 +144,23 @@ def _parse_llm_response(
     else:
         multiplier = llm_multiplier if llm_multiplier > 1 else 1
 
+    no_scale = no_scale_keys or set()
+
+    # Per-value evidence block: {"metric_key": {"lines": [s, e], "scale": ...,
+    # "currency": ...}}.  Preserved verbatim (never coerced/scaled) so the
+    # pipeline can build value_metadata_by_id and the verifier can spot-check.
+    raw_evidence = parsed.pop("__evidence__", None)
+    evidence: dict[str, Any] = {}
+    if isinstance(raw_evidence, dict):
+        evidence = raw_evidence
+    elif isinstance(raw_evidence, str):
+        try:
+            parsed_ev = json.loads(raw_evidence)
+            if isinstance(parsed_ev, dict):
+                evidence = parsed_ev
+        except json.JSONDecodeError:
+            pass
+
     table_raw_max = _IMPLAUSIBLE_ABS_USD // multiplier if multiplier > 1 else _TABLE_RAW_MAX
     # Deterministic sign guardrail — runs UNCONDITIONALLY (even with no
     # __scale__ multiplier): coerce SEC/IR-style strings ("(175,685)",
@@ -137,6 +168,8 @@ def _parse_llm_response(
     # doubled, or passed downstream as strings.  Non-numeric text is left
     # untouched.
     for k, v in list(parsed.items()):
+        if k.startswith("__"):
+            continue
         if v is None or isinstance(v, (int, float)):
             continue
         coerced = _coerce_number(v)
@@ -145,6 +178,15 @@ def _parse_llm_response(
 
     if multiplier > 1 or shares_multiplier > 1:
         for k, v in list(parsed.items()):
+            # Metadata keys (__scale__, __currency__, __company_mismatch__,
+            # __evidence__) must never be scaled or coerced.
+            if k.startswith("__"):
+                continue
+            # Label-derived as-is keys (per-share/percentage/ratio/share
+            # counts) are never scaled — even when the key string itself does
+            # not match the regex below (member-tagged EPS keys).
+            if k in no_scale:
+                continue
             # Booleans must never be scaled (e.g. "__company_mismatch__": true
             # would otherwise become 1000 under a thousands multiplier).
             if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
@@ -163,6 +205,9 @@ def _parse_llm_response(
                     continue
                 parsed[k] = v * multiplier
 
+    if evidence:
+        parsed["__evidence__"] = evidence
+
     return parsed
 
 
@@ -178,6 +223,7 @@ def run_agent_loop(
     finalize_description: str = FINALIZE_DESCRIPTION,
     parse_final_result: Callable[[str], dict[str, Any] | None] | None = None,
     recovery_regex: re.Pattern | None = None,
+    no_scale_keys: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Run the tool-calling agent loop — shared by extraction and period detection.
 
@@ -199,13 +245,18 @@ def run_agent_loop(
         recovery_regex: Pattern used to recover a final JSON blob from the last AI
             message when the agent never called the terminal tool.  Defaults to the
             ``__scale__``-keyed extraction pattern.
+        no_scale_keys: Bracket/raw keys that must never be scaled (per-share/
+            percentage concepts whose labels carry the as-is signal).  Passed to
+            the default extraction parser.
 
     Returns:
         The parsed final result dict,
         or ``None`` if the agent failed to produce a result.
     """
     if parse_final_result is None:
-        parse_final_result = lambda s: _parse_llm_response(s, 1, dollar_multiplier)  # noqa: E731
+        parse_final_result = lambda s: _parse_llm_response(  # noqa: E731
+            s, 1, dollar_multiplier, no_scale_keys
+        )
     if recovery_regex is None:
         recovery_regex = re.compile(r'\{[^{}]*"__scale__"[^{}]*\}', re.DOTALL)
 
@@ -248,8 +299,18 @@ def run_agent_loop(
         try:
             response = llm_with_tools.invoke(messages)
         except Exception as exc:
-            logger.error("Agent LLM call failed at step %d for %s: %s", step, ticker, exc)
-            break
+            # Preserve the provider's exact status/body (e.g. DeepSeek 402
+            # Insufficient Balance) so operators and the worker can act on the
+            # real cause instead of seeing only "no result produced".
+            detail = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "Agent LLM call failed at step %d for %s — %s",
+                step, ticker, detail, exc_info=True,
+            )
+            report_call(f"  [llm]  ✗ provider error at step {step}: {detail[:800]}")
+            raise AgentProviderError(
+                f"LLM provider failed at extraction step {step}: {detail}"
+            ) from exc
 
         messages.append(response)
 

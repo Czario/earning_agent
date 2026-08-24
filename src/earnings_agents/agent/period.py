@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from earnings_agents.agent.loop import run_agent_loop
+from earnings_agents.agent.loop import run_agent_loop, AgentProviderError
 from earnings_agents.agent.tools import build_pi_tools
 from earnings_agents.state import EarningsAgentState
 
@@ -419,8 +419,10 @@ def run_period_detection(
     system_prompt = PERIOD_SYSTEM_PROMPT.format(fy_end=fy_end)
 
     initial_message = (
-        f"This is a {len(raw_text):,}-character SEC earnings press release. "
-        "Determine the current reporting period, then call finalize_period."
+        f"This is a {len(raw_text):,}-character earnings document. It may be an "
+        "SEC 8-K/EDGAR exhibit, an IR-hosted PDF, a shareholder letter, or "
+        "another website PDF. Determine the current reporting period from the "
+        "document, then call finalize_period."
     )
 
     tools = build_pi_tools(
@@ -441,7 +443,8 @@ def run_period_detection(
     )
     if result is None:
         raise PeriodDetectionError(
-            f"period agent produced no result for {ticker}"
+            f"period agent produced no result for {ticker}; see the preceding "
+            "[llm] provider error for the exact failure"
         )
 
     validated, error = apply_period_business_rules(result)

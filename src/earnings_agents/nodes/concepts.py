@@ -20,6 +20,7 @@ generic income-statement extraction proceed.  It never sets ``status=failed``.
 from __future__ import annotations
 
 import logging
+import re
 
 from earnings_agents.config import PROMPT_HISTORY_PERIODS
 from earnings_agents.integrations.normalize import (
@@ -31,6 +32,23 @@ from earnings_agents.agent.period import require_detected_period
 from earnings_agents.state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
+
+
+# Malformed-row detector for upstream normalizer pollution.  Rows whose label
+# carries no words (e.g. label "404" from a page number / footnote marker —
+# observed live on PDD) are not financial metrics: no filing prints them, so
+# the extraction agent can never find them and the verifier re-flags them as
+# missing every audit round, burning the entire retry loop on a phantom.  A
+# real income-statement row always has an alphabetic word in its label.
+_GARBAGE_LABEL_RX = re.compile(r"^[\d\s.,()/%-]+$")
+
+
+def _is_garbage_concept(c: dict) -> bool:
+    """True when a concept row carries no alphabetic word in its label."""
+    label = (c.get("label") or "").strip()
+    if not label:
+        return True
+    return bool(_GARBAGE_LABEL_RX.match(label))
 
 
 def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
@@ -104,44 +122,15 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
         ticker, cik, period_type, period_end_str,
     )
 
-    # ── 1. Recent-value window FIRST — the rule: extract ONLY concepts that
-    # had a stored value in any of the last PROMPT_HISTORY_PERIODS periods
-    # (quarterly → concept_values_quarterly, annual → concept_values_annual).
-    # The window is computed before any concept loading so the concept query
-    # itself is restricted to it — non-recent concepts are never even loaded.
-    # (system:/calculated concepts are exempt: always loaded for derivation.)
-    try:
-        recent = get_recently_valued_concept_ids(
-            cik, period=period, n_periods=PROMPT_HISTORY_PERIODS
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _skip(
-            f"Recent-value lookup failed for {ticker} ({exc}) — cannot build "
-            f"the extraction target.",
-            cik=cik,
-            fiscal_year_end_month=fy_end_month,
-            fiscal_year_end_code=company.get("fiscal_year_end_code"),
-            detected_period=state.get("detected_period"),
-        )
-
-    recent_concept_ids: list[str] = sorted(recent)
-    if not recent_concept_ids:
-        return _skip(
-            f"No concepts valued in the last {PROMPT_HISTORY_PERIODS} "
-            f"{period_type} periods for {ticker} — nothing to extract.",
-            cik=cik,
-            fiscal_year_end_month=fy_end_month,
-            fiscal_year_end_code=company.get("fiscal_year_end_code"),
-            detected_period=state.get("detected_period"),
-        )
-
-    # ── 2. Load ONLY the recently-valued concepts (query-level filter) ─────
+    # ── 1. Load the FULL eligible concept universe ─────────────────────────
+    # Recent history is a prioritization signal, not an eligibility filter:
+    # new segments, breakdowns, and newly disclosed rows must remain
+    # extractable even when they had no stored value in the recent window.
     try:
         concepts = get_statement_concepts(
             cik,
             statement_types=["income"],
             period=period,
-            concept_ids=recent_concept_ids,
         )
     except Exception as exc:  # noqa: BLE001
         return _skip(
@@ -153,33 +142,99 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
             detected_period=state.get("detected_period"),
         )
 
-    from earnings_agents.hooks import report_call
-    report_call(
-        f"  [load concepts]  loaded {len(concepts)} income-statement concept(s) "
-        f"({period_type}) — last-{PROMPT_HISTORY_PERIODS}-period window "
-        f"(+ system/calculated exempt)"
-    )
-    logger.info(
-        "load_company_concepts: loaded %d income-statement concept(s) for %s "
-        "(CIK %s, %s, recent-%d-period window + system/calculated exempt)",
-        len(concepts), ticker, cik, period_type, PROMPT_HISTORY_PERIODS,
-    )
-
     if not concepts:
         return _skip(
             f"No income-statement concepts stored for {ticker} in normalize_data "
-            f"for the recent-value window — we can't proceed.",
+            f"— we can't proceed.",
             cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
             detected_period=state.get("detected_period"),
         )
 
+    # ── 1b. Drop malformed concept rows (upstream normalizer pollution) ────
+    n_raw = len(concepts)
+    concepts = [c for c in concepts if not _is_garbage_concept(c)]
+    if len(concepts) < n_raw:
+        from earnings_agents.hooks import report_call
+        report_call(
+            f"  [load concepts]  dropped {n_raw - len(concepts)} malformed "
+            "concept row(s) (numeric/garbage labels — upstream pollution)"
+        )
+        logger.info(
+            "load_company_concepts: dropped %d malformed concept row(s) for %s",
+            n_raw - len(concepts), ticker,
+        )
+
+    if not concepts:
+        return _skip(
+            f"No usable income-statement concepts for {ticker} in "
+            "normalize_data (all rows malformed) — we can't proceed.",
+            cik=cik,
+            fiscal_year_end_month=fy_end_month,
+            fiscal_year_end_code=company.get("fiscal_year_end_code"),
+            detected_period=state.get("detected_period"),
+        )
+
+    # ── 2. Recent-value window → prioritization (best-effort) ─────────────
+    try:
+        recent = get_recently_valued_concept_ids(
+            cik, period=period, n_periods=PROMPT_HISTORY_PERIODS
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "load_company_concepts: recent-value lookup failed for %s (%s) — "
+            "falling back to the full universe", ticker, exc,
+        )
+        recent = set()
+    recent_concept_ids: list[str] = sorted(recent)
+
+    def _is_calculated(c: dict) -> bool:
+        return bool(c.get("calculated")) or str(
+            c.get("concept") or c.get("taxonomy_key") or ""
+        ).lower().startswith("system:")
+
+    def _is_dimensional(c: dict) -> bool:
+        return bool(c.get("dimension") or c.get("dimension_concept"))
+
+    # Target = recent concepts ∪ all dimensional rows ∪ system/calculated.
+    # When no history exists (bootstrap), use the full universe.
+    if recent_concept_ids:
+        target = [
+            c for c in concepts
+            if c["_id"] in recent or _is_dimensional(c) or _is_calculated(c)
+        ]
+    else:
+        target = concepts
+
+    if not target:
+        return _skip(
+            f"No eligible income-statement concepts for {ticker} — nothing to extract.",
+            cik=cik,
+            fiscal_year_end_month=fy_end_month,
+            fiscal_year_end_code=company.get("fiscal_year_end_code"),
+            detected_period=state.get("detected_period"),
+        )
+
+    from earnings_agents.hooks import report_call
+    n_recent = sum(1 for c in target if c["_id"] in recent)
+    n_discovery = len(target) - n_recent
+    report_call(
+        f"  [load concepts]  loaded {len(target)}/{len(concepts)} income-statement "
+        f"concept(s) ({period_type}) — {n_recent} recent + {n_discovery} discovery "
+        f"(new segments/breakdowns + system/calculated)"
+    )
+    logger.info(
+        "load_company_concepts: targeted %d of %d income-statement concept(s) for %s "
+        "(CIK %s, %s; %d recent, %d discovery)",
+        len(target), len(concepts), ticker, cik, period_type, n_recent, n_discovery,
+    )
+
     return {
         **state,
         "cik": cik,
         "company_industry": company.get("industry") or {},
-        "target_concepts": concepts,
+        "target_concepts": target,
         "recent_concept_ids": recent_concept_ids,
         "calculated_concepts": [],
         "fiscal_year_end_month": fy_end_month,

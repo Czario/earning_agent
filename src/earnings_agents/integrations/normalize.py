@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from bson import ObjectId
 from pymongo import MongoClient, UpdateOne
+from uuid import uuid4
 
 from earnings_agents.agent.period import DetectedPeriod, format_period_label
 from earnings_agents.config import MONGODB_URI
@@ -286,6 +287,7 @@ def get_statement_concepts(
             "statement_type": 1,
             "dimension": 1,
             "dimension_concept": 1,
+            "calculated": 1,
         },
     # path alone is not unique (sibling rows can share a path, disambiguated
     # by order_key) — sort by both so row order is deterministic across runs.
@@ -380,6 +382,10 @@ def get_statement_concepts(
                 "taxonomy_key": taxonomy_key,
                 "dimension": bool(d.get("dimension")),
                 "dimension_concept": bool(d.get("dimension_concept")),
+                "calculated": bool(d.get("calculated")),
+                "dimension_member": member_tag or "",
+                "dimension_member_label": member or "",
+                "dimension_axis": member_tag or "",
             }
         )
     return out
@@ -429,6 +435,9 @@ def get_calculated_concepts(
             "path": 1,
             "order_key": 1,
             "statement_type": 1,
+            "dimension": 1,
+            "dimension_concept": 1,
+            "calculated": 1,
         },
     ).sort([("path", 1), ("order_key", 1)])
 
@@ -451,12 +460,15 @@ def get_calculated_concepts(
                 "path": d.get("path", ""),
                 "order_key": d.get("order_key"),
                 "statement_type": d.get("statement_type", ""),
+                "dimension": bool(d.get("dimension")),
+                "dimension_concept": bool(d.get("dimension_concept")),
+                "calculated": bool(d.get("calculated")),
             }
         )
 
     logger.debug(
         "get_calculated_concepts: found %d calculated concept(s) for cik=%s (%s)",
-        len(out), cik, period_type,
+        len(out), cik, period.period_type,
     )
     return out
 
@@ -553,27 +565,6 @@ def fiscal_period_exists(cik: str, period: DetectedPeriod) -> bool:
     ) > 0
 
 
-def delete_fiscal_period(cik: str, period: DetectedPeriod) -> int:
-    """Delete values for the canonical agent period."""
-    db = _get_client()[_NORMALIZE_DB]
-    collection_name = _values_collection(period)
-    filt: dict[str, Any] = {
-        "cik": cik,
-        "statement_type": "income",
-        "reporting_period.fiscal_year": period.fiscal_year,
-    }
-    if period.quarter is not None:
-        filt["reporting_period.quarter"] = period.quarter
-    result = db[collection_name].delete_many(filt)
-    if result.deleted_count:
-        logger.info(
-            "delete_fiscal_period: removed %d document(s) from %s for CIK %s %s",
-            result.deleted_count, collection_name, cik,
-            format_period_label(period),
-        )
-    return result.deleted_count
-
-
 def get_recently_valued_concept_ids(
     cik: str,
     period: DetectedPeriod,
@@ -586,13 +577,14 @@ def get_recently_valued_concept_ids(
     values, and returns the set of ``concept_id`` values (as strings) that had
     at least one stored value in any of those periods.
 
-    Purpose: the HARD extraction-target filter.  A concept that has not been
-    reported in any of the recent periods is very unlikely to appear in the
-    current filing, so it is dropped from the extraction target entirely — it
-    never reaches the agent prompt, mapping, derivation, or save.
+    Purpose: the extraction-target PRIORITIZATION signal — NOT an eligibility
+    filter.  `load_company_concepts` builds its target as recent concepts ∪
+    all dimensional rows ∪ `system:`/`calculated` concepts, so new segments
+    and newly disclosed rows stay extractable even without history; this
+    function only marks which concepts are known to be recently valued.
 
-    Returns an **empty set** when no history exists; the caller skips the run
-    (nothing to extract).
+    Returns an **empty set** when no history exists (the caller bootstraps
+    from the full universe).
     """
     col_name = _values_collection(period)
     db = _get_client()[_NORMALIZE_DB]
@@ -622,6 +614,7 @@ def upsert_concept_values(
     period: DetectedPeriod,
     statement_type: str = "income",
     derived_concept_ids: set[str] | None = None,
+    value_metadata_by_id: dict[str, dict] | None = None,
     accession_number: str | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
@@ -636,6 +629,13 @@ def upsert_concept_values(
     pipeline, with ``concept_id`` stored as ``ObjectId`` and ``end_date`` as
     a native ``datetime`` so the upsert filter correctly de-duplicates
     re-runs of the same earnings release.
+
+    **Atomicity**: the period is replaced write-first, clean-stale-after.
+    All values are upserted (with a unique per-save ``save_token``) BEFORE any
+    stale document is deleted, so a failed/interrupted write never leaves the
+    period empty or partially overwritten — the previous run's documents stay
+    in place until the new ones are fully written, and the stale sweep only
+    removes documents that do not carry the current save token.
 
     Returns the number of operations submitted (0 on early-exit failures).
     """
@@ -658,6 +658,10 @@ def upsert_concept_values(
                             tzinfo=timezone.utc)
     period_date_str = end_date.strftime("%Y-%m-%d")
     now = datetime.now(tz=timezone.utc)
+    # Unique per-save token: every document written by this call carries it, so
+    # the post-write stale sweep can identify exactly what belongs to this save.
+    save_token = f"{uuid4().hex}-{int(now.timestamp())}"
+
 
     db = _get_client()[_NORMALIZE_DB]
     collection = db[collection_name]
@@ -671,6 +675,9 @@ def upsert_concept_values(
                 "upsert_concept_values: invalid ObjectId %r — skipping", concept_id_str
             )
             continue
+
+        meta: dict[str, Any] = (value_metadata_by_id or {}).get(concept_id_str) or {}
+        dimension_value = bool(meta.get("dimension") or meta.get("dimension_concept"))
 
         period_doc: dict[str, Any] = {
             "end_date": end_datetime,
@@ -695,9 +702,26 @@ def upsert_concept_values(
             "value": value,
             "earning_data": True,
             "created_at": now,
-            "dimension_value": False,
-            "calculated": concept_id_str in (derived_concept_ids or set()),
+            "dimension_value": dimension_value,
+            "calculated": bool(meta.get("calculated")) or concept_id_str in (derived_concept_ids or set()),
+            "currency": meta.get("currency") or "USD",
+            "save_token": save_token,
         }
+        if dimension_value:
+            if meta.get("dimension_member"):
+                doc["dimension_member"] = meta["dimension_member"]
+            if meta.get("dimension_member_label"):
+                doc["dimension_member_label"] = meta["dimension_member_label"]
+            if meta.get("dimension_axis"):
+                doc["dimension_axis"] = meta["dimension_axis"]
+        if meta.get("original_currency"):
+            doc["original_currency"] = meta["original_currency"]
+            doc["original_value"] = meta.get("original_value")
+            doc["original_scale"] = meta.get("original_scale")
+        if meta.get("source_exhibit"):
+            doc["source_exhibit"] = meta["source_exhibit"]
+        if meta.get("status"):
+            doc["extraction_status"] = meta["status"]
         if accession_number:
             doc["accession_number"] = accession_number
         filter_doc: dict[str, Any] = {
@@ -707,6 +731,13 @@ def upsert_concept_values(
         }
         if period_type == "quarterly":
             filter_doc["reporting_period.quarter"] = quarter
+        if dimension_value:
+            # Distinct dimensional rows must never overwrite one another:
+            # same member under DIFFERENT axes (e.g. BusinessSegmentAxis vs
+            # GeographicAxis both containing "Product") are different rows.
+            filter_doc["dimension_member"] = meta.get("dimension_member") or ""
+            if meta.get("dimension_axis"):
+                filter_doc["dimension_axis"] = meta["dimension_axis"]
 
         ops.append(
             UpdateOne(
@@ -719,29 +750,32 @@ def upsert_concept_values(
     if not ops:
         return 0
 
-    # ── Delete existing data for this period before inserting fresh ───────
-    # Avoids duplicate-key errors when the same fiscal period was previously
-    # stored with a slightly different end_date (e.g. Q3 vs Q2 reclassification
-    # of the same June 27 period).  The unique index is on {cik,
-    # concept_id, fiscal_year, quarter}, so deleting by these keys first
-    # guarantees clean insertion.
-    _del_filt: dict[str, Any] = {
+    # ── Write FIRST, then sweep stale ────────────────────────────────────
+    # All values for this period are upserted (in place, via the identity
+    # filter) BEFORE any deletion.  A failed/interrupted write therefore never
+    # leaves the period empty: the previous run's documents remain until the
+    # new ones are fully written.  The stale sweep afterwards removes every
+    # document of this period that does not carry this save's token (old
+    # runs, superseded concept rows, rows removed from the target list).
+    from earnings_agents.hooks import report_call
+    collection.bulk_write(ops, ordered=False)
+
+    _stale_filt: dict[str, Any] = {
         "cik": cik,
         "statement_type": statement_type,
         "reporting_period.fiscal_year": fiscal_year,
+        "save_token": {"$ne": save_token},
     }
     if period_type == "quarterly":
-        _del_filt["reporting_period.quarter"] = quarter
-    _del_count = collection.delete_many(_del_filt).deleted_count
+        _stale_filt["reporting_period.quarter"] = quarter
+    _del_count = collection.delete_many(_stale_filt).deleted_count
     if _del_count:
         logger.info(
-            "upsert_concept_values: deleted %d stale doc(s) for CIK %s %s",
+            "upsert_concept_values: swept %d stale doc(s) for CIK %s %s",
             _del_count, cik, format_period_label(period),
         )
 
-    from earnings_agents.hooks import report_call
     period_label = format_period_label(period)
-    collection.bulk_write(ops, ordered=False)
     report_call(
         f"  [db]  ✓ upserted {len(ops)} concept(s) → {collection_name}  {period_label}"
     )

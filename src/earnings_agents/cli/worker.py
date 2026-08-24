@@ -232,7 +232,8 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         set_node_callback(None)
         set_call_callback(None)
         pub.close()
-        _cleanup_temporary_filing(payload)
+        # Keep temporary uploads available when the job is re-queued.  The
+        # caller owns cleanup after terminal success/dead-letter handling.
 
     elapsed_s = perf_counter() - t0
     elapsed_str = (
@@ -254,13 +255,14 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
     if final.get("_pending_replace"):
         label = final.get("_replace_period_label", "?")
         if status == "saved":
-            # The deferred replace already ran inside mongodb_save (delete +
-            # upsert) — report it in the past tense so it doesn't read like a
+            # The deferred replace already ran atomically inside
+            # mongodb_save → upsert_concept_values (write-first + stale
+            # sweep) — report it in the past tense so it doesn't read like a
             # second save/extraction is still pending.
             pub.publish(
                 "progress",
                 f"replaced {label} — existing data replaced "
-                f"(deferred delete + upsert)",
+                f"(atomic write-first replace)",
             )
         else:
             pub.publish(
@@ -298,6 +300,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         logger.info("8-K skipped for %s — %s", ticker, status)
         return True
 
+    payload["last_error"] = str(final.get("error") or f"pipeline ended with status={status}")
     logger.warning(
         "8-K pipeline ended with status=%s  error=%s  for %s",
         status, final.get("error"), ticker,
@@ -419,8 +422,11 @@ def main(argv: list[str] | None = None) -> None:
             )
             raise  # let the process exit normally
         except Exception as exc:  # noqa: BLE001
-            payload["last_error"] = str(exc)
-            logger.exception("Unhandled error processing 8-K job for %s", payload.get("ticker"))
+            payload["last_error"] = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "Unhandled error processing 8-K job for %s — %s",
+                payload.get("ticker"), payload["last_error"],
+            )
 
         if success:
             # Write sec_period_of_report so the pipeline table shows the
@@ -431,10 +437,37 @@ def main(argv: list[str] | None = None) -> None:
             # without the agent label must remain unlabeled, not misclassified.
             _period = payload.pop("_sec_period_label", None) or ""
             _update_load_request_status(payload, "completed", period_of_report=_period)
+            _cleanup_temporary_filing(payload)
         else:
+            # _process_payload already set payload["last_error"] from the
+            # graph's final state. Copy it into the retry payload before
+            # classifying retryability (there is no `final` in this scope —
+            # _process_payload returns a bool, not the graph state).
+            payload["last_error"] = str(payload.get("last_error") or "")
+            # Billing/authentication/configuration failures are deterministic:
+            # re-queuing the same PDF only repeats the provider error and can
+            # exhaust retries while the temporary upload is already gone.
+            # Leave the payload in the DLQ immediately for operator action.
+            last_error = str(payload.get("last_error") or "").lower()
+            non_retryable = any(
+                marker in last_error
+                for marker in (
+                    "402", "insufficient balance", "payment required",
+                    "invalid api key", "authentication", "unauthorized",
+                )
+            )
             payload["attempts"] = attempts + 1
             payload["failed_at"] = time.time()
-            if payload["attempts"] < args.max_attempts:
+            if non_retryable:
+                logger.error(
+                    "8-K job has non-retryable provider failure; moving directly "
+                    "to dead-letter queue for %s: %s",
+                    payload.get("ticker"), payload.get("last_error"),
+                )
+                _update_load_request_status(payload, "failed")
+                _cleanup_temporary_filing(payload)
+                client.rpush(dead_letter_queue, serialize_message(payload))
+            elif payload["attempts"] < args.max_attempts:
                 logger.warning(
                     "8-K job failed; retrying attempt %d/%d for %s",
                     payload["attempts"], args.max_attempts, payload.get("ticker"),
@@ -447,6 +480,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.max_attempts, dead_letter_queue, payload.get("ticker"),
                 )
                 _update_load_request_status(payload, "failed")
+                _cleanup_temporary_filing(payload)
                 client.rpush(dead_letter_queue, serialize_message(payload))
 
         if args.once:

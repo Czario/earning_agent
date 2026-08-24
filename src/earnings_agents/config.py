@@ -79,3 +79,9 @@ PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
 # Maximum extraction passes in the agentic loop (initial pass + retries).
 # Override with the MAX_EXTRACTION_ATTEMPTS environment variable.
 MAX_EXTRACTION_ATTEMPTS: int = int(os.getenv("MAX_EXTRACTION_ATTEMPTS", "3"))
+
+# Verifier agent budget.  VERIFIER_MAX_ROUNDS bounds the
+# extract → verify → targeted-retry loop; VERIFIER_MAX_STEPS bounds the
+# verifier's tool-calling steps per round.
+VERIFIER_MAX_ROUNDS: int = int(os.getenv("VERIFIER_MAX_ROUNDS", "2"))
+VERIFIER_MAX_STEPS: int = int(os.getenv("VERIFIER_MAX_STEPS", "30"))

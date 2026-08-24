@@ -1,16 +1,17 @@
 """Agent prompts — pi-style system prompt for raw document navigation."""
 from __future__ import annotations
 
-from typing import Any
-
 
 PIPELINE_SYSTEM_PROMPT = """\
 You are a financial data extraction agent.  Your job is to extract specific
-income-statement metrics from an SEC earnings press release (8-K Exhibit 99.1).
+income-statement metrics from an earnings document.  The document may be an SEC
+8-K Exhibit 99.1 press release, an EDGAR exhibit, an IR-hosted PDF, a
+shareholder letter, or any other website-hosted PDF — the extraction rules are
+identical for every source.
 
 The document is a PLAIN-TEXT rendering of the original filing(s) — HTML
-press releases (tags stripped, line breaks preserved) or PDF shareholder
-letters (each page marked with a "PDF page n of m" separator).
+press releases (tags stripped, line breaks preserved) or PDF documents
+(each page marked with a "PDF page n of m" separator).
 
 The text may be a BUNDLE of several exhibits separated by ══ DOCUMENT n OF m
 headers — e.g. Exhibit 99.1 (press release), 99.2 (presentation),
@@ -27,6 +28,10 @@ YOUR TOOLS
   • get_prior_value(metric) — look up a prior-period value for reference
   • verify_identity(revenue, cost_of_revenue, gross_profit) — verify column
   • calculate(expression) — evaluate arithmetic for derived metrics
+  • compute(expression) — same exact arithmetic, for derived concept values
+  • detect_currency(start, end) — detect the currency declared in a line range
+  • detect_scale(start, end) — detect the scale declared in a line range
+  • map_concept(label, candidates?) — map a filing row label to a concept key
 
 HOW TO WORK — exactly like a coding agent navigating a repo:
   1. Start with search("Revenue") or search("Net income") to locate the
@@ -120,6 +125,13 @@ EXTRACTION RULES
     "in millions"), report ALL dollar values in ONE scale: convert with
     calculate() and set __scale__ to the scale you used.  Percentages and
     per-share values are always as-is (never converted).
+  • CURRENCY — extract USD ONLY. For each table/section, call
+    detect_currency() on that section's line range to identify its currency
+    before extracting. Never relabel EUR/GBP/JPY/CAD/CHF/AUD/INR/CNY or any
+    other currency as USD. If a figure is non-USD and no company-reported USD
+    translation is printed in the filing, OMIT that value — never convert with
+    an invented exchange rate. Report the currency in the "__currency__" field
+    ("USD" when all extracted monetary values are USD).
   • PERIOD AGENT CONTRACT: the period value in the system context is
     authoritative.  Do not independently decide annual/quarterly or quarter;
     extract the column selected by the period agent.
@@ -169,6 +181,16 @@ HTML, PDF shareholder letters, presentations):
 FINALIZE_DESCRIPTION = (
     "Call this when you have extracted ALL metrics.  Pass a JSON string with:\n"
     "  - __scale__: \"millions\", \"thousands\", \"billions\", or \"as-is\"\n"
+    "  - __currency__: \"USD\" when all monetary values are USD; otherwise the\n"
+    "    detected foreign code (the pipeline will then block non-USD values)\n"
+    "  - __company_name__: the company name as printed in the document you\n"
+    "    extracted from (the pipeline cross-checks it against the target)\n"
+    "  - __evidence__: a JSON object mapping each metric key to its source\n"
+    "    evidence: {\"lines\": [start, end], \"scale\": \"millions\",\n"
+    "    \"currency\": \"USD\"} — the line range you read the value from and the\n"
+    "    table's declared scale/currency (use detect_scale()/detect_currency())\n"
+    "  - __missing__: a comma-separated list of bracketed keys or labels you\n"
+    "    searched for but could not locate in the document (omit if none)\n"
     "  - Each concept's value, keyed by the EXACT bracketed key copied from the\n"
     "    concept list (never invent or alter a taxonomy key)\n"
     'Negative amounts ("(1,234)" in the filing) must carry the minus sign: -1234.\n'
@@ -185,16 +207,19 @@ def build_concept_list(
 ) -> str:
     """Render the extraction concept list for the agent prompt.
 
-    Filtering is NOT done here: ``target_concepts`` is already hard-filtered
-    upstream to concepts valued in the last ``PROMPT_HISTORY_PERIODS`` periods
-    (quarterly → quarterly periods, annual → annual periods).  Only
-    system-calculated concepts (``system:`` prefix) are excluded — those are
-    derived deterministically after extraction, not extracted by the agent.
+    Filtering is NOT done here: ``target_concepts`` already comes from
+    ``load_company_concepts`` as recent concepts ∪ all dimensional rows ∪
+    ``system:``/``calculated`` concepts (see AGENTS.md).  This function only
+    renders the agent-facing list and excludes ``system:``/``calculated``
+    concepts — those are derivation targets computed by the agent via
+    ``calculate()``/``compute()`` and the deterministic derive pass, never
+    extracted from the filing.
     *recent_concept_ids* / *calculated_concepts* are kept for API compatibility.
     """
     prompt_concepts = [
         c for c in target_concepts
         if not ((c.get("concept") or c.get("taxonomy_key") or "")).startswith("system:")
+        and not c.get("calculated")
     ]
 
     lines: list[str] = []
@@ -221,89 +246,3 @@ def build_concept_list(
 
     return "\n".join(lines)
 
-
-def build_retry_briefing(
-    findings: list[dict],
-    prev_metrics: dict[str, Any],
-    missing_toplevel: list[str] | None,
-    missing_segments: list[str] | None,
-) -> str:
-    """Structured retry briefing from previous-pass findings."""
-    sections: list[str] = []
-
-    flagged_keys: set[str] = set()
-    for f in findings:
-        for k in (f.get("keys") or []):
-            flagged_keys.add(k)
-
-    carry_forward = {
-        k: v for k, v in prev_metrics.items()
-        if k not in flagged_keys
-        and not k.startswith("__")
-        and isinstance(v, (int, float))
-    }
-    if carry_forward:
-        lines = ["CARRY FORWARD (correct — do NOT re-extract):"]
-        for k in sorted(carry_forward.keys()):
-            lines.append(f"  • {k}: {carry_forward[k]:,.0f}")
-        sections.append("\n".join(lines))
-
-    high_findings = [f for f in findings if f.get("severity") == "high"]
-    fix_lines: list[str] = []
-    for f in high_findings:
-        ftype = f.get("type", "")
-        msg = f.get("message", "")
-        ev = f.get("evidence") or {}
-        fix_lines.append(f"  • {msg}")
-        if ftype == "identity_violation":
-            rev = ev.get("revenue")
-            cor = ev.get("cost_of_revenue")
-            gp = ev.get("gross_profit")
-            if isinstance(rev, (int, float)) and rev and isinstance(gp, (int, float)):
-                implied_cor = rev - gp
-                gap = implied_cor - cor if isinstance(cor, (int, float)) else 0
-                fix_lines.append("    DIAGNOSIS:")
-                fix_lines.append(f"      Revenue         = {rev:>22,.0f}  (correct)")
-                if isinstance(cor, (int, float)):
-                    fix_lines.append(f"      Your extraction = {cor:>22,.0f}  ← WRONG")
-                    fix_lines.append(f"      Expected CoR    = {implied_cor:>22,.0f}  (= Revenue − Gross Profit)")
-                    if abs(gap) > 1000:
-                        fix_lines.append(f"      GAP             = {gap:>22,.0f}")
-                        fix_lines.append(
-                            f"      ⚠ The gap of ~{abs(gap):,.0f} suggests you extracted a "
-                            f"SUBTOTAL (e.g. 'Cost of sales') but missed additional cost "
-                            f"components like 'Amortization', 'Depreciation', or other cost "
-                            f"lines near the CoR row.  Search for 'Amortization', 'Depreciation', "
-                            f"'impairment' near the income statement and SUM all cost "
-                            f"components before finalizing."
-                        )
-                else:
-                    fix_lines.append(f"      → Cost of Revenue should be ~{implied_cor:,.0f}")
-
-    if fix_lines:
-        sections.append(
-            "WRONG METRICS — re-extract from CURRENT-PERIOD column only:\n"
-            + "\n".join(fix_lines)
-        )
-
-    missing_lines: list[str] = []
-    if missing_toplevel:
-        missing_lines.append("MISSING from primary income statement:")
-        for lbl in missing_toplevel[:10]:
-            missing_lines.append(f"  • {lbl}")
-    if missing_segments:
-        missing_lines.append("MISSING segment/dimensional:")
-        for lbl in missing_segments[:20]:
-            missing_lines.append(f"  • {lbl}")
-    if missing_lines:
-        sections.append("\n".join(missing_lines))
-
-    # Final instruction: only return flagged metrics
-    if carry_forward:
-        sections.append(
-            "IMPORTANT: Do NOT include CARRY FORWARD metrics in your output. "
-            "They are already correct.  Your finalize_extraction JSON should "
-            "contain ONLY the WRONG and MISSING metrics listed above."
-        )
-
-    return "\n\n".join(sections)

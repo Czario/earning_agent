@@ -7,8 +7,10 @@ No accession checks — only exact-period existence using the canonical
 period-agent result:
 
   • same fiscal period stored  → schedule ``_pending_replace`` and CONTINUE —
-    the delete itself stays deferred to ``mongodb_save``, which removes the
-    stale period docs immediately before the upsert (no data-loss window)
+    the replacement itself is atomic inside ``mongodb_save`` →
+    ``upsert_concept_values`` (all values are upserted first, then a stale
+    sweep removes only docs not carrying the current save token — there is no
+    delete-before-write window)
   • otherwise                  → proceed
 
 Period typing comes from the agent: an ANNUAL period is checked and replaced

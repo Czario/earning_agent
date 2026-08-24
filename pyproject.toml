@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = []
+dev = ["pytest>=8.0.0"]
 
 [project.scripts]
 earnings-run-once = "earnings_agents.cli.earnings:main"

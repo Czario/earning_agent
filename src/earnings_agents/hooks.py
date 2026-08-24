@@ -122,6 +122,12 @@ def with_hooks(
                 str(exc).replace('"', "'"),
                 elapsed_ms,
             )
+            # Surface node exceptions through the same worker/admin progress
+            # channel as LLM/tool calls. This is important when an LLM provider
+            # failure is converted into a failed state by the hook wrapper.
+            report_call(
+                f"  [error]  {node_name} failed: {type(exc).__name__}: {exc}"
+            )
             cb = getattr(_thread_local, "node_callback", None)
             if cb:
                 cb(node_name, "error", ticker, None, elapsed_ms)

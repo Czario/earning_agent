@@ -20,27 +20,14 @@ class EarningsAgentState(TypedDict):
     # pending → discovered → fetched → text_extracted → extracted → saved | failed
     status: str
     # Agentic loop fields
-    extraction_attempts: int          # incremented before each extraction pass; caps retries
-    extraction_notes: Optional[str]   # reflection output: hints for the next extraction pass
-    # Routing signal emitted by analyze_metrics_node. True = loop back to
-    # agent_document_pipeline. Using a dedicated field avoids overloading the
-    # status field as a routing signal.
-    needs_reextract: bool
-    # Snapshot of high-severity finding messages from the previous analysis pass.
-    # Used by analyze_metrics_node to detect no-progress loops (same findings
-    # across consecutive passes → break early rather than burn remaining attempts).
-    previous_high_finding_keys: Optional[list]
-
-    # Keys dropped by the agent's cleanup. Informational.
-    cleanup_removed: Optional[list]
-    # Structured Finding.to_dict() entries produced by analyze_metrics_node.
-    # Drives the re-extract loop.
+    extraction_attempts: int          # incremented before each extraction pass; caps verifier retry rounds
+    # Structured completeness/verifier findings: [{type, severity, message,
+    # evidence}].  Populated by the agent pipeline (currency, incomplete
+    # exhibits, missing concepts, hierarchy ambiguity, verifier issues) and
+    # consumed by mongodb_save — unresolved high-severity findings refuse the
+    # upsert under STRICT_ACCURACY.
     findings: Optional[list]
-    # Per-pass skill-effectiveness records appended by analyze_metrics_node on
-    # each re-extract loop: {"to_attempt": int, "deltas": [...]}. Pure
-    # observability (ADR-0006) — shows which skills' findings were resolved
-    # between passes; never influences routing.
-    skill_effectiveness: NotRequired[Optional[list]]
+
     # ── normalize_data targeted extraction ──────────────────────────────────
     # Populated by load_company_concepts_node when EARNINGS_SAVE_TARGET=normalize_data.
     # Empty list (not None) means the node ran but the company was not found,
@@ -67,29 +54,32 @@ class EarningsAgentState(TypedDict):
     # extraction (Tier 0/1). Populated by agent pipeline.
     mapped_metric_keys: NotRequired[Optional[list[str]]]
     # Labels of target_concepts that had no value mapped after all tiers.
-    # Stored by agent pipeline; consumed by analyze_metrics_node
-    # to generate targeted retry hints.
-    missing_concept_labels: NotRequired[Optional[list[str]]]   # all unmapped
-    missing_segment_labels: NotRequired[Optional[list[str]]]   # dimensional (dimension_concept) only
-    missing_toplevel_labels: NotRequired[Optional[list[str]]]  # non-dimensional only
-    # Labels of target_concepts that had no value mapped after all tiers.
-    # Stored by agent pipeline; consumed by analyze_metrics_node
-    # to generate targeted retry hints.
+    # Stored by agent pipeline; consumed by the save/completeness gate.
     missing_concept_labels: NotRequired[Optional[list[str]]]   # all unmapped
     missing_segment_labels: NotRequired[Optional[list[str]]]   # dimensional only
     missing_toplevel_labels: NotRequired[Optional[list[str]]]  # non-dimensional only
-    # Populated by the agent pipeline when HTML tables are extracted.
-    raw_sections: NotRequired[Optional[dict]]
-    # Per-metric chunk provenance (informational).
-    chunk_metric_sources: NotRequired[Optional[dict]]  # str → list[int]
-    # Per-metric verbatim source snippets.
-    # Consumed by ``check_source_grounding`` in analyze_metrics_node to flag
-    # values that cannot be grounded in the source document.
-    metric_source_snippets: NotRequired[Optional[dict]]  # str → str
-    # ── Deferred replace (internal) ─────────────────────────────────────────
-    # Set by check_period_node when the period already exists in
-    # normalize_data.  mongodb_save_node deletes old data before upserting
-    # fresh data, ensuring no data loss if the pipeline fails mid-run.
+    # Canonical currency metadata.  The extraction agent is the authority
+    # (reports __currency__ per table via detect_currency); the deterministic
+    # whole-document scan is only a fallback for confirmed foreign/mixed codes.
+    # Drives the USD-only save gate.
+    currency_metadata: NotRequired[Optional[dict]]
+    # Per-concept value metadata (concept_id → dict): dimension flags/member
+    # identity, currency, scale, source line evidence, calculated status, and
+    # extraction status.  Built by the agent pipeline from the agent's
+    # __evidence__ block and consumed by mongodb_save / upsert_concept_values.
+    value_metadata_by_id: NotRequired[Optional[dict]]
+    # Structured report from the independent verifier agent (second-read
+    # audit): {"status", "issues", "actionable_issues"}.  Populated by the
+    # agent pipeline's extract → verify → targeted-retry loop.
+    verifier_report: NotRequired[Optional[dict]]
+    # Hierarchy paths that have multiple same-path parent rows.  Auto-derivation
+    # refuses to attach children there; the verifier confirms attribution.
+    ambiguous_paths: NotRequired[Optional[list[str]]]
+    # ── Deferred replace (informational) ──────────────────────────────────
+    # Set by check_period_node when the exact fiscal period already exists.
+    # mongodb_save_node performs the replace ATOMICALLY inside
+    # upsert_concept_values (write-first + stale sweep) — this flag only
+    # drives messaging ("replacing X").
     _pending_replace: NotRequired[Optional[dict]]  # {"cik"}; period is canonical detected_period
     _replace_period_label: NotRequired[Optional[str]]  # human-readable period label
     # ── Multi-exhibit documents ──────────────────────────────────────────
