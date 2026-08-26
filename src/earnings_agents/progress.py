@@ -128,9 +128,35 @@ class WorkerProgressPublisher:
         except Exception as exc:  # noqa: BLE001
             logger.warning("WorkerProgressPublisher: publish failed: %s", exc)
 
-    def close(self) -> None:
+    def close(self, summary: str | None = None) -> None:
+        """Close the publisher, embedding *summary* in the log's final line.
+
+        When *summary* is given (e.g. ``"✓ … saved  (24 concepts)  (7 LLM
+        calls)  33.3s"``), it is published to the UI as a ``summary`` event
+        AND appended to the run log file's ``── run ended`` line — the
+        caller computes it AFTER the pipeline finishes, so the log file's
+        last line carries the run's outcome, LLM-call count, and elapsed
+        time.
+        """
+        if summary and self._client is not None:
+            event: dict[str, Any] = {
+                "event":           "worker_progress",
+                "ticker":          self._ticker,
+                "load_request_id": self._load_request_id,
+                "node":            "summary",
+                "message":         summary,
+                "kind":            "summary",
+                "elapsed_ms":      None,
+                "timestamp":       datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                self._client.publish(EVENTS_CHANNEL, json.dumps(event))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "WorkerProgressPublisher: summary publish failed: %s", exc
+                )
         if self._runlog is not None:
-            self._runlog.close()
+            self._runlog.close(summary)
             self._runlog = None
         try:
             if self._client:

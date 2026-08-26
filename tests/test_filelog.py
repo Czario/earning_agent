@@ -83,6 +83,25 @@ class TestRunLogFile(unittest.TestCase):
             finally:
                 log.close()
 
+    def test_close_with_summary_appends_to_final_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = RunLogFile("HIMS", None, log_dir=tmp)
+            log.write("[db]  ✓ upserted 24 concept(s)")
+            log.close(
+                summary="✓ HIMS_2026_latest saved  (24 concepts)  (7 LLM calls)  33.3s"
+            )
+            content = Path(log.path).read_text(encoding="utf-8")
+            last = content.splitlines()[-1]
+            self.assertIn("── run ended", last)
+            self.assertIn("(24 concepts)  (7 LLM calls)  33.3s", last)
+
+    def test_close_without_summary_keeps_bare_footer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = RunLogFile("A", None, log_dir=tmp)
+            log.close()
+            content = Path(log.path).read_text(encoding="utf-8")
+            self.assertRegex(content.splitlines()[-1], r"^── run ended \d{4}-\d{2}-\d{2}T")
+
     def test_recreates_deleted_log_dir_automatically(self):
         """If the Logs dir is deleted at any time, the next run re-creates it."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,6 +145,29 @@ class TestPublisherWritesToFile(unittest.TestCase):
             self.assertIn("[llm] chunk 1/1 → calling llm  (deepseek)", content)
             self.assertIn("✓ saved", content)
             self.assertIn("ticker=PYPL  load_request_id=req-1", content)
+
+    def test_close_with_summary_lands_summary_in_final_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("earnings_agents.config.RUN_LOGS_DIR", tmp), \
+                 patch("earnings_agents.config.RUN_LOGS_ENABLED", True):
+                pub = WorkerProgressPublisher(
+                    "redis://127.0.0.1:1", "HIMS", "req-9"
+                )  # unreachable Redis — file logging must still work
+                pub.publish("call", "[tool]  step 4 → finalize_extraction()")
+                pub.close(
+                    summary="✓ HIMS_2026_latest saved  (24 concepts)  (7 LLM calls)  33.3s"
+                )
+
+            files = list(Path(tmp).glob("*.log"))
+            self.assertEqual(len(files), 1)
+            content = files[0].read_text(encoding="utf-8")
+            last = content.splitlines()[-1]
+            self.assertIn("── run ended", last)
+            self.assertIn("(24 concepts)  (7 LLM calls)  33.3s", last)
+            # the summary appears ONCE — in the final line, not duplicated
+            self.assertEqual(
+                content.count("(7 LLM calls)"), 1,
+            )
 
     def test_disabled_via_config_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

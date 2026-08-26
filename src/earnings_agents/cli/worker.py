@@ -233,16 +233,16 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
             if isinstance(exc, KeyboardInterrupt)
             else str(exc)[:120]
         )
-        pub.publish(
-            "summary",
-            f"✗ {reason}  {elapsed_str}",
-            kind="summary",
-        )
+        # The summary lands in the run log file's final line (LLM calls +
+        # elapsed) and is published to the UI before the publisher closes.
+        pub.close(summary=f"✗ {reason}  {elapsed_str}")
         raise
     finally:
         set_node_callback(None)
         set_call_callback(None)
-        pub.close()
+        # NOTE: pub.close() is intentionally NOT here — the terminal paths
+        # below close it WITH their summary line so the log file's last line
+        # carries the run's outcome, LLM-call count, and elapsed time.
         # Keep temporary uploads available when the job is re-queued.  The
         # caller owns cleanup after terminal success/dead-letter handling.
 
@@ -290,7 +290,8 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         )
         year = str(detected_period.fiscal_year) if detected_period else "?"
         summary = f"✓ {ticker}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
-        pub.publish("summary", summary, kind="summary")
+        # Close the publisher now — the summary is the log file's final line.
+        pub.close(summary=summary)
         # Use the exact canonical period context produced by the period agent.
         # Do not re-query the latest database row: another job could win that
         # race and relabel this filing with a different period.
@@ -309,12 +310,16 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
 
     if status == "skipped":
         logger.info("8-K skipped for %s — %s", ticker, status)
+        pub.close(summary=f"skipped — {final.get('error') or status}")
         return True
 
     payload["last_error"] = str(final.get("error") or f"pipeline ended with status={status}")
     logger.warning(
         "8-K pipeline ended with status=%s  error=%s  for %s",
         status, final.get("error"), ticker,
+    )
+    pub.close(
+        summary=f"✗ {status} — {str(final.get('error') or 'pipeline failed')[:120]}  {elapsed_str}"
     )
     return False
 

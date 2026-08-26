@@ -165,23 +165,28 @@ class _GroqInvokeAdapter:
         # The real count corrects the reservation once the API responds.
         estimated_tokens = len(prompt) // 4 + 800
         token_entry = _groq_rate_limiter.acquire(estimated_tokens)
+        _t0 = time.perf_counter()
         try:
             msg = self._chat.invoke(prompt)
         except Exception:
             # Release the reservation on error so the budget isn't permanently consumed.
             _groq_rate_limiter.update_actual(token_entry, 0)
             raise
+        _elapsed = time.perf_counter() - _t0
         # Log and correct token budget with actual usage.
         usage = getattr(msg, "response_metadata", {}).get("token_usage") or {}
         if usage:
             logger.debug(
-                "groq tokens — prompt: %s  completion: %s  total: %s",
+                "groq tokens — prompt: %s  completion: %s  total: %s  (%.1fs)",
                 usage.get("prompt_tokens", "?"),
                 usage.get("completion_tokens", "?"),
                 usage.get("total_tokens", "?"),
+                _elapsed,
             )
             actual_tokens = usage.get("total_tokens", estimated_tokens)
             _groq_rate_limiter.update_actual(token_entry, actual_tokens)
+        else:
+            logger.debug("groq invoke took %.1fs", _elapsed)
         content = getattr(msg, "content", msg)
         return content if isinstance(content, str) else str(content)
 
@@ -198,15 +203,20 @@ class _OpenAIInvokeAdapter:
         self._chat = chat_model
 
     def invoke(self, prompt: str) -> str:
+        _t0 = time.perf_counter()
         msg = self._chat.invoke(prompt)
+        _elapsed = time.perf_counter() - _t0
         content = getattr(msg, "content", msg)
         if usage := getattr(msg, "response_metadata", {}).get("token_usage"):
             logger.debug(
-                "openai tokens — prompt: %s  completion: %s  total: %s",
+                "openai tokens — prompt: %s  completion: %s  total: %s  (%.1fs)",
                 usage.get("prompt_tokens", "?"),
                 usage.get("completion_tokens", "?"),
                 usage.get("total_tokens", "?"),
+                _elapsed,
             )
+        else:
+            logger.debug("openai invoke took %.1fs", _elapsed)
         return content if isinstance(content, str) else str(content)
 
 
@@ -226,19 +236,24 @@ class _GeminiInvokeAdapter:
         self._config = config
 
     def invoke(self, prompt: str) -> str:
+        _t0 = time.perf_counter()
         response = self._client.models.generate_content(
             model=self._model,
             contents=prompt,
             config=self._config,
         )
+        _elapsed = time.perf_counter() - _t0
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
             logger.debug(
-                "gemini tokens — prompt: %s  candidates: %s  total: %s",
+                "gemini tokens — prompt: %s  candidates: %s  total: %s  (%.1fs)",
                 getattr(usage, "prompt_token_count", "?"),
                 getattr(usage, "candidates_token_count", "?"),
                 getattr(usage, "total_token_count", "?"),
+                _elapsed,
             )
+        else:
+            logger.debug("gemini invoke took %.1fs", _elapsed)
         text = getattr(response, "text", None)
         return text if isinstance(text, str) else str(text)
 
@@ -250,6 +265,7 @@ def build_llm(
     request_timeout: float | None = None,
     max_retries: int = 2,
     provider: str | None = None,
+    model: str | None = None,
 ) -> Any:
     """Build an LLM client for the configured provider.
 
@@ -275,6 +291,9 @@ def build_llm(
             ``"gemini"``). When given, takes precedence over the
             ``LLM_PROVIDER`` env var. Used by the extraction node to escalate
             to a cloud provider on retry attempts.
+        model: Explicit model override for the effective provider (e.g. the
+            section indexer routing to a fast model).  When None, the
+            provider's configured default model is used.
     """
     effective_provider = (provider or LLM_PROVIDER).strip().lower()
     if effective_provider == "groq":
@@ -288,7 +307,7 @@ def build_llm(
         if not GROQ_API_KEY:
             raise ValueError("LLM_PROVIDER=groq but GROQ_API_KEY is not set")
         kwargs: dict[str, Any] = {
-            "model": GROQ_MODEL,
+            "model": model or GROQ_MODEL,
             "temperature": 0,
             "api_key": GROQ_API_KEY,
             "base_url": GROQ_BASE_URL,
@@ -314,7 +333,7 @@ def build_llm(
         if not DEEPSEEK_API_KEY:
             raise ValueError("LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY is not set")
         kwargs = {
-            "model": DEEPSEEK_MODEL,
+            "model": model or DEEPSEEK_MODEL,
             "temperature": 0,
             "api_key": DEEPSEEK_API_KEY,
             "base_url": DEEPSEEK_BASE_URL,
@@ -347,13 +366,14 @@ def build_llm(
             # google-genai expects the HTTP timeout in milliseconds.
             http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
         )
+        effective_model = model or GEMINI_MODEL
         config_kwargs: dict[str, Any] = {"temperature": 0}
         if json_schema is not None or format_json:
             # gemini-2.5 supports native JSON mode. The schema (when present) is
             # embedded in the prompt by the caller, mirroring the Groq adapter.
             config_kwargs["response_mime_type"] = "application/json"
         gen_config = types.GenerateContentConfig(**config_kwargs)
-        llm = _GeminiInvokeAdapter(client, GEMINI_MODEL, gen_config)
+        llm = _GeminiInvokeAdapter(client, effective_model, gen_config)
         if LLM_CACHE_ENABLED:
             llm = _CachedLLM(llm, f"gemini:{GEMINI_MODEL}", LLM_CACHE_DIR)
         return llm
@@ -363,7 +383,7 @@ def build_llm(
 
     kwargs = {
         "base_url": OLLAMA_BASE_URL,
-        "model": OLLAMA_MODEL,
+        "model": model or OLLAMA_MODEL,
         "temperature": 0,
         "num_ctx": OLLAMA_NUM_CTX,
     }

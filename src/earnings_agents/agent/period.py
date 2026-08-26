@@ -44,11 +44,13 @@ The filing's current fiscal-year/quarter header is authoritative.
 STEPS
   1. get_document_info() for an overview — the text may be a BUNDLE of
      exhibits; the FIRST document is the press release carrying the period
-     header.  Read the period from there.
+     header.
   2. search("Ended") or search("quarter") to locate the period header
      (e.g. "Three Months Ended July 26, 2026",
      "results for its third quarter ended July 26, 2026",
-     "Fiscal Year Ended July 25, 2026").
+     "Fiscal Year Ended July 25, 2026").  If the search does not quickly
+     reveal it, call find_sections() — its company_header entry points at
+     the period header.
   3. read_lines() the header region and read the CURRENT-period column
      header exactly as printed.
 
@@ -403,6 +405,7 @@ def run_period_detection(
     fy_end_month: int | None = None,
     fy_end_code: str | None = None,
     document_map: list[dict] | None = None,
+    section_store: dict | None = None,
 ) -> dict[str, Any]:
     """Run the period-detection agent over *raw_text*.
 
@@ -410,6 +413,9 @@ def run_period_detection(
     ``get_document_info`` so the agent knows the first document is the press
     release carrying the period header.  *company_industry* feeds the cached
     ``get_company_info`` tool (the period prompt itself does not use it).
+    *section_store*, when given, receives the LLM-built section map from the
+    agent's ``find_sections`` call (``section_store["index"]``) so the graph
+    can persist it to state for the extraction pass.
 
     Raises :class:`PeriodDetectionError` when the agent produces nothing usable.
     Returns the validated period dict:
@@ -429,6 +435,7 @@ def run_period_detection(
         raw_text, prior_values={}, cik=cik, company_name=company_name,
         company_industry=company_industry,
         document_map=document_map,
+        section_store=section_store,
     )
 
     result = run_agent_loop(
@@ -488,6 +495,7 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
         }
 
     report_call(f"  [period]  agent period detection ({ticker})")
+    section_store: dict = {}
     try:
         period = run_period_detection(
             raw_text,
@@ -498,6 +506,7 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
             fy_end_month=company.get("fiscal_year_end_month"),
             fy_end_code=company.get("fiscal_year_end_code"),
             document_map=state.get("document_map"),
+            section_store=section_store,
         )
     except PeriodDetectionError as exc:
         report_call(f"  [period]  ✗ {exc}")
@@ -522,7 +531,7 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
         "period_label": period["period_label"],
         "fiscal_year": period["fiscal_year"],
     }
-    return {
+    new_state = {
         **state,
         "cik": company["cik"],
         "company_industry": company.get("industry") or {},
@@ -530,3 +539,10 @@ def detect_period_node(state: EarningsAgentState) -> EarningsAgentState:
         "fiscal_year_end_code": company.get("fiscal_year_end_code"),
         "detected_period": detected_period,
     }
+    # The LLM-built section map rides along with the period contract when the
+    # period agent called find_sections() — the extraction pass consumes it
+    # (prebuilt_sections) so its first read_lines goes straight to the table.
+    sections = section_store.get("index")
+    if sections:
+        new_state["document_sections"] = sections
+    return new_state

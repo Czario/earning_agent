@@ -25,7 +25,7 @@ class FakePub:
     def publish(self, *args, **kwargs):
         pass
 
-    def close(self):
+    def close(self, summary=None):
         pass
 
 

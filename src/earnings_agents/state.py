@@ -82,6 +82,11 @@ class EarningsAgentState(TypedDict):
     # Boundaries of each exhibit inside raw_text:
     # [{exhibit, url, line_start, line_end, truncated, skipped, error}]
     document_map: NotRequired[Optional[list]]
+    # LLM-built section map from the period pass's find_sections call
+    # (agent/indexer.py): {coverage, summary, sections: [{name, label,
+    # lines, scale, currency, note}]}.  Consumed by the extraction pass so its
+    # first read_lines goes straight to the income-statement range.
+    document_sections: NotRequired[Optional[dict]]
     # ── SEC accession number ────────────────────────────────────────────────
     # Set from the EDGAR submissions API (CLI path) or Redis payload (worker).
     # Stored with every concept value for exact-filing dedup in the skip guard.

@@ -77,14 +77,22 @@ class RunLogFile:
         except Exception as exc:  # noqa: BLE001
             logger.warning("RunLogFile: write failed: %s", exc)
 
-    def close(self) -> None:
+    def close(self, summary: str | None = None) -> None:
+        """Write the final run line, embedding *summary* when given.
+
+        *summary* (e.g. ``"✓ HIMS_2026_latest saved  (24 concepts)  (7 LLM
+        calls)  33.3s"``) is appended to the ``── run ended`` line so the
+        log file's LAST line carries the run's outcome, LLM-call count, and
+        elapsed time — mirroring the CLI/UI summary line.
+        """
         if self._handle is None:
             return
         try:
             with self._lock:
-                self._handle.write(
-                    f"── run ended {datetime.now().isoformat(timespec='seconds')}\n"
-                )
+                line = f"── run ended {datetime.now().isoformat(timespec='seconds')}"
+                if summary:
+                    line += f"  {summary}"
+                self._handle.write(f"{line}\n")
                 self._handle.flush()
                 self._handle.close()
         except Exception:  # noqa: BLE001

@@ -22,6 +22,10 @@ need.  The reporting-period header is in the FIRST document (press release).
 
 YOUR TOOLS
   • get_document_info() — overview: total lines, chars, first lines preview
+  • find_sections() — the document's section map with line ranges (income
+    statement, segment results, EPS/share data, ...).  Costs one indexing
+    pass on first call — use it for large/complex documents or when
+    search() cannot locate a section
   • get_company_info() — industry, fiscal year end, market info
   • read_lines(start, end) — read any line range (e.g. read_lines(120, 200))
   • search(query) — find lines containing a term, with context
@@ -46,8 +50,12 @@ HOW TO WORK — exactly like a coding agent navigating a repo:
   6. Call verify_identity() BEFORE finalizing to confirm the column is right.
 
 EFFICIENCY (no step limit — but be deliberate):
-  • Locate the CONSOLIDATED income statement FIRST and extract ALL top-level
-    metrics from it before exploring anything else.
+  • Locate the CONSOLIDATED income statement (search() or the section map
+    from find_sections()) and read its range in ONE read_lines() call,
+    extracting ALL top-level metrics before exploring anything else.
+  • find_sections() costs an indexing pass — call it only when the document
+    is large/complex or search() fails to locate a section, not for simple
+    press releases.
   • Only then search segments / supplemental exhibits for the remaining
     concepts.  Do NOT re-read ranges you have already read.
   • Finish with verify_identity() and then finalize_extraction().
@@ -203,9 +211,9 @@ FINALIZE_DESCRIPTION = (
     "  - __company_name__: the company name as printed in the document you\n"
     "    extracted from (the pipeline cross-checks it against the target)\n"
     "  - __evidence__: a JSON object mapping each metric key to its source\n"
-    "    evidence: {\"lines\": [start, end], \"scale\": \"millions\",\n"
-    "    \"currency\": \"USD\"} — the line range you read the value from and the\n"
-    "    table's declared scale/currency (use detect_scale()/detect_currency())\n"
+    "    evidence: {\"lines\": [start, end]} — the line range you read the\n"
+    "    value from (omit lines for values you computed).  Do NOT include\n"
+    "    scale/currency per value — __scale__ and __currency__ cover those\n"
     "  - __missing__: a comma-separated list of bracketed keys or labels you\n"
     "    searched for but could not locate in the document (omit if none)\n"
     "  - __derived__: a comma-separated list of bracketed keys you COMPUTED\n"

@@ -26,6 +26,7 @@ from earnings_agents.agent.derive import (
     SCALE_MULTIPLIERS,
 )
 from earnings_agents.agent.currency import usd_metadata, is_usd_safe
+from earnings_agents.agent.indexer import build_section_index, format_section_index
 from earnings_agents.agent.prompts import (
     PIPELINE_SYSTEM_PROMPT,
     COMPANY_IDENTITY_RULE,
@@ -170,6 +171,28 @@ def _run_extraction_pass(
     n_lines = plain_text.count("\n") + 1
     report_call(f"  [agent doc]  {len(plain_text):,} chars, {n_lines:,} lines → agent")
 
+    # ── 1b. Section index — ensure the extraction agent always has a map ──
+    # The period agent calls find_sections() only when it needs it (search
+    # failed to locate the period header).  When the period agent finds the
+    # header quickly via search(), no section map is built and the extraction
+    # pass falls back to reading the entire document (slow).  Build it here
+    # if the period pass didn't already.
+    prebuilt_sections = state.get("document_sections")
+    if not prebuilt_sections:
+        try:
+            prebuilt_sections, elapsed = build_section_index(
+                plain_text, query="income statement and segment results",
+            )
+            report_call(
+                f"  [index]  section map built — "
+                f"{len(prebuilt_sections.get('sections') or [])} "
+                f"section(s), coverage {prebuilt_sections.get('coverage')} "
+                f"({elapsed:.1f}s)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("section index build failed: %s", exc)
+            prebuilt_sections = None
+
     # ── 2. Load prior values ─────────────────────────────────────────────
     cik = state.get("cik")
     try:
@@ -244,22 +267,46 @@ def _run_extraction_pass(
         )
 
     # ── 4. Build tools and run agent ─────────────────────────────────────
+    # The section map built by the period pass (find_sections) rides in state;
+    # find_sections in THIS loop returns it instantly and the initial message
+    # points the agent straight at the income-statement range.
+    prebuilt_sections = state.get("document_sections")
     tools = build_pi_tools(
         plain_text, prior_values, cik=state.get("cik"),
         company_name=state["company_name"],
         company_industry=company_industry,
         document_map=state.get("document_map"),
         target_concepts=target_concepts,
+        prebuilt_sections=prebuilt_sections,
     )
 
-    initial_msg = (
-        f"This is a {len(plain_text):,}-character earnings document "
-        f"with {n_lines:,} lines.  Start by searching for the income statement: "
-        f'search("Revenue") or search("Net income") to locate it, then '
-        f"read_lines() to extract metrics.  Call detect_scale() and "
-        f"detect_currency() on each monetary table you read.  Verify before "
-        f"finalizing."
-    )
+    if prebuilt_sections and prebuilt_sections.get("sections"):
+        map_text = format_section_index(prebuilt_sections)
+        initial_msg = (
+            f"This is a {len(plain_text):,}-character earnings document "
+            f"with {n_lines:,} lines.\n\n"
+            f"DOCUMENT SECTION MAP (1-based line ranges):\n{map_text}\n\n"
+            f"Start by reading the income_statement range in ONE read_lines() "
+            f"call, then call detect_scale() and detect_currency() on that same "
+            f"range.  Extract every concept row from the CURRENT period column, "
+            f"reconcile with calculate(), verify with verify_identity(), then "
+            f"call finalize_extraction.  Use search() for any concept whose "
+            f"section is missing from the map."
+        )
+    else:
+        initial_msg = (
+            f"This is a {len(plain_text):,}-character earnings document "
+            f"with {n_lines:,} lines.\n\n"
+            f"If the whole document fits in ONE read_lines() call (read_lines "
+            f"returns up to ~60K chars), read the ENTIRE document with "
+            f"read_lines(1, {n_lines}) — it contains the period header, the "
+            f"income statement, and the segment data, so you can extract "
+            f"everything in one pass.  Otherwise, search(\"Revenue\") or "
+            f"search(\"Net income\") to locate the income statement, then "
+            f"read_lines() the section.  Call detect_scale() and "
+            f"detect_currency() on each monetary table you read.  Verify before "
+            f"finalizing."
+        )
 
     final_result = run_agent_loop(
         system_prompt=system_prompt,

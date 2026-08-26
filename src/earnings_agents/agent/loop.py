@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from itertools import count
 from typing import Any, Callable
 
@@ -21,6 +22,16 @@ from earnings_agents.hooks import report_call
 from earnings_agents.llm import build_chat_llm
 
 logger = logging.getLogger(__name__)
+
+# Per-tool result caps.  The uniform 8000-char cap made read_lines return only
+# ~25 lines per call (line number + 300-char line), forcing the agent into six
+# piecemeal reads of one table — the dominant cost of the extraction loop.
+# read_lines gets a large cap so ONE call can return a whole income statement;
+# search gets a modest bump for multi-block hits.
+_TOOL_RESULT_CAPS: dict[str, int] = {
+    "read_lines": 60_000,
+    "search": 16_000,
+}
 
 
 class AgentProviderError(RuntimeError):
@@ -297,7 +308,9 @@ def run_agent_loop(
         )
 
         try:
+            _step_t0 = time.perf_counter()
             response = llm_with_tools.invoke(messages)
+            _step_elapsed = time.perf_counter() - _step_t0
         except Exception as exc:
             # Preserve the provider's exact status/body (e.g. DeepSeek 402
             # Insufficient Balance) so operators and the worker can act on the
@@ -311,6 +324,11 @@ def run_agent_loop(
             raise AgentProviderError(
                 f"LLM provider failed at extraction step {step}: {detail}"
             ) from exc
+
+        report_call(
+            f"  [timing]  llm step {step} took {_step_elapsed:.1f}s  "
+            f"({LLM_PROVIDER or 'llm'})"
+        )
 
         messages.append(response)
 
@@ -394,8 +412,11 @@ def run_agent_loop(
                 if isinstance(result, str) and result.startswith(("Tool error", "Unknown tool")):
                     report_call(f"  [tool]  ✗ {result[:120]}")
 
-                if isinstance(result, str) and len(result) > 8000:
-                    result = result[:8000] + "\n... (truncated)"
+                if isinstance(result, str) and len(result) > _TOOL_RESULT_CAPS.get(
+                    tool_name, 8000
+                ):
+                    cap = _TOOL_RESULT_CAPS.get(tool_name, 8000)
+                    result = result[:cap] + "\n... (truncated)"
                 tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
 
         messages.extend(tool_messages)

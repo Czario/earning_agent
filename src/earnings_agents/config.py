@@ -29,6 +29,14 @@ DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120"))
 
+# Indexer (find_sections) routing.  The section locator is a simple one-shot
+# call — it can run on a FAST provider (e.g. gemini-2.5-flash) even when the
+# agent loops run on a slower default provider.  Empty INDEX_LLM_PROVIDER →
+# same provider as LLM_PROVIDER.  If the provider's API key is missing the
+# indexer falls back to the default provider (never fails a run).
+INDEX_LLM_PROVIDER: str = os.getenv("INDEX_LLM_PROVIDER", "").strip().lower()
+INDEX_LLM_MODEL: str = os.getenv("INDEX_LLM_MODEL", "").strip()
+
 # Google Gemini settings (read when LLM_PROVIDER="gemini").
 # Uses the official google-genai SDK (https://ai.google.dev/gemini-api/docs/libraries).
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")

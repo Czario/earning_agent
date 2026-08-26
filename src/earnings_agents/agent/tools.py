@@ -20,9 +20,15 @@ deterministic derivation code.
 """
 from __future__ import annotations
 
+import logging
 import re
+from typing import Any, Callable
 
 from langchain_core.tools import tool as _lc_tool
+
+from earnings_agents.agent.indexer import build_section_index, format_section_index
+
+logger = logging.getLogger(__name__)
 
 
 def build_pi_tools(
@@ -33,6 +39,9 @@ def build_pi_tools(
     company_industry: dict | None = None,
     document_map: list[dict] | None = None,
     target_concepts: list[dict] | None = None,
+    prebuilt_sections: dict | None = None,
+    section_store: dict | None = None,
+    section_builder: Callable[[str], tuple[dict, float]] | None = None,
 ) -> list:
     """Build the pi-style tool set for raw document navigation.
 
@@ -50,6 +59,14 @@ def build_pi_tools(
             (``[{exhibit, url, line_start, line_end, truncated, skipped}]``).
             When provided, ``get_document_info`` lists it so the agent can
             jump straight to the exhibit holding the data it needs.
+        prebuilt_sections: An already-built section map (from the period pass)
+            — ``find_sections`` returns it instantly instead of re-indexing.
+        section_store: Mutable dict; ``find_sections`` writes the built index
+            into ``section_store["index"]`` so the graph can persist it to
+            state for the extraction pass.
+        section_builder: Callable ``(text, query=None) -> (index, elapsed)``
+            used by ``find_sections`` on a cold cache.  Defaults to the LLM
+            section locator (``agent/indexer.build_section_index``).
     """
     lines = document_text.split("\n")
     total_lines = len(lines)
@@ -110,6 +127,51 @@ def build_pi_tools(
             f"Exhibit map:\n{docs_block}\n"
             f"First lines (preview):\n{toc}"
         )
+
+    # ── 1b. Section map (LLM-backed, lazy, cached) ────────────────────
+    section_index_cache: dict[str, Any] = {}
+    _section_builder = section_builder or build_section_index
+
+    @_lc_tool
+    def find_sections(query: str | None = None) -> str:
+        """Get the document's section map with line ranges.
+
+        Returns the major sections (income statement, segment results,
+        EPS/share data, balance sheet, ...) with their 1-based line ranges.
+        Call this FIRST to locate the income statement, then read_lines() the
+        range it reports.  The map is built lazily by one indexing pass on
+        the first call and cached for the rest of the run; a pre-built map
+        (from the period pass) is returned instantly.
+
+        Args:
+            query: Optional focus hint (e.g. "where is EPS?").  The full map
+                is returned either way; on a cold cache the hint steers the
+                indexer to make sure the relevant section is included.
+        """
+        if prebuilt_sections:
+            return format_section_index(prebuilt_sections)
+        if section_index_cache:
+            return format_section_index(section_index_cache)
+        try:
+            index, elapsed = _section_builder(document_text, query=query)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "find_sections failed for %s: %s", cik or "?", exc, exc_info=True
+            )
+            return (
+                "Section indexing failed. Use search() and read_lines() to "
+                "navigate the document instead."
+            )
+        section_index_cache.update(index)
+        if section_store is not None:
+            section_store["index"] = index
+        from earnings_agents.hooks import report_call
+
+        report_call(
+            f"  [index]  section map built — {len(index.get('sections') or [])} "
+            f"section(s), coverage {index.get('coverage')} ({elapsed:.1f}s)"
+        )
+        return format_section_index(index)
 
     # ── 2. Read lines ─────────────────────────────────────────────────
     @_lc_tool
@@ -529,6 +591,7 @@ def build_pi_tools(
 
     return [
         get_document_info,
+        find_sections,
         read_lines,
         search,
         get_prior_value,
