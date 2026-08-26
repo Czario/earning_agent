@@ -75,3 +75,9 @@ LLM_CACHE_DIR: str = os.getenv("LLM_CACHE_DIR", ".llm_cache")
 # periods).  Concepts without a recent value never reach the agent, mapping,
 # derivation, or save.
 PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
+
+# Per-run log files mirroring the admin-panel event stream (Logs/<date-time>.log)
+RUN_LOGS_ENABLED: bool = os.getenv("RUN_LOGS_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+RUN_LOGS_DIR: str = os.getenv("RUN_LOGS_DIR", "Logs")

@@ -32,12 +32,24 @@ services:
       DATABASE_NAME:    normalize_data
       LLM_PROVIDER:     ${LLM_PROVIDER:-deepseek}
       PYTHONUNBUFFERED: "1"
+      # Log-file timestamps follow the machine timezone. For the Docker worker,
+      # set TZ in .env (e.g. TZ=Asia/Kolkata) to match your host clock.
+      TZ:               ${TZ:-UTC}
+      # Per-run log files (same lines the admin panel shows).  The repo root
+      # is mounted (not just ./Logs) so that if Logs/ is ever deleted, the
+      # container sees it gone and RunLogFile's mkdir re-creates it on the
+      # host automatically — a bind mount of ./Logs alone would go stale.
+      RUN_LOGS_DIR:      /project/Logs
     volumes:
       # Mount source directly so code edits are reflected without rebuilding the
       # image.  uv sync installs the project in editable mode, so Python reads
       # from this mount at runtime.  After editing, run:
       #   docker compose restart worker-8k
       - ./src:/app/src
+      # Repo root mounted rw so Logs/ lives INSIDE the mount: deleting it on
+      # the host is seen by the container, and the next run re-creates it
+      # automatically (a ./Logs-only bind mount would go stale on deletion).
+      - .:/project
       # Same host directory mounted by admin_backend. Uploaded IR PDFs are
       # read directly from this mount and never downloaded over HTTP.
       - ../admin_backend/uploads/ir-filings:/app/uploads/ir-filings

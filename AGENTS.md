@@ -189,7 +189,7 @@ StructuredTools). Tool results truncated to 8000 chars.
 
 ```
 src/earnings_agents/
-  graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py
+  graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py, filelog.py
   agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py
   integrations/ edgar.py · normalize.py · mongo.py · redis.py · http.py · html.py · playwright.py
@@ -200,6 +200,11 @@ src/earnings_agents/
   semantic-mapping pass; `build_chat_llm` → `bind_tools()` for the agent loops)
 - `hooks.py` — `with_hooks` + per-thread callbacks (`report_call` drives CLI/worker progress)
 - `progress.py` — `WorkerProgressPublisher` (Redis pub/sub `sec:worker:events`), heartbeat
+- `filelog.py` — `RunLogFile`: every admin-panel event line is ALSO appended to
+  `Logs/<TICKER>_<YYYY-MM-DD>_<HH-MM-SS>.log` (one per run, machine-local time;
+  `RUN_LOGS_ENABLED`/`RUN_LOGS_DIR` to disable/relocate; auto-`mkdir`s the dir on
+  every run; Docker mounts the repo root at `/project` with `RUN_LOGS_DIR=/project/Logs`
+  so a deleted `Logs/` is re-created automatically, `TZ` env passthrough)
 - `registry.py` — CIK/ticker lookup from `data/reference/sec_company_tickers.json` (24 h disk cache)
 - `integrations/edgar.py` — submissions API → 8-K Item 2.02 → filing index → EX-99.1 URLs;
   `get_latest_earnings_url` returns `(url, supplemental, accession, exhibits)`;
@@ -342,6 +347,8 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `STRICT_ACCURACY` | `1` | Refuse save on unresolved high-severity findings |
 | `EXTRACTION_MAX_CHARS` | `400000` | Cap on `raw_text` stored in state |
 | `PROMPT_HISTORY_PERIODS` | `3` | Window (stored periods) used as an extraction *prioritization* signal, not an eligibility filter |
+| `RUN_LOGS_ENABLED` | `1` | Write per-run admin-panel-mirror log files (`Logs/<date-time>.log`) |
+| `RUN_LOGS_DIR` | `Logs` | Directory for the per-run log files (Docker sets `/app/Logs`) |
 | `LLM_CACHE` | `0` | Dev-only LLM response disk cache |
 | `EDGAR_RATE_LIMIT` | `8` | SEC token-bucket req/s (in `edgar.py`, not config) |
 | `FETCH_EXHIBIT_MAX_CHARS` / `FETCH_TOTAL_MAX_CHARS` | 400000 / 1200000 | Per-exhibit and total text caps for multi-exhibit fetching |

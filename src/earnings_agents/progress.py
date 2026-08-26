@@ -52,7 +52,9 @@ from typing import Any, Callable
 
 from redis import Redis
 
+from earnings_agents import config
 from earnings_agents.cli.earnings import _NODE_LABELS, _format_step_line
+from earnings_agents.filelog import RunLogFile
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,12 @@ class WorkerProgressPublisher:
     ) -> None:
         self._ticker = ticker
         self._load_request_id = load_request_id
+        # Mirror every admin-panel event line into Logs/<date-time>.log.
+        self._runlog = (
+            RunLogFile(ticker, load_request_id)
+            if config.RUN_LOGS_ENABLED
+            else None
+        )
         self._client: Redis | None = None
         try:
             self._client = Redis.from_url(
@@ -99,6 +107,10 @@ class WorkerProgressPublisher:
         ``kind`` controls frontend styling:
           ``step_start`` | ``step_end`` | ``call_llm`` | ``call`` | ``summary`` | ``skip``
         """
+        # Always record to the run log file first (works even if Redis is down)
+        # so the file mirrors exactly what the admin panel displays.
+        if self._runlog is not None:
+            self._runlog.write(message, kind)
         if not self._client:
             return
         event: dict[str, Any] = {
@@ -117,6 +129,9 @@ class WorkerProgressPublisher:
             logger.warning("WorkerProgressPublisher: publish failed: %s", exc)
 
     def close(self) -> None:
+        if self._runlog is not None:
+            self._runlog.close()
+            self._runlog = None
         try:
             if self._client:
                 self._client.close()
