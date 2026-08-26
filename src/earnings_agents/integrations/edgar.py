@@ -107,6 +107,69 @@ def _edgar_get(url: str, **kwargs) -> requests.Response:
     raise requests.RequestException(f"_edgar_get exhausted retries for {url}") from last_exc
 
 
+def _parse_filing_index(
+    cik_int: str, acc: str, acc_nodash: str,
+) -> tuple[list[dict], dict | None]:
+    """Fetch a filing index and return ``(exhibits, primary_doc)``.
+
+    ``exhibits`` — ALL EX-99 exhibit documents in filing-index order, each
+    ``{exhibit: "EX-99.1", description: "The Press Release", url}`` (the
+    Description column lets downstream agents know WHAT each exhibit is).
+
+    ``primary_doc`` — the filing's primary document row (Type ``8-K``) as a
+    single ``{exhibit: "8-K", description, url}`` dict, or ``None`` when
+    absent.  Inline-XBRL viewer links (``/ix?doc=...``) are unwrapped to the
+    real document path.
+
+    Returns ``([], None)`` when the index cannot be fetched/parsed.
+    """
+    index_url = _EDGAR_INDEX_HTML.format(cik_int=cik_int, acc_nodash=acc_nodash, acc=acc)
+    try:
+        resp = _edgar_get(index_url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("EDGAR HTML index fetch failed for %s: %s", index_url, exc)
+        return [], None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    exhibits: list[dict] = []
+    primary_doc: dict | None = None
+
+    # Filing index table: columns are Seq | Description | Document | Type | Size
+    for row in soup.select("table.tableFile tr, table tr"):
+        cells = row.find_all("td")
+        if len(cells) < 4:
+            continue
+        # Type is in the 4th column (index 3); link is in the 3rd column (index 2)
+        doc_type = cells[3].get_text(strip=True).upper()
+        link_tag = cells[2].find("a", href=True)
+        if not link_tag:
+            continue
+        href: str = link_tag["href"]
+        if href.startswith("/ix?doc="):
+            # Inline-XBRL viewer link — unwrap to the real document path.
+            href = href.split("doc=", 1)[1]
+        if href.startswith("/"):
+            href = f"https://www.sec.gov{href}"
+        description = cells[1].get_text(" ", strip=True) if len(cells) > 1 else ""
+        if doc_type in _EX99_TYPES:
+            exhibits.append(
+                {"exhibit": doc_type, "description": description, "url": href}
+            )
+            logger.info(
+                "Found exhibit %s (%s) for %s/%s: %s",
+                doc_type, description[:60], cik_int, acc, href,
+            )
+        elif doc_type == "8-K" and primary_doc is None:
+            primary_doc = {"exhibit": "8-K", "description": description, "url": href}
+
+    logger.info(
+        "Found %d EX-99 exhibit(s) in index for %s/%s",
+        len(exhibits), cik_int, acc,
+    )
+    return exhibits, primary_doc
+
+
 def _find_all_ex_99_exhibits(
     cik_int: str, acc: str, acc_nodash: str,
 ) -> list[dict]:
@@ -119,43 +182,7 @@ def _find_all_ex_99_exhibits(
 
     Returns an empty list when no exhibits are found.
     """
-    index_url = _EDGAR_INDEX_HTML.format(cik_int=cik_int, acc_nodash=acc_nodash, acc=acc)
-    try:
-        resp = _edgar_get(index_url, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("EDGAR HTML index fetch failed for %s: %s", index_url, exc)
-        return []
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    exhibits: list[dict] = []
-
-    # Filing index table: columns are Seq | Description | Document | Type | Size
-    for row in soup.select("table.tableFile tr, table tr"):
-        cells = row.find_all("td")
-        if len(cells) < 4:
-            continue
-        # Type is in the 4th column (index 3); link is in the 3rd column (index 2)
-        doc_type = cells[3].get_text(strip=True).upper()
-        if doc_type in _EX99_TYPES:
-            link_tag = cells[2].find("a", href=True)
-            if link_tag:
-                href: str = link_tag["href"]
-                if href.startswith("/"):
-                    href = f"https://www.sec.gov{href}"
-                description = cells[1].get_text(" ", strip=True) if len(cells) > 1 else ""
-                exhibits.append(
-                    {"exhibit": doc_type, "description": description, "url": href}
-                )
-                logger.info(
-                    "Found exhibit %s (%s) for %s/%s: %s",
-                    doc_type, description[:60], cik_int, acc, href,
-                )
-
-    logger.info(
-        "Found %d EX-99 exhibit(s) in index for %s/%s",
-        len(exhibits), cik_int, acc,
-    )
+    exhibits, _ = _parse_filing_index(cik_int, acc, acc_nodash)
     return exhibits
 
 
@@ -167,6 +194,38 @@ def _find_all_ex_99_urls(cik_int: str, acc: str, acc_nodash: str) -> list[str]:
 def normalize_cik(cik: str) -> str:
     """Return a zero-padded 10-digit CIK string."""
     return str(int(cik)).zfill(10)
+
+
+def get_exhibits_for_accession(cik: str, acc: str) -> list[dict]:
+    """Resolve the exhibit documents for ONE specific filing accession.
+
+    Unlike :func:`get_latest_earnings_url` — which scans the EDGAR submissions
+    API for "the most recent Item 2.02 8-K" (subject to submissions-API lag and
+    empty ``items`` metadata on brand-new filings) — this resolves the exhibits
+    from the filing index of the exact accession the caller already knows about
+    (e.g. the RSS-feed entry the poller queued).  Deterministic, no
+    submissions-API race: the reporting period is then decided by the period
+    agent after the pinned documents are fetched.
+
+    Returns EX-99 exhibits in filing-index order
+    ``[{exhibit, description, url}]``; falls back to the filing's primary
+    document when the filing has no EX-99 exhibit.  Returns ``[]`` when the
+    index cannot be fetched or neither an EX-99 nor a primary document is
+    found (callers may fall back to the latest-filing scan).
+    """
+    cik_padded = normalize_cik(cik)
+    cik_int = str(int(cik_padded))
+    acc_nodash = acc.replace("-", "")
+    exhibits, primary_doc = _parse_filing_index(cik_int, acc, acc_nodash)
+    if exhibits:
+        return exhibits
+    if primary_doc:
+        logger.info(
+            "No EX-99 exhibits for %s/%s — using primary document %s",
+            cik_int, acc, primary_doc["url"],
+        )
+        return [primary_doc]
+    return []
 
 
 def get_latest_earnings_url(

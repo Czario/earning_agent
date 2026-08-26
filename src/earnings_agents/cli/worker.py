@@ -169,6 +169,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         },
         filing_url=payload.get("filing_url") if not temporary_filing_id else None,
         local_filing_path=local_filing_path,
+        accession=payload.get("accession_number") or None,
     )
 
     # The reporting period is decided by the period agent INSIDE the graph —

@@ -46,7 +46,10 @@ from earnings_agents.config import (  # noqa: E402
 from earnings_agents.nodes.detect import detect_document_type_node  # noqa: E402
 from earnings_agents.graph import build_graph  # noqa: E402
 from earnings_agents.registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
-from earnings_agents.integrations.edgar import get_latest_earnings_url  # noqa: E402
+from earnings_agents.integrations.edgar import (  # noqa: E402
+    get_exhibits_for_accession,
+    get_latest_earnings_url,
+)
 from earnings_agents.hooks import set_detail_callback, set_node_callback  # noqa: E402
 
 SEP = "=" * 64
@@ -316,11 +319,15 @@ def _build_8k_state(
     already stored and schedules a deferred replace.
 
     When *filing_url* is not provided, the function fetches the latest 8-K
-    from SEC EDGAR (CLI path).  When it IS provided (worker path — manual
-    trigger with a press-release HTML or shareholder-letter PDF URL), the
-    function skips the EDGAR lookup and uses the pre-resolved URL directly.
-    Reporting-period identity is determined only by the period agent after the
-    filing is fetched.
+    from SEC EDGAR (CLI path).  When *accession* IS provided (worker path —
+    RSS-polled filing), the function resolves the exhibit documents of that
+    EXACT accession from its filing index and does NOT scan the submissions
+    API for "the latest 8-K" (no lag/empty-items race on fresh filings).
+    When *filing_url* IS provided (worker path — manual trigger with a
+    press-release HTML or shareholder-letter PDF URL), the function skips the
+    EDGAR lookup and uses the pre-resolved URL directly.  Reporting-period
+    identity is determined only by the period agent after the filing is
+    fetched.
     """
     _base = {
         "ticker": ticker or cik,
@@ -336,13 +343,38 @@ def _build_8k_state(
     # ── Resolve filing URL, accession, and exhibit list ───────────────────
     exhibits: list[dict] = []
     if not filing_url and not local_filing_path:
-        printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
-        (
-            filing_url,
-            supplemental_urls,
-            accession,
-            exhibits,
-        ) = get_latest_earnings_url(cik)
+        if accession:
+            # RSS-polled filing: the accession identifies the EXACT filing the
+            # poller saw.  Resolve its exhibits directly from the filing index
+            # — NO submissions-API "latest 8-K" scan, so there is no race with
+            # submissions-API lag / empty items on a brand-new filing.
+            printer(
+                f"  [EDGAR]  {company_name} ({ticker or cik}) resolving pinned "
+                f"accession {accession}..."
+            )
+            exhibits = get_exhibits_for_accession(cik, accession)
+            if exhibits:
+                filing_url = exhibits[0]["url"]
+                supplemental_urls = [e["url"] for e in exhibits[1:]]
+            else:
+                printer(
+                    f"  [EDGAR]  pinned accession {accession} has no documents "
+                    f"— falling back to latest 8-K"
+                )
+                (
+                    filing_url,
+                    supplemental_urls,
+                    accession,
+                    exhibits,
+                ) = get_latest_earnings_url(cik)
+        else:
+            printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
+            (
+                filing_url,
+                supplemental_urls,
+                accession,
+                exhibits,
+            ) = get_latest_earnings_url(cik)
     elif filing_url:
         printer(
             f"  [URL]    {company_name} ({ticker or cik}) using provided filing URL "
