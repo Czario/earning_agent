@@ -48,7 +48,7 @@ class EarningsAgentState(TypedDict):
     # {period_type, period_end, quarter, period_label, fiscal_year}
     detected_period: NotRequired[Optional[dict]]
     # Keys in metrics{} that were successfully matched to a concept_id during
-    # extraction (Tier 0/1). Populated by agent pipeline.
+    # extraction (Tier 0/1 + semantic). Populated by agent pipeline.
     mapped_metric_keys: NotRequired[Optional[list[str]]]
     # Labels of target_concepts that had no value mapped after all tiers.
     # Stored by agent pipeline; consumed by the save/completeness gate.
@@ -82,6 +82,9 @@ class EarningsAgentState(TypedDict):
     # Boundaries of each exhibit inside raw_text:
     # [{exhibit, url, line_start, line_end, truncated, skipped, error}]
     document_map: NotRequired[Optional[list]]
+    # ── Agentic long-term memory ────────────────────────────────────────────
+    # Advisory memory text injected into the extraction prompt (informational).
+    memory_block: NotRequired[Optional[str]]
     # LLM-built section map from the period pass's find_sections call
     # (agent/indexer.py): {coverage, summary, sections: [{name, label,
     # lines, scale, currency, note}]}.  Consumed by the extraction pass so its

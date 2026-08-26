@@ -104,10 +104,43 @@ _PRESCAN_SHARES_IN_THOUSANDS_RX = re.compile(
     re.I,
 )
 
-def prescan_document(raw_text: str) -> tuple[str | None, str | None]:
-    """Scan the full document once for scale (thousands/millions/billions).
+# Income-statement keyword sets used for per-exhibit routing hints.
+# A range that hits both a primary and a secondary keyword likely contains
+# the income statement.
+_IS_PRIMARY_KW = re.compile(
+    r"\b(?:revenue|total\s+revenue|net\s+revenue|operating\s+revenue"
+    r"|net\s+income|net\s+earnings|net\s+loss|operating\s+income"
+    r"|operating\s+loss|income\s+before\s+tax|income\s+from\s+operations"
+    r"|gross\s+profit|gross\s+margin|cost\s+of\s+revenue|cost\s+of\s+sales"
+    r"|cost\s+of\s+goods\s+sold|interest\s+income|interest\s+expense"
+    r"|provision\s+for\s+credit\s+losses|loan\s+loss\s+provision"
+    r"|noninterest\s+income|noninterest\s+expense)",
+    re.I,
+)
+_IS_SECONDARY_KW = re.compile(
+    r"\b(?:income\s+tax|income\s+taxes|provision\s+for\s+taxes"
+    r"|effective\s+tax\s+rate|diluted\s+eps|basic\s+eps"
+    r"|earnings\s+per\s+share|weighted.average\s+shares"
+    r"|selling.?general|sg%?a|r%?d|research\s+and\s+development"
+    r"|depreciation|amortization|stock.based\s+compensation"
+    r"|non.operating|other\s+income|other\s+expense"
+    r"|consolidated\s+statement|results\s+of\s+operations)",
+    re.I,
+)
 
-    Returns ``(scale, shares_scale)`` — either may be None if not detected.
+def prescan_document(
+    raw_text: str,
+    document_map: list[dict] | None = None,
+) -> tuple[str | None, str | None, dict | None]:
+    """Scan the full document once for scale and (optionally) exhibit-level
+    income-statement routing hints.
+
+    Returns ``(scale, shares_scale, is_hints)`` where *is_hints* is
+    ``{"exhibit": str, "lines": [start, end], "primary_count": int,
+    "secondary_count": int}`` for each exhibit range that appears to contain
+    income-statement content.  ``None`` when no document_map is provided
+    (backward-compatible with callers that only want scale).
+
     Period detection is NOT done here — the period agent reads the document
     header itself.
     """
@@ -135,7 +168,137 @@ def prescan_document(raw_text: str) -> tuple[str | None, str | None]:
     if _PRESCAN_SHARES_IN_THOUSANDS_RX.search(text):
         shares_scale = "thousands"
 
-    return scale, shares_scale
+    # ── Per-exhibit income-statement routing hints ──────────────────────
+    is_hints: list[dict] | None = None
+    if document_map:
+        lines = raw_text.split("\n")
+        for doc in document_map:
+            ls = doc.get("line_start")
+            le = doc.get("line_end")
+            if ls is None or le is None:
+                continue
+            exhibit_text = "\n".join(lines[ls - 1 : le])
+            primary_count = len(_IS_PRIMARY_KW.findall(exhibit_text))
+            secondary_count = len(_IS_SECONDARY_KW.findall(exhibit_text))
+            if primary_count >= 3 and secondary_count >= 2:
+                if is_hints is None:
+                    is_hints = []
+                is_hints.append({
+                    "exhibit": doc.get("exhibit", "unknown"),
+                    "lines": [ls, le],
+                    "primary_count": primary_count,
+                    "secondary_count": secondary_count,
+                })
+        # Sort by primary keyword density so the best exhibit is first.
+        if is_hints:
+            is_hints.sort(key=lambda h: h["primary_count"], reverse=True)
+
+    return scale, shares_scale, is_hints
+
+
+# ── Income-statement section extractor ───────────────────────────────────────
+
+_IS_START_PATTERNS = [
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+operations", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statement\s+of\s+operations", re.I),
+    re.compile(r"statements?\s+of\s+operations\s+and\s+comprehensive", re.I),
+    re.compile(r"(?:condensed\s+)?(?:consolidated\s+)?income\s+statement", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+earnings", re.I),
+    re.compile(r"statements?\s+of\s+income", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+comprehensive", re.I),
+]
+
+_IS_STOP_PATTERNS = [
+    re.compile(r"(?:condensed\s+)?consolidated\s+(?:balance\s+sheets?|statements?\s+of\s+financial\s+position)", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+cash\s+flows", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+changes\s+in\s+(?:\w+\s+)*equity", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+stockholders", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+shareholders", re.I),
+    re.compile(r"notes\s+to\s+(?:the\s+)?(?:condensed\s+)?(?:consolidated\s+)?financial\s+statements", re.I),
+    re.compile(r"(?:unaudited\s+)?notes\s+to\s+financial\s+statements", re.I),
+    re.compile(r"independent\s+auditors?['']?\s+report", re.I),
+]
+
+
+def extract_is_section(exhibit_text: str, max_chars: int = 15_000) -> str | None:
+    """Extract just the income-statement section from exhibit text.
+
+    Scans for IS header patterns (Statements of Operations, Income
+    Statement, etc.) and returns the text from that header to the next
+    major section (Balance Sheet, Cash Flow, Notes).  Capped at *max_chars*
+    to keep context small for the LLM.
+
+    Returns None if no IS section is found (caller should fall back to
+    the full exhibit text).
+    """
+    lines = exhibit_text.split("\n")
+    is_start: int | None = None
+    is_stop: int | None = None
+
+    # Find the IS header
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for pattern in _IS_START_PATTERNS:
+            if pattern.search(stripped):
+                is_start = i
+                break
+        if is_start is not None:
+            break
+
+    if is_start is None:
+        return None  # no IS header found — caller falls back to full text
+
+    # Find the next major section after the IS header
+    for i in range(is_start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        for pattern in _IS_STOP_PATTERNS:
+            if pattern.search(stripped):
+                is_stop = i
+                break
+        if is_stop is not None:
+            break
+
+    # If no stop pattern found, go 300 lines past the IS start (heuristic)
+    if is_stop is None:
+        is_stop = min(is_start + 300, len(lines))
+
+    section = "\n".join(lines[is_start:is_stop])
+    if len(section) > max_chars:
+        section = section[:max_chars] + "\n... (section continues)"
+    return section
+
+
+def build_extraction_summary(
+    concept_metrics: dict | None,
+    currency: str | None,
+    scale: str | None,
+    company_name: str,
+    period_label: str,
+) -> str:
+    """Build a compact extraction summary for memory calls.
+
+    Instead of re-processing the full 38K exhibit text when calling
+    remember_* tools, the agent gets this small summary (~500 chars)
+    with just the key findings.  Drastically reduces context for memory
+    LLM steps (30s → ~2s).
+    """
+    parts = [f"Extraction summary for {company_name} ({period_label}):"]
+    if scale:
+        parts.append(f"  Scale: {scale}")
+    if currency:
+        parts.append(f"  Currency: {currency}")
+    if concept_metrics:
+        sorted_items = sorted(concept_metrics.items(), key=lambda x: str(x[0]))
+        parts.append(f"  Extracted {len(sorted_items)} metrics:")
+        for cid, val in sorted_items[:15]:
+            parts.append(f"    {cid}: {val:,.0f}" if isinstance(val, (int, float)) else f"    {cid}: {val}")
+        if len(sorted_items) > 15:
+            parts.append(f"    ... and {len(sorted_items) - 15} more")
+    return "\n".join(parts)
 
 
 # ── Scale multipliers ────────────────────────────────────────────────────────
@@ -206,7 +369,7 @@ def semantically_map_unmapped_metrics(
     metrics: dict[str, Any],
     target_concepts: list[dict],
     concept_metrics: dict[str, float],
-) -> tuple[dict[str, float], set[str]]:
+) -> tuple[dict[str, float], set[str], dict[str, str]]:
     """Resolve numeric extraction keys that did not map exactly.
 
     Press releases frequently use a business label that is semantically the
@@ -221,6 +384,10 @@ def semantically_map_unmapped_metrics(
     high-confidence mappings returned by the resolver are accepted.  If the
     resolver is unavailable or uncertain, the metric remains observable in the
     existing missing-concept fields rather than being guessed.
+
+    Returns ``(concept_metrics, resolved_keys, semantic_reverse)`` where
+    ``semantic_reverse`` maps concept_id → the filing metric key it was
+    resolved from (used to learn filing-label aliases locally).
     """
     mapped_ids = set(concept_metrics)
     unmapped: dict[str, float] = {
@@ -249,7 +416,7 @@ def semantically_map_unmapped_metrics(
                 break
     unresolved = {key: value for key, value in unmapped.items() if key not in direct_keys}
     if not unresolved:
-        return concept_metrics, set()
+        return concept_metrics, set(), {}
 
     candidates = [
         {
@@ -264,7 +431,7 @@ def semantically_map_unmapped_metrics(
         and c.get("_id")
     ]
     if not candidates:
-        return concept_metrics, set()
+        return concept_metrics, set(), {}
 
     prompt = """\
 You are a conservative accounting concept mapper. Map extracted filing
@@ -312,13 +479,14 @@ Return strict JSON only:
         mappings = parsed.get("mappings", []) if isinstance(parsed, dict) else []
     except Exception as exc:  # noqa: BLE001 — semantic repair is best effort
         logger.warning("semantic concept mapping unavailable: %s", exc)
-        return concept_metrics, set()
+        return concept_metrics, set(), {}
 
     if not isinstance(mappings, list):
-        return concept_metrics, set()
+        return concept_metrics, set(), {}
     candidate_ids = {c["concept_id"] for c in candidates}
     used_ids = set(mapped_ids)
     resolved: set[str] = set()
+    semantic_reverse: dict[str, str] = {}
     updated = dict(concept_metrics)
     for item in mappings:
         if not isinstance(item, dict):
@@ -336,10 +504,11 @@ Return strict JSON only:
         updated[cid] = unresolved[key]
         used_ids.add(cid)
         resolved.add(key)
+        semantic_reverse[cid] = key
         logger.info(
             "semantic concept mapping: %r → %s (high confidence)", key, cid
         )
-    return updated, resolved
+    return updated, resolved, semantic_reverse
 
 
 

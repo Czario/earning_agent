@@ -18,8 +18,9 @@ from earnings_agents.agent.industry import (
 )
 from earnings_agents.agent.derive import (
     build_calc_derivation_block,
+    build_extraction_summary,
     build_no_scale_keys,
-    load_prior_values,
+    extract_is_section,
     map_concepts,
     semantically_map_unmapped_metrics,
     prescan_document,
@@ -167,18 +168,31 @@ def _run_extraction_pass(
     # ── 1. Document pre-scan (scale only) — deterministic mechanical step ──
     # Currency is NOT decided here: the tool-calling agent inspects each
     # table/section with detect_currency() and reports __currency__ itself.
-    doc_scale, _ = prescan_document(plain_text)
+    doc_scale, _, is_hints = prescan_document(
+        plain_text, document_map=state.get("document_map"),
+    )
     n_lines = plain_text.count("\n") + 1
     report_call(f"  [agent doc]  {len(plain_text):,} chars, {n_lines:,} lines → agent")
+    if is_hints:
+        for h in is_hints:
+            report_call(
+                f"  [prescan]  income-statement likely in {h['exhibit']} "
+                f"(lines {h['lines'][0]}-{h['lines'][1]}, "
+                f"{h['primary_count']} IS + {h['secondary_count']} context hits)"
+            )
 
-    # ── 1b. Section index — ensure the extraction agent always has a map ──
-    # The period agent calls find_sections() only when it needs it (search
-    # failed to locate the period header).  When the period agent finds the
-    # header quickly via search(), no section map is built and the extraction
-    # pass falls back to reading the entire document (slow).  Build it here
-    # if the period pass didn't already.
-    prebuilt_sections = state.get("document_sections")
-    if not prebuilt_sections:
+    # ── 1b. Section index — build only when prescan hints are insufficient ──
+    # When the prescan identified the income-statement exhibit with strong
+    # keyword signals (≥3 primary + ≥2 secondary), skip the expensive LLM
+    # indexer (60K chars → ~90s) and let the agent navigate via the exhibit
+    # routing hint instead.  Only build the index when we lack good hints
+    # or the period agent already built one.
+    if is_hints and is_hints[0]["primary_count"] >= 3:
+        report_call(
+            f"  [prescan]  strong income-statement signal — "
+            f"skipping LLM indexer (agent routed to {is_hints[0]['exhibit']})"
+        )
+    elif not prebuilt_sections:
         try:
             prebuilt_sections, elapsed = build_section_index(
                 plain_text, query="income statement and segment results",
@@ -193,7 +207,7 @@ def _run_extraction_pass(
             logger.warning("section index build failed: %s", exc)
             prebuilt_sections = None
 
-    # ── 2. Load prior values ─────────────────────────────────────────────
+    # ── 2. Extract the best exhibit text for pre-injection ─────────────
     cik = state.get("cik")
     try:
         period = require_detected_period(state)
@@ -203,9 +217,42 @@ def _run_extraction_pass(
             "status": "failed",
             "error": f"Agent pipeline: invalid period-agent result for {ticker}: {exc}",
         }
-    prior_values = load_prior_values(target_concepts, cik, period)
 
     dollar_multiplier = SCALE_MULTIPLIERS.get(doc_scale, 1) if doc_scale else 1
+
+    # Pre-read the income-statement exhibit so the agent gets the full table
+    # upfront — eliminates 5+ read_lines navigation calls.
+    is_exhibit_text: str | None = None
+    is_exhibit_label: str = ""
+    if is_hints:
+        best = is_hints[0]
+        doc_map = state.get("document_map") or []
+        lines = plain_text.split("\n")
+        for doc in doc_map:
+            exhibit = doc.get("exhibit") or ""
+            if exhibit == best["exhibit"]:
+                ls = doc.get("line_start")
+                le = doc.get("line_end")
+                if ls and le:
+                    exhibit_full = "\n".join(lines[ls - 1 : le])
+                    # Extract just the IS section (~10-15K chars) to keep
+                    # LLM context small.  Fall back to full exhibit if the
+                    # IS section can't be isolated.
+                    is_section = extract_is_section(exhibit_full)
+                    if is_section:
+                        is_exhibit_text = is_section
+                        report_call(
+                            f"  [prescan]  IS section extracted — {len(is_section):,} chars "
+                            f"(from {len(exhibit_full):,} exhibit)"
+                        )
+                    else:
+                        is_exhibit_text = exhibit_full
+                        report_call(
+                            f"  [prescan]  IS section not found — using full exhibit "
+                            f"({len(exhibit_full):,} chars)"
+                        )
+                    is_exhibit_label = exhibit
+                    break
 
     # ── 3. Build prompt ──────────────────────────────────────────────────
     concept_list_str = build_concept_list(
@@ -244,6 +291,36 @@ def _run_extraction_pass(
             f"({industry_profile['sic_description'][:60]})"
         )
 
+    # ── Long-term memory — advisory hints + write tools ───────────────
+    # GOAL: make future extraction FASTER and MORE ACCURATE.  The agent reads
+    # stored hints (label aliases + layout) and records new ones via the
+    # remember_alias / remember_layout tools.
+    memory_block = ""
+    memory_tools: list = []
+    if cik:
+        try:
+            from earnings_agents.config import MEMORY_ENABLED
+            if MEMORY_ENABLED:
+                from earnings_agents.agent.memory import (
+                    build_remember_alias_tool,
+                    build_remember_currency_tool,
+                    build_remember_layout_tool,
+                    recall_memory,
+                )
+                # Extraction cares about aliases (mapping), layout (navigation)
+                # and currency (trust USD without re-verifying).
+                mem = recall_memory(cik, types={"label_alias", "layout", "currency"})
+                memory_block = mem["local_block"]
+                if memory_block:
+                    report_call(f"  [memory]  advisory hints injected for {ticker}")
+                memory_tools = [
+                    build_remember_alias_tool(cik),
+                    build_remember_layout_tool(cik),
+                    build_remember_currency_tool(cik),
+                ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("memory setup failed for %s: %s", ticker, exc)
+
     system_prompt = (
         PIPELINE_SYSTEM_PROMPT.format(concept_list=concept_list_str)
         + f"\n\nCOMPANY: {state['company_name']} ({ticker})\n\n"
@@ -253,8 +330,52 @@ def _run_extraction_pass(
         + "\n\n"
         + industry_context
     )
+    if memory_block:
+        system_prompt += f"\n\n{memory_block}"
     if hints_block:
         system_prompt += f"\n\n{hints_block}"
+    if is_exhibit_text:
+        # IS exhibit already in context — suppress navigation instructions
+        # that would cause the agent to search for data it already has.
+        pass
+    else:
+        system_prompt += (
+            "\n\nMULTI-DOCUMENT FILINGS — the bundle may contain several exhibits "
+            "(press release, presentation, supplemental).  Navigate SMARTLY, never "
+            "linearly:\n"
+            "  • get_document_info() FIRST — it lists each exhibit with its "
+            "opening lines; identify the press release vs presentation vs "
+            "supplemental without reading them.\n"
+            "  • search() is GLOBAL across ALL documents — use it to jump straight "
+            "to matches; each result shows which exhibit it is in.\n"
+            "  • The income statement is usually in the press release or a "
+            "supplemental exhibit, not a slide deck.  When several documents "
+            "match, prefer the FULLEST statement (most line items).\n"
+            "  • Verify the statement has the row chain (Revenue → Cost of revenue "
+            "→ Gross profit → Operating income → Net income) before extracting."
+        )
+    if memory_tools:
+        system_prompt += (
+            "\n\nMEMORY GOAL — make future extraction FASTER and MORE "
+            "ACCURATE.\n"
+            "  • When map_concept() (or your reading) shows a filing label "
+            "maps to a known concept whose name differs, call "
+            "remember_alias(filing_label=..., canonical=...) — the tool "
+            "rejects identical labels and member/segment metadata.\n"
+            "  • Record stable NAVIGATIONAL layout facts via "
+            "remember_layout(note=...) — which exhibit/section the income "
+            "statement lives in (e.g. 'second half of the release', "
+            "'Exhibit 99.2 supplemental').  NEVER include per-filing line "
+            "numbers — they change every filing.\n"
+            "  • NEVER record absences, dimension members/segments (handled "
+            "by taxonomy keys), or filing-content descriptions (e.g. how "
+            "revenue is disaggregated) that a future run re-reads anyway.\n"
+            "  • After detect_currency() confirms the document currency, call "
+            "remember_currency(currency='USD', other_codes=...) — pass any "
+            "OTHER currencies the filing contains (from the 'Codes "
+            "detected:' list) so future runs expect them and still extract "
+            "USD."
+        )
     if calc_block:
         system_prompt += (
             "\n\nCOMPUTE-ONLY CONCEPTS — these are NOT printed in the filing, "
@@ -272,15 +393,53 @@ def _run_extraction_pass(
     # points the agent straight at the income-statement range.
     prebuilt_sections = state.get("document_sections")
     tools = build_pi_tools(
-        plain_text, prior_values, cik=state.get("cik"),
+        plain_text, cik=state.get("cik"),
         company_name=state["company_name"],
         company_industry=company_industry,
         document_map=state.get("document_map"),
         target_concepts=target_concepts,
         prebuilt_sections=prebuilt_sections,
+        prescan_is_hints=is_hints,
     )
+    for t in memory_tools:
+        tools.append(t)
 
-    if prebuilt_sections and prebuilt_sections.get("sections"):
+    if is_exhibit_text:
+        # Pre-injected income statement exhibit — agent extracts directly
+        # instead of navigating with read_lines.
+        is_section_size = len(is_exhibit_text)
+        is_full_exhibit = is_section_size > 20_000
+        is_line_start = is_hints[0]["lines"][0] if is_hints else 1
+        is_line_end = is_hints[0]["lines"][1] if is_hints else n_lines
+        initial_msg = (
+            f"This is a {len(plain_text):,}-character earnings document "
+            f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
+            f"COMPANY: {state['company_name']} ({ticker})\n\n"
+            f"INCOME STATEMENT ({is_exhibit_label}) — LINES {is_line_start}-{is_line_end}:\n"
+            f"The income statement text is provided below ({is_section_size:,} chars).\n\n"
+            f"--- BEGIN {is_exhibit_label} ---\n"
+            f"{is_exhibit_text}\n"
+            f"--- END {is_exhibit_label} ---\n\n"
+            f"TWO-PHASE EXTRACTION:\n\n"
+            f"PHASE 1 — Extract from the text above (NO search/read_lines needed):\n"
+            f"  1. Call detect_scale() and detect_currency() on lines "
+            f"{is_line_start}-{is_line_end} to confirm units.\n"
+            f"  2. Extract ALL income-statement concepts (Revenue, Operating Income, "
+            f"Net Income, EPS, etc.) directly from the text above.\n"
+            f"  3. Reconcile with calculate(), verify with verify_identity().\n\n"
+            f"PHASE 2 — Search for dimensional/segment data NOT in the text above:\n"
+            f"  4. After extracting all IS concepts, use search() to find segment "
+            f"breakdowns, geographic revenue, product-line data, or other "
+            f"dimensional concepts that may be in OTHER exhibits or sections.\n"
+            f"  5. Extract any additional dimensional concepts you find.\n\n"
+            f"  6. Call finalize_extraction().\n\n"
+            f"DO NOT call get_document_info() or get_company_info() — you already "
+            f"have the document structure and company name above.\n\n"
+            f"MEMORY: When calling remember_* tools, base your notes on the "
+            f"values and labels you already extracted — do NOT re-read or "
+            f"re-search the exhibit text."
+        )
+    elif prebuilt_sections and prebuilt_sections.get("sections"):
         map_text = format_section_index(prebuilt_sections)
         initial_msg = (
             f"This is a {len(plain_text):,}-character earnings document "
@@ -292,6 +451,26 @@ def _run_extraction_pass(
             f"reconcile with calculate(), verify with verify_identity(), then "
             f"call finalize_extraction.  Use search() for any concept whose "
             f"section is missing from the map."
+        )
+    elif is_hints:
+        best = is_hints[0]
+        map_text = (
+            f"EXHIBIT ROUTING HINT (from prescan — the income statement is "
+            f"likely in {best['exhibit']}, lines {best['lines'][0]}-{best['lines'][1]}\n"
+            f"with {best['primary_count']} income-statement keywords and "
+            f"{best['secondary_count']} context keywords)."
+        )
+        initial_msg = (
+            f"This is a {len(plain_text):,}-character earnings document "
+            f"with {n_lines:,} lines.\n\n"
+            f"{map_text}\n\n"
+            f"Start by calling read_lines({best['lines'][0]}, {best['lines'][1]}) "
+            f"to read the full income-statement exhibit in ONE call, then call "
+            f"detect_scale() and detect_currency() on that same range.  Extract "
+            f"every concept row from the CURRENT period column, reconcile with "
+            f"calculate(), verify with verify_identity(), then call "
+            f"finalize_extraction.  If other exhibits contain additional segment "
+            f"data, use search() to locate it."
         )
     else:
         initial_msg = (
@@ -418,10 +597,11 @@ def _run_extraction_pass(
     # Exact taxonomy/label mapping is preferred.  Resolve only leftover
     # numeric keys semantically (without changing their values) so filing
     # wording such as "Revenue" vs "Total revenue" does not silently vanish.
-    concept_metrics, semantic_mapped_keys = semantically_map_unmapped_metrics(
+    concept_metrics, semantic_mapped_keys, semantic_reverse = semantically_map_unmapped_metrics(
         metrics, target_concepts, concept_metrics,
     )
     mapped_keys.update(semantic_mapped_keys)
+    _reverse_map.update(semantic_reverse)
 
     # ── Derived (computed) concepts ────────────────────────────────────
     # CALC (system:/calculated) concepts are never verbatim in the filing, so
@@ -550,6 +730,7 @@ def _run_extraction_pass(
         "missing_concept_labels": missing_labels,
         "missing_toplevel_labels": missing_toplevel,
         "missing_segment_labels": missing_segments,
+        "memory_block": memory_block,
         "currency_metadata": currency_meta,
         "value_metadata_by_id": value_metadata_by_id,
         "ambiguous_paths": sorted(ambiguous_paths),

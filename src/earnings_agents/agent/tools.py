@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 def build_pi_tools(
     document_text: str,
-    prior_values: dict[str, float],
     cik: str | None = None,
     company_name: str = "",
     company_industry: dict | None = None,
@@ -42,13 +41,13 @@ def build_pi_tools(
     prebuilt_sections: dict | None = None,
     section_store: dict | None = None,
     section_builder: Callable[[str], tuple[dict, float]] | None = None,
+    prescan_is_hints: list[dict] | None = None,
 ) -> list:
     """Build the pi-style tool set for raw document navigation.
 
     Args:
         document_text: Full plain-text of the filing (possibly a concatenated
             multi-exhibit bundle).
-        prior_values: Prior-period values for sanity checking.
         cik: Company CIK for company info lookup.
         company_name: Company name for display.
         company_industry: Cached ``{sic_code, sic_description}`` profile from
@@ -67,6 +66,10 @@ def build_pi_tools(
         section_builder: Callable ``(text, query=None) -> (index, elapsed)``
             used by ``find_sections`` on a cold cache.  Defaults to the LLM
             section locator (``agent/indexer.build_section_index``).
+        prescan_is_hints: Prescan-detected income-statement exhibit hints
+            (``[{exhibit, lines, primary_count, secondary_count}]``).  When
+            present, ``find_sections`` returns an instant routing hint instead
+            of calling the expensive LLM indexer.
     """
     lines = document_text.split("\n")
     total_lines = len(lines)
@@ -78,6 +81,17 @@ def build_pi_tools(
     for i, line in enumerate(lines):
         for word in re.findall(r"[a-zA-Z]{4,}", line.lower()):
             _line_index.setdefault(word, []).append(i)
+
+    def _exhibit_for_line(ln: int) -> str:
+        """Which exhibit does a line belong to (empty when single-document)."""
+        if not document_map:
+            return ""
+        for d in document_map:
+            ls = d.get("line_start")
+            le = d.get("line_end")
+            if ls and le and ls <= ln <= le:
+                return d.get("exhibit") or d.get("url") or ""
+        return ""
 
     # ── 1. Document info ───────────────────────────────────────────────
     @_lc_tool
@@ -121,14 +135,35 @@ def build_pi_tools(
         else:
             docs_block = f"  single document — lines 1-{total_lines}"
 
+        # Per-exhibit opening lines so the agent can classify each document
+        # (press release vs presentation vs supplemental) WITHOUT reading it.
+        doc_preview_lines: list[str] = []
+        for d in document_map or []:
+            ls = d.get("line_start")
+            if not ls:
+                continue
+            end = d.get("line_end") or total_lines
+            head: list[str] = []
+            for i in range(ls - 1, min(end, total_lines)):
+                s = lines[i].strip()
+                if s and len(s) > 3 and not s.startswith(("*", "(", "|", "§", "═")):
+                    head.append(s[:100])
+                    if len(head) >= 3:
+                        break
+            label = d.get("exhibit") or d.get("url") or "?"
+            preview = " | ".join(head) if head else "(no readable preview)"
+            doc_preview_lines.append(f"  • {label} (lines {ls}-{end}): {preview}")
+        docs_preview = "\n".join(doc_preview_lines)
+
         return (
             f"Document bundle: {total_chars:,} characters, {total_lines:,} lines, "
             f"{len(document_map) or 1} exhibit(s)\n"
             f"Exhibit map:\n{docs_block}\n"
-            f"First lines (preview):\n{toc}"
+            + (f"Exhibit previews:\n{docs_preview}\n" if docs_preview else "")
+            + f"First lines (preview):\n{toc}"
         )
 
-    # ── 1b. Section map (LLM-backed, lazy, cached) ────────────────────
+    # ── 1b. Section map (prescan hints → instant, LLM indexer as fallback) ──
     section_index_cache: dict[str, Any] = {}
     _section_builder = section_builder or build_section_index
 
@@ -139,9 +174,8 @@ def build_pi_tools(
         Returns the major sections (income statement, segment results,
         EPS/share data, balance sheet, ...) with their 1-based line ranges.
         Call this FIRST to locate the income statement, then read_lines() the
-        range it reports.  The map is built lazily by one indexing pass on
-        the first call and cached for the rest of the run; a pre-built map
-        (from the period pass) is returned instantly.
+        range it reports.  The map is returned instantly when available from
+        prescan hints or a pre-built index; the LLM indexer is a last resort.
 
         Args:
             query: Optional focus hint (e.g. "where is EPS?").  The full map
@@ -152,6 +186,24 @@ def build_pi_tools(
             return format_section_index(prebuilt_sections)
         if section_index_cache:
             return format_section_index(section_index_cache)
+
+        # Prescan found the income-statement exhibit — return an instant
+        # routing hint instead of calling the expensive LLM indexer.
+        if prescan_is_hints:
+            best = prescan_is_hints[0]
+            parts = [
+                f"Income-statement exhibit (prescan): {best['exhibit']}",
+                f"  lines {best['lines'][0]}-{best['lines'][1]}"
+                f" ({best['primary_count']} IS + {best['secondary_count']} context hits)",
+            ]
+            # Add remaining exhibits as secondary targets.
+            for h in prescan_is_hints[1:]:
+                parts.append(
+                    f"  Also: {h['exhibit']} lines {h['lines'][0]}-{h['lines'][1]}"
+                    f" ({h['primary_count']} IS + {h['secondary_count']} context hits)"
+                )
+            return "\n".join(parts)
+
         try:
             index, elapsed = _section_builder(document_text, query=query)
         except Exception as exc:  # noqa: BLE001
@@ -193,7 +245,7 @@ def build_pi_tools(
 
         result_lines: list[str] = []
         for i in range(start - 1, min(end, total_lines)):
-            line_text = lines[i][:300]
+            line_text = lines[i][:500]
             result_lines.append(f"{i + 1:5d}: {line_text}")
 
         header = f"Lines {start}-{min(end, total_lines)} of {total_lines:,}:"
@@ -256,7 +308,9 @@ def build_pi_tools(
         for block in blocks[:15]:
             block_start = max(0, block[0] - ctx)
             block_end = min(total_lines, block[-1] + ctx + 1)
-            out_lines.append(f"── lines {block_start + 1}-{block_end} ──")
+            exhibit = _exhibit_for_line(block[0])
+            tag = f" ({exhibit})" if exhibit else ""
+            out_lines.append(f"── lines {block_start + 1}-{block_end}{tag} ──")
             for i in range(block_start, block_end):
                 marker = ">>>" if i in all_matches else "   "
                 line_text = lines[i][:200]
@@ -594,7 +648,6 @@ def build_pi_tools(
         find_sections,
         read_lines,
         search,
-        get_prior_value,
         verify_identity,
         calculate,
         get_company_info,

@@ -77,6 +77,30 @@ LLM_CACHE_ENABLED: bool = os.getenv("LLM_CACHE", "0").strip().lower() in {
 }
 LLM_CACHE_DIR: str = os.getenv("LLM_CACHE_DIR", ".llm_cache")
 
+# ── Agentic long-term memory ──────────────────────────────────────────────
+# The extraction agent records label aliases + layout hints via the
+# remember_alias / remember_layout tools during its run (fast Mongo write, no
+# extra LLM pass).  GOAL: make future extraction FASTER and MORE ACCURATE.
+# Learnings are advisory only — injected as hints, never authoritative, never
+# skip.
+#
+# MEMORY_ENABLED has NO default — it must be set explicitly in the
+# environment (true/1/yes/on or false/0/no/off).  A missing or unrecognised
+# value raises an error at import time (fail fast).
+_MEMORY_ENABLED_RAW = (os.getenv("MEMORY_ENABLED") or "").strip().lower()
+if not _MEMORY_ENABLED_RAW:
+    raise ValueError(
+        "MEMORY_ENABLED is required and has no default — set it to "
+        "true/1/yes/on or false/0/no/off in the environment (.env)"
+    )
+_MEMORY_ENABLED_VALID = {"0", "1", "true", "false", "yes", "no", "on", "off"}
+if _MEMORY_ENABLED_RAW not in _MEMORY_ENABLED_VALID:
+    raise ValueError(
+        "MEMORY_ENABLED must be one of "
+        f"{sorted(_MEMORY_ENABLED_VALID)!r}; got {os.getenv('MEMORY_ENABLED')!r}"
+    )
+MEMORY_ENABLED: bool = _MEMORY_ENABLED_RAW not in {"0", "false", "no", "off"}
+
 # Window (in stored periods) for the HARD extraction-target filter:
 # a concept is extracted only if it had a value in any of the last N periods
 # (quarterly filings → last N quarterly periods, annual → last N annual

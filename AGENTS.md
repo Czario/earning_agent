@@ -155,6 +155,14 @@ in-loop), `compute` (same exact arithmetic as `calculate`, for derived concept
 values). `calculate`/`compute` share one plain-function evaluator (both are
 StructuredTools). Tool results truncated to 8000 chars.
 
+Multi-document navigation is agent-driven: `get_document_info` lists each
+exhibit's line range AND its opening lines (so the agent can classify a press
+release vs presentation vs supplemental without reading it); `search` is
+global across the whole bundle and annotates each match block with the
+exhibit it belongs to; the extraction prompt instructs a SMART (non-linear)
+strategy — identify exhibits first, jump with global search, prefer the
+fullest income statement.  **No deterministic navigation helpers.**
+
 ### Concept lookup & fiscal math (`integrations/normalize.py`)
 
 - `get_statement_concepts(cik, statement_types, period=DetectedPeriod)` — returns `{_id, concept,
@@ -185,12 +193,65 @@ StructuredTools). Tool results truncated to 8000 chars.
   and `accession_number` (traceability only — never used for checks/dedup).
   The old `delete_fiscal_period` delete-before-write helper was removed.
 
+### Agentic long-term memory (`agent/memory.py`)
+
+**GOAL: make future extraction FASTER and MORE ACCURATE.**  Memory stores four
+kinds of learnings, each written by the agent that observes them via a
+dedicated tool (a plain Mongo upsert in milliseconds, no extra LLM pass, no
+post-save node, no deterministic consolidation):
+
+- `label_alias` — the filing labels a known concept differently, via
+  `remember_alias(filing_label, canonical)` (text format
+  `'"<canonical>" is labeled "<filing label>"'`).  The tool REJECTS
+  identical labels and dimension member/taxonomy metadata.
+- `layout` — a stable NAVIGATIONAL fact, via `remember_layout(note)`: which
+exhibit/section the income statement lives in (e.g. "second half of the
+release", "Exhibit 99.2 supplemental").  The tool REJECTS per-filing line
+numbers (they change every filing), notes longer than ~220 chars (ONE short
+fact per note), and near-duplicates of an existing layout note (Jaccard OR
+containment similarity >= 0.5 — so long rephrased + extended repeats are
+caught too).
+- `currency` — the reporting currency the extraction agent confirmed via
+  `detect_currency`, via `remember_currency(currency, other_codes)`.  If the
+  filing contains other currencies (e.g. a EUR table), they are recorded too:
+  "Reports in USD; filing may also contain EUR." — so future runs expect
+  them and still extract USD.
+- `period` — the filing cadence + period-label format the period agent
+determined, via `remember_period(period_type, period_label)` (only the
+stable prefix is stored — the per-filing date is dropped; the period agent
+still reads the actual dates from the filing).
+
+Store (in `normalize_data`):
+
+- `agent_memory_company` — one doc per CIK: `{cik, learnings, updated_at}`;
+  each learning is just `{id, type, text}` (no ticker/SIC — those already
+  live in the `companies` collection).
+
+Layout learnings are restricted to NAVIGATIONAL facts (exhibit/section/
+relative position).  Content descriptions (e.g. how revenue is disaggregated),
+terminology lists, and period-convention phrasing are deliberately NOT
+learned — they re-describe filing content the agent re-reads every run.
+
+**Never skip / never record absences (hard invariant)** — memory must never
+cause a run to skip, exclude, or stop searching for any concept: a metric
+absent today may be disclosed in a future filing.  The memory tool
+docstrings forbid absences, and the injected recall block carries an
+explicit "NEVER skip a concept because of memory" warning.
+
+**Recall (read path)** — `recall_memory(cik, types)` injects an advisory
+`COMPANY MEMORY` block: the extraction prompt gets label aliases + layout +
+currency hints (`agent/pipeline.py`), the period prompt gets the cadence/
+label-format hint (`agent/period.py`).  Memory is **advisory only**: injected
+as hints, never authoritative, never adds concepts outside the extraction
+target, never supplies values, never skips or excludes a concept, and never
+overrides the filing.  Config: `MEMORY_ENABLED` (required, no default).
+
 ## Code map
 
 ```
 src/earnings_agents/
   graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py, filelog.py
-  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py
+  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py · memory.py
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py
   integrations/ edgar.py · normalize.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
@@ -213,6 +274,15 @@ src/earnings_agents/
 
 ## Guardrails & invariants — do not break
 
+- **No deterministic tools — agent tool calls only.**  All document
+  navigation, mapping, currency/scale/period detection, and learning are
+  performed by the agents through their tool calls.  Do NOT suggest or
+  implement deterministic navigation/extraction helpers (e.g. a
+  `locate_income_statement` text-scan tool); improve the agent's existing
+  tools (richer `get_document_info`/`search` results) and prompts instead.
+  This includes multi-document filings: the agent decides how to find the
+  income statement across exhibits (smart, non-linear search), optionally
+  aided by layout memory — never a deterministic locator.
 - **Period comes from the period agent or the run fails.** No regex/filename/
   EDGAR metadata/cadence inference exists anywhere in the codebase.
 - **Extraction target = recent concepts prioritized, never excluded.** The full
@@ -235,6 +305,12 @@ src/earnings_agents/
   context (helps recognize filing terminology); it can never add concepts
   outside the recent-value target, supply or infer values, or override
   anything read from the filing. Missing industry data never fails a run.
+- **Memory is advisory-only and never skips concepts.** Long-term memory
+  exists only to make future extraction faster/cheaper.  It can never add
+  concepts outside the extraction target, supply or infer values, override
+  the filing, or — critically — cause a run to skip/exclude/stop-searching
+  any concept.  Absence learnings are forbidden: a metric absent today may
+  be disclosed in a future filing.
 - **Q4 is never extracted as quarterly.** Q4 == annual; both-column releases → the
   fiscal-year (annual) column. Enforced in the period agent prompt, the business-rules
   gate, the extraction prompt, and naturally by `quarter=null` annual upserts.
@@ -346,6 +422,7 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `REDIS_URL` / `REDIS_QUEUE_NAME` | `redis://localhost:6379/0` / `sec:filings` | Worker queue (deploy sets `sec:filings:8k`) |
 | `STRICT_ACCURACY` | `1` | Refuse save on unresolved high-severity findings |
 | `EXTRACTION_MAX_CHARS` | `400000` | Cap on `raw_text` stored in state |
+| `MEMORY_ENABLED` | *(required — no default)* | Enable agentic long-term memory (hint injection + `remember_alias`/`remember_layout`/`remember_currency`/`remember_period` tools); must be set explicitly (`true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`) |
 | `PROMPT_HISTORY_PERIODS` | `3` | Window (stored periods) used as an extraction *prioritization* signal, not an eligibility filter |
 | `RUN_LOGS_ENABLED` | `1` | Write per-run admin-panel-mirror log files (`Logs/<date-time>.log`) |
 | `RUN_LOGS_DIR` | `Logs` | Directory for the per-run log files (Docker sets `/app/Logs`) |

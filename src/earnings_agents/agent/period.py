@@ -424,6 +424,33 @@ def run_period_detection(
     fy_end = fy_end_code or (f"{fy_end_month:02d}00" if fy_end_month else "unknown")
     system_prompt = PERIOD_SYSTEM_PROMPT.format(fy_end=fy_end)
 
+    # ── Long-term memory — advisory period-cadence hint + write tool ──
+    remember_period_tool = None
+    if cik:
+        try:
+            from earnings_agents.config import MEMORY_ENABLED
+            if MEMORY_ENABLED:
+                from earnings_agents.agent.memory import (
+                    build_remember_period_tool,
+                    recall_memory,
+                )
+                mem = recall_memory(cik, types={"period"})
+                if mem["local_block"]:
+                    system_prompt += "\n\n" + mem["local_block"]
+                remember_period_tool = build_remember_period_tool(cik)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("memory setup failed for %s: %s", ticker, exc)
+
+    if remember_period_tool is not None:
+        system_prompt += (
+            "\n\nMEMORY GOAL — make future period detection FASTER and MORE "
+            "ACCURATE.  Once you have determined the period, call "
+            "remember_period(period_type=..., period_label=...) with the "
+            "exact header you read so future runs know the cadence and label "
+            "format up front (they still read the actual dates from the "
+            "filing)."
+        )
+
     initial_message = (
         f"This is a {len(raw_text):,}-character earnings document. It may be an "
         "SEC 8-K/EDGAR exhibit, an IR-hosted PDF, a shareholder letter, or "
@@ -432,11 +459,13 @@ def run_period_detection(
     )
 
     tools = build_pi_tools(
-        raw_text, prior_values={}, cik=cik, company_name=company_name,
+        raw_text, cik=cik, company_name=company_name,
         company_industry=company_industry,
         document_map=document_map,
         section_store=section_store,
     )
+    if remember_period_tool is not None:
+        tools.append(remember_period_tool)
 
     result = run_agent_loop(
         system_prompt=system_prompt,
