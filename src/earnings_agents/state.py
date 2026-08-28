@@ -72,9 +72,15 @@ class EarningsAgentState(TypedDict):
     # Set by check_period_node when the exact fiscal period already exists.
     # mongodb_save_node performs the replace ATOMICALLY inside
     # upsert_concept_values (write-first + stale sweep) — this flag only
-    # drives messaging ("replacing X").
+    # drives messaging ("replacing X") and triggers Q4 recalculation.
     _pending_replace: NotRequired[Optional[dict]]  # {"cik"}; period is canonical detected_period
     _replace_period_label: NotRequired[Optional[str]]  # human-readable period label
+    # ── Post-save Q4 derivation (income statement only) ───────────────────
+    # Summary of the Q4 calculation that runs after an ANNUAL save:
+    # {status, statement_type, fiscal_year, recalculated, processed,
+    # calculated, point_in_time, skipped, skipped_reasons, errors}.
+    # Populated by calculate_q4_node; purely observability — never fails a run.
+    q4_calculation: NotRequired[Optional[dict]]
     # ── Multi-exhibit documents ──────────────────────────────────────────
     # Filing exhibits as resolved by EDGAR: [{exhibit: "EX-99.1",
     # description: "The Press Release", url}] in filing-index order.

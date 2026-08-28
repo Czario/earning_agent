@@ -113,3 +113,24 @@ RUN_LOGS_ENABLED: bool = os.getenv("RUN_LOGS_ENABLED", "1").strip().lower() not 
     "0", "false", "no", "off",
 }
 RUN_LOGS_DIR: str = os.getenv("RUN_LOGS_DIR", "Logs")
+
+# ── Post-save Q4 derivation (income statement only) ────────────────────────
+# After an ANNUAL filing is saved to concept_values_annual (Q4 == annual in
+# this pipeline), derive Q4 quarterly values and insert them into
+# concept_values_quarterly: Q4 = Annual - (Q1 + Q2 + Q3) for flow concepts,
+# Q4 = Annual for point-in-time concepts (cash balances, shares outstanding,
+# period markers).  Income statement concepts only — the same scope as the
+# calculations project's `--calculate-q4 --statement is`.  Set to 0 to disable.
+CALCULATE_Q4_AFTER_ANNUAL: bool = os.getenv(
+    "CALCULATE_Q4_AFTER_ANNUAL", "1"
+).strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+# When False (default), Q4 is derived only when the annual value AND all of
+# Q1/Q2/Q3 exist for the concept — a missing quarter is never treated as 0
+# (that would fabricate a Q4 value).  Set to 1 to adopt the calculations
+# project's behavior of treating missing values as 0.
+Q4_ALLOW_INCOMPLETE: bool = os.getenv("Q4_ALLOW_INCOMPLETE", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}

@@ -34,7 +34,7 @@ short-circuit to `END`).
 
 ```
 fetch_filing → detect_period → check_period → load_company_concepts
-    → agent_document_pipeline → mongodb_save → END
+    → agent_document_pipeline → mongodb_save → calculate_q4 → END
 ```
 
 | # | Node | File | Job |
@@ -45,6 +45,7 @@ fetch_filing → detect_period → check_period → load_company_concepts
 | 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes the canonical `detected_period` (no period decision here). Loads the **full eligible concept universe**, then builds the target as **recent concepts ∪ all dimensional (segment/breakdown) rows ∪ `system:`/`calculated` concepts**. The recent-value window (`get_recently_valued_concept_ids`, last `PROMPT_HISTORY_PERIODS` periods) is a *prioritization* signal, not an eligibility filter — new segments/newly disclosed rows stay extractable without history. `system:`/`calculated` concepts are CALC derivation targets — rendered to the agent as compute-only (not extracted verbatim from the filing). No history → full-universe bootstrap; no concepts at all → skip. Malformed upstream rows (labels with no alphabetic word, e.g. `custom:404` page-number pollution) and rows whose hierarchy `path` carries a bare page-number segment (`404`/`555`) are dropped before the target is built — no filing prints them. |
 | 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop (single pass) → map → derive → findings (below). No verifier agent, no retry loop. |
 | 6 | `mongodb_save` | `nodes/save.py` | STRICT_ACCURACY gate → currency gate → **atomic period replace** inside `upsert_concept_values` (write-first, then a stale sweep deletes only docs not carrying the current save token — no delete-before-write window) → upsert into `concept_values_{quarterly\|annual}`. |
+| 7 | `calculate_q4` | `nodes/q4.py` | Post-save Q4 derivation — **income statement only** (same scope as the calculations project's `--calculate-q4 --statement is`). After an ANNUAL save succeeds, derives `Q4 = Annual − (Q1 + Q2 + Q3)` per just-saved concept and inserts into `concept_values_quarterly` (point-in-time concepts: `Q4 = Annual` copy). Ported from `services/q4_calculation_service.py` + `repositories/financial_repository.py` in the `calculations` project. Guards: `CALCULATE_Q4_AFTER_ANNUAL` on (default), `status="saved"`, annual period. Never fails the run — summary in `state.q4_calculation` (observability). |
 
 > **Job-level retry only.** The graph runs **once per filing**; there is no
 > in-graph re-extract loop. Retries exist only at the **job level** in the Redis
@@ -252,8 +253,8 @@ overrides the filing.  Config: `MEMORY_ENABLED` (required, no default).
 src/earnings_agents/
   graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py, filelog.py
   agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py · memory.py
-  nodes/        fetch.py · check.py · concepts.py · detect.py · save.py
-  integrations/ edgar.py · normalize.py · mongo.py · redis.py · http.py · html.py · playwright.py
+  nodes/        fetch.py · check.py · concepts.py · detect.py · save.py · q4.py
+  integrations/ edgar.py · normalize.py · q4.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
 ```
 
@@ -340,6 +341,21 @@ src/earnings_agents/
   stay until the new ones are fully written. No accession checks anywhere —
   re-runs always replace the same exact period; a quarterly Q4 record is never
   checked or deleted by annual processing.
+- **Q4 derivation runs AFTER the annual save, income statement only**
+  (`calculate_q4` node, `integrations/q4.py`) — ported from the `calculations`
+  project (`--calculate-q4 --statement is` scope). When an ANNUAL filing is
+  saved, Q4 quarterly values are derived as `Q4 = Annual − (Q1+Q2+Q3)`
+  (flow concepts) or `Q4 = Annual` (point-in-time concepts — cash balances,
+  shares outstanding, period markers) and inserted into
+  `concept_values_quarterly` with `calculated: True`, `form_type: 10-Q`,
+  `quarter: 4`, and a `note` marking the derivation. It never runs for
+  quarterly filings, never fails the run (summary in `state.q4_calculation`),
+  and never skips a concept because of it. Strict by default
+  (`Q4_ALLOW_INCOMPLETE=0`): a missing Q1/Q2/Q3 or annual value skips the
+  concept — a fabricated Q4 is never stored (set `Q4_ALLOW_INCOMPLETE=1` for
+  the source project's treat-missing-as-0 behavior). Idempotent: an existing
+  Q4 is skipped; when the annual save REPLACED an existing period
+  (`_pending_replace`), Q4s are recomputed via write-first upsert.
 - **Single-pass extraction (no verifier, no retry)** — the pipeline runs exactly
   one extraction-agent pass per filing. There is no independent second-read and
   no re-extraction loop: metrics that are not present in the filing are simply
@@ -424,6 +440,8 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `EXTRACTION_MAX_CHARS` | `400000` | Cap on `raw_text` stored in state |
 | `MEMORY_ENABLED` | *(required — no default)* | Enable agentic long-term memory (hint injection + `remember_alias`/`remember_layout`/`remember_currency`/`remember_period` tools); must be set explicitly (`true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`) |
 | `PROMPT_HISTORY_PERIODS` | `3` | Window (stored periods) used as an extraction *prioritization* signal, not an eligibility filter |
+| `CALCULATE_Q4_AFTER_ANNUAL` | `1` | Post-save Q4 derivation (income statement only): after an ANNUAL filing is saved, derive `Q4 = Annual − (Q1+Q2+Q3)` into `concept_values_quarterly`; set `0` to disable |
+| `Q4_ALLOW_INCOMPLETE` | `0` | Treat missing Q1/Q2/Q3 as `0` in Q4 derivation (calculations-project behavior); when `0` (default) concepts with missing inputs are skipped — a fabricated Q4 is never stored |
 | `RUN_LOGS_ENABLED` | `1` | Write per-run admin-panel-mirror log files (`Logs/<date-time>.log`) |
 | `RUN_LOGS_DIR` | `Logs` | Directory for the per-run log files (Docker sets `/app/Logs`) |
 | `LLM_CACHE` | `0` | Dev-only LLM response disk cache |
