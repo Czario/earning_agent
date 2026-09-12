@@ -2,10 +2,16 @@
 
 Graph:
     fetch_filing → detect_period → check_period → load_company_concepts
-        → agent_document_pipeline → mongodb_save → calculate_q4 → END
+        → agent_document_pipeline → mongodb_save → save_guidance
+        → calculate_q4 → END
 
 The reporting period is decided ONLY by the period agent (detect_period); if it
 fails the run fails — no deterministic period inference anywhere.
+
+``save_guidance`` (post-save, after a successful income-statement save): persists
+the agent's forward-looking guidance records into `guidance_values` (the same
+collection the admin backend reads/writes) and scores current guidance whose
+covered period has arrived against the stored actuals.  Never fails a run.
 
 ``calculate_q4`` is the post-save Q4 derivation (income statement only): after
 an ANNUAL filing is saved to ``concept_values_annual`` it derives
@@ -26,6 +32,7 @@ from earnings_agents.nodes.concepts import load_company_concepts_node
 from earnings_agents.nodes.fetch import fetch_filing_node
 from earnings_agents.nodes.q4 import calculate_q4_node
 from earnings_agents.nodes.save import mongodb_save_node
+from earnings_agents.nodes.save_guidance import save_guidance_node
 from earnings_agents.state import EarningsAgentState
 from earnings_agents.hooks import with_hooks
 
@@ -47,13 +54,15 @@ def _route_after(next_node: str):
 
 
 def _route_after_save(state: EarningsAgentState) -> str:
-    """Run the post-save Q4 derivation only after a successful save.
+    """Run the post-save nodes only after a successful save.
 
-    The node itself no-ops for quarterly periods, disabled config, or missing
-    CIK/concepts — this route only avoids invoking it when the save failed.
+    The guidance save runs first (persists guidance_values + scores actuals),
+    then the Q4 derivation.  Each node no-ops when irrelevant (no guidance
+    records / quarterly period / disabled config) — this route only avoids
+    invoking them when the income-statement save itself failed.
     """
     if state.get("status") == "saved":
-        return "calculate_q4"
+        return "save_guidance"
     return "__end__"
 
 
@@ -67,6 +76,7 @@ def build_graph():
     graph.add_node("load_company_concepts", with_hooks(load_company_concepts_node))
     graph.add_node("agent_document_pipeline", with_hooks(agent_document_pipeline_node))
     graph.add_node("mongodb_save", with_hooks(mongodb_save_node))
+    graph.add_node("save_guidance", with_hooks(save_guidance_node))
     graph.add_node("calculate_q4", with_hooks(calculate_q4_node))
 
     graph.set_entry_point("fetch_filing")
@@ -81,14 +91,15 @@ def build_graph():
         route = _route_after(dst)
         graph.add_conditional_edges(src, route, {dst: dst, "__end__": END})
 
-    # Q4 derivation runs only after a successful save (annual filings only —
-    # the node no-ops otherwise).  Never fails the run.
+    # Post-save: guidance persistence/scoring runs first, then Q4 derivation
+    # (both only after a successful save — the node no-ops otherwise).
     graph.add_conditional_edges(
         "mongodb_save",
         _route_after_save,
-        {"calculate_q4": "calculate_q4", "__end__": END},
+        {"save_guidance": "save_guidance", "__end__": END},
     )
 
+    graph.add_edge("save_guidance", "calculate_q4")
     graph.add_edge("calculate_q4", END)
 
     return graph.compile()

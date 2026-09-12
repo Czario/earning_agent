@@ -100,3 +100,17 @@ class EarningsAgentState(TypedDict):
     # Set from the EDGAR submissions API (CLI path) or Redis payload (worker).
     # Stored with every concept value for exact-filing dedup in the skip guard.
     accession_number: NotRequired[Optional[str]]
+    # ── Forward-looking guidance (guidance_values) ─────────────────────────
+    # Normalized guidance records extracted by the agent's PHASE 3 step from
+    # finalize_extraction's "__guidance__" list.  Each record is a
+    # guidance_values-shaped doc (metric, standard_label, basis, form, value /
+    # value_low / value_high, unit / scale / currency, as_printed, condition,
+    # period {fiscal_year, quarter, period_type, label, period_end_date},
+    # filing_period, event_type, ...) with source="llm".  Consumed by
+    # save_guidance_node (upsert + is_current demotion + manual protection +
+    # result scoring).  Absence is normal (many 8-Ks disclose no guidance).
+    guidance_records: NotRequired[Optional[list]]
+    # Observability summary from save_guidance_node:
+    # {status, n_records, upserted, skipped_manual, demoted, scored,
+    #  score_errors, error}.  Never fails a run.
+    guidance_save: NotRequired[Optional[dict]]

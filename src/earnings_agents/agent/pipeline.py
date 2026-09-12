@@ -186,7 +186,8 @@ def _run_extraction_pass(
     # keyword signals (≥3 primary + ≥2 secondary), skip the expensive LLM
     # indexer (60K chars → ~90s) and let the agent navigate via the exhibit
     # routing hint instead.  Only build the index when we lack good hints
-    # or the period agent already built one.
+    # or the period agent already built one (state.document_sections).
+    prebuilt_sections = state.get("document_sections")
     if is_hints and is_hints[0]["primary_count"] >= 3:
         report_call(
             f"  [prescan]  strong income-statement signal — "
@@ -281,6 +282,17 @@ def _run_extraction_pass(
     )
     hints_block = "\n\n".join(hints_parts) if hints_parts else ""
 
+    # ── Guidance extraction block (PHASE 3) — injected when enabled ──────
+    # The contract overrides the "WHAT TO IGNORE: forward-looking guidance"
+    # line in the base system prompt and teaches the agent the
+    # __guidance__ JSON contract.  Disabled → the agent ignores guidance
+    # exactly as before (no extra LLM work, no contract in context).
+    from earnings_agents.config import GUIDANCE_ENABLED
+    guidance_block = ""
+    if GUIDANCE_ENABLED:
+        from earnings_agents.agent.prompts import GUIDANCE_CONTRACT_BLOCK
+        guidance_block = GUIDANCE_CONTRACT_BLOCK
+
     # ── Industry context — advisory SIC data injected on EVERY pass ─────
     company_industry = state.get("company_industry")
     industry_context = build_industry_context(company_industry)
@@ -334,6 +346,12 @@ def _run_extraction_pass(
         system_prompt += f"\n\n{memory_block}"
     if hints_block:
         system_prompt += f"\n\n{hints_block}"
+    if guidance_block:
+        # Guidance contract placed EARLY (right after the period hints) so it
+        # carries more weight than being buried at the very end of the prompt
+        # — the base prompt's "WHAT TO IGNORE" guidance line is reworded to
+        # defer to this block.
+        system_prompt += f"\n\n{guidance_block}"
     if is_exhibit_text:
         # IS exhibit already in context — suppress navigation instructions
         # that would cause the agent to search for data it already has.
@@ -391,7 +409,6 @@ def _run_extraction_pass(
     # The section map built by the period pass (find_sections) rides in state;
     # find_sections in THIS loop returns it instantly and the initial message
     # points the agent straight at the income-statement range.
-    prebuilt_sections = state.get("document_sections")
     tools = build_pi_tools(
         plain_text, cik=state.get("cik"),
         company_name=state["company_name"],
@@ -486,6 +503,10 @@ def _run_extraction_pass(
             f"detect_currency() on each monetary table you read.  Verify before "
             f"finalizing."
         )
+
+    if guidance_block:
+        from earnings_agents.agent.prompts import GUIDANCE_PHASE_NOTICE
+        initial_msg += GUIDANCE_PHASE_NOTICE
 
     final_result = run_agent_loop(
         system_prompt=system_prompt,
@@ -591,6 +612,54 @@ def _run_extraction_pass(
             "evidence": [],
             "requires_review": True,
         }
+
+    # ── 4c. Forward-looking guidance (PHASE 3 output) ─────────────────────
+    # The extraction agent reports guidance numbers in finalize_extraction
+    # under the metadata key "__guidance__" — a JSON list, one object per
+    # guidance number.  Normalize each to the `guidance_values` schema (same
+    # collection the admin backend reads/writes).  Absence is NORMAL (many
+    # 8-Ks disclose no quantitative guidance) — never a failure, never a
+    # blocking finding; dropped records are observability only.
+    guidance_records: list[dict] = []
+    guidance_issues: list[str] = []
+    from earnings_agents.agent.guidance import normalize_guidance_records
+    agent_guidance = metrics.pop("__guidance__", None)
+    if agent_guidance:
+        try:
+            guidance_records, guidance_issues = normalize_guidance_records(
+                agent_guidance, period, currency_meta.get("currency"),
+            )
+            if guidance_issues:
+                logger.info(
+                    "guidance for %s: %d record(s) dropped — %s",
+                    ticker, len(guidance_issues),
+                    " ".join(guidance_issues[:30]),
+                )
+        except Exception as exc:  # noqa: BLE001 — guidance must never kill the run
+            logger.warning("guidance normalization failed for %s: %s", ticker, exc)
+            guidance_records = []
+            guidance_issues = [f"normalization error: {exc}"]
+    if guidance_records:
+        report_call(
+            f"  [guidance]  {len(guidance_records)} guidance record(s) extracted "
+            f"for {ticker}"
+        )
+    elif GUIDANCE_ENABLED and agent_guidance:
+        # ALWAYS visible: the agent reported guidance but nothing usable
+        # survived normalization.  Print the drop reasons — the CLI runs at
+        # WARNING level, so logger.info is invisible to operators.
+        n_reported = (
+            len(agent_guidance)
+            if isinstance(agent_guidance, (list, dict))
+            else "?"
+        )
+        brief = ("; ".join(guidance_issues[:5])) or "unknown reason"
+        report_call(
+            f"  [guidance]  ⚠ {len(guidance_issues)} of {n_reported} reported "
+            f"record(s) dropped: {brief}"
+        )
+    elif GUIDANCE_ENABLED:
+        report_call(f"  [guidance]  no guidance reported by agent for {ticker}")
 
     concept_metrics, _reverse_map, mapped_keys = map_concepts(metrics, target_concepts)
 
@@ -725,6 +794,7 @@ def _run_extraction_pass(
         "raw_text": raw_text,
         "metrics": metrics,
         "concept_metrics": concept_metrics,
+        "guidance_records": guidance_records,
         "derived_concept_ids": list(derived_ids),
         "mapped_metric_keys": list(mapped_keys),
         "missing_concept_labels": missing_labels,

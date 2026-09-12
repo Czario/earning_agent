@@ -134,3 +134,20 @@ CALCULATE_Q4_AFTER_ANNUAL: bool = os.getenv(
 Q4_ALLOW_INCOMPLETE: bool = os.getenv("Q4_ALLOW_INCOMPLETE", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
+
+# ── Forward-looking guidance extraction (guidance_values) ──────────────────
+# When enabled (default), the extraction agent runs a PHASE 3 step over the
+# filing's Guidance/Outlook section and reports forward-looking numbers in
+# finalize_extraction under "__guidance__".  The pipeline normalizes each
+# record to the `guidance_values` schema (same collection the admin backend
+# reads/writes) and a post-save node persists them keyed on
+# (cik, accession_number, metric, basis, period) with is_current demotion and
+# source=manual protection.  Set to 0 to disable entirely (the agent then
+# ignores guidance sections exactly as before).
+GUIDANCE_ENABLED: bool = os.getenv("GUIDANCE_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+# Max guidance records a single filing may contribute (cap on the agent's
+# __guidance__ list — protects the finalize JSON and the save loop).
+GUIDANCE_MAX_RECORDS: int = int(os.getenv("GUIDANCE_MAX_RECORDS", "15"))

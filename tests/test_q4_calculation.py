@@ -658,7 +658,8 @@ class TestNodeGuards(unittest.TestCase):
 class TestGraphRouting(unittest.TestCase):
     def test_route_after_save(self):
         from earnings_agents.graph import _route_after_save
-        self.assertEqual(_route_after_save({"status": "saved"}), "calculate_q4")
+        # Post-save: guidance persistence runs BEFORE the Q4 derivation.
+        self.assertEqual(_route_after_save({"status": "saved"}), "save_guidance")
         self.assertEqual(_route_after_save({"status": "failed"}), "__end__")
         self.assertEqual(_route_after_save({"status": "skipped"}), "__end__")
 
@@ -667,7 +668,18 @@ class TestGraphRouting(unittest.TestCase):
         compiled = build_graph()
         nodes = set(compiled.get_graph().nodes.keys())
         self.assertIn("calculate_q4", nodes)
+        self.assertIn("save_guidance", nodes)
         self.assertIn("mongodb_save", nodes)
+
+    def test_graph_edges_save_guidance_before_calculate_q4(self):
+        from earnings_agents.graph import build_graph
+        compiled = build_graph()
+        g = compiled.get_graph()
+        # mongodb_save conditionally routes to save_guidance; save_guidance
+        # has a straight edge into calculate_q4.
+        edges = [(e.source, e.target) for e in g.edges]
+        self.assertIn(("save_guidance", "calculate_q4"), edges)
+        self.assertIn(("calculate_q4", "__end__"), edges)
 
 
 if __name__ == "__main__":

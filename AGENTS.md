@@ -17,7 +17,7 @@ atomic period replace, strict save gate) keep it accurate.
 ```bash
 uv sync                                  # install deps
 uv sync --extra dev                      # + pytest (test suite)
-uv run pytest tests/ -q                  # run the test suite (69 tests)
+uv run pytest tests/ -q                  # run the test suite (189 tests)
 uv run earnings --ticker MSFT            # CLI run (SEC EDGAR path)
 uv run earnings --ticker MSFT --dry-run  # connectivity check, no LLM
 uv run earnings --ticker MSFT -v         # DEBUG logging
@@ -46,6 +46,7 @@ fetch_filing → detect_period → check_period → load_company_concepts
 | 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop (single pass) → map → derive → findings (below). No verifier agent, no retry loop. |
 | 6 | `mongodb_save` | `nodes/save.py` | STRICT_ACCURACY gate → currency gate → **atomic period replace** inside `upsert_concept_values` (write-first, then a stale sweep deletes only docs not carrying the current save token — no delete-before-write window) → upsert into `concept_values_{quarterly\|annual}`. |
 | 7 | `calculate_q4` | `nodes/q4.py` | Post-save Q4 derivation — **income statement only** (same scope as the calculations project's `--calculate-q4 --statement is`). After an ANNUAL save succeeds, derives `Q4 = Annual − (Q1 + Q2 + Q3)` per just-saved concept and inserts into `concept_values_quarterly` (point-in-time concepts: `Q4 = Annual` copy). Ported from `services/q4_calculation_service.py` + `repositories/financial_repository.py` in the `calculations` project. Guards: `CALCULATE_Q4_AFTER_ANNUAL` on (default), `status="saved"`, annual period. Never fails the run — summary in `state.q4_calculation` (observability). |
+| 7b | `save_guidance` | `agent/guidance.py` · `integrations/guidance.py` · `nodes/save_guidance.py` | **Post-save forward-looking guidance** (runs after a successful save, before Q4 derivation). The extraction agent's PHASE 3 step reads the filing's Guidance/Outlook section (same loop, same tools) and reports `__guidance__` in `finalize_extraction`; the pipeline normalizes each record to the `guidance_values` schema — the SAME collection the admin backend reads/writes, docs shaped exactly like `GuidanceService.buildDoc` (`source="llm"` is the only difference from manual entries): `{cik, accession_number, form_type, filing_period, period{...}, period_type, metric, standard_label, concept, statement_type, basis, form, value, value_low, value_high, plus_minus, plus_minus_unit, unit, scale, currency, as_printed, condition, event_type, supersedes, is_current, source, result, ...}`. Every doc carries a top-level `period_type` (`quarterly`|`annual`) — the binary class of the COVERED period, DERIVED from the nested `period.period_type` extended enum (annual/multi_year → `annual`; quarterly/ytd/current_quarter → `quarterly`) on both the agent path (`_period_type_binary`, never accepted as raw input) and the admin backend's `buildDoc` (derive-only, client values ignored), so the two can never drift. `scripts/backfill_guidance_period_type.py` backfills the field on docs written before it existed. Covered `period` is the FUTURE period after the canonical `detected_period` (filing text authoritative; deterministic next-period derivation only as fallback — past/same-period records are dropped, never saved). `upsert_guidance_records` keys on `(cik, accession_number, metric, basis, period)`, demotes `is_current` across accessions, sets `supersedes`, and skips any key holding `source="manual"` (human edits win). `score_guidance_for_cik` then resolves current guidance whose covered period has arrived to the company's concept row via the existing `concepts_standard_mapping` vocabulary, reads the stored actual, and writes `result {actual_value, actual_accession_number, delta_abs, delta_pct, outcome}` (beat/miss/inline/qualitative — direction per metric in code). **`concept` is never null when a matching row exists**: at save time each doc resolves `standard_label` → the company's concept NAME via `concepts_standard_mapping` (label variants: Total/singular/plural), falling back to a normalized-label match against the company's own `normalized_concepts_*` rows (covers GAAP labels the 18-row mapping vocabulary lacks, e.g. "Provision for income taxes"); the agent's own `concept` when provided stays authoritative; the key is always present on the stored doc — null only when the company genuinely has no matching row (non-GAAP/custom metrics). Injection is non-fatal everywhere: no guidance section → no records (normal); extraction/normalization/persistence errors → observability only; never fails a run and never blocks the income-statement save. |
 
 > **Job-level retry only.** The graph runs **once per filing**; there is no
 > in-graph re-extract loop. Retries exist only at the **job level** in the Redis
@@ -252,9 +253,9 @@ overrides the filing.  Config: `MEMORY_ENABLED` (required, no default).
 ```
 src/earnings_agents/
   graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py, filelog.py
-  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · industry.py · currency.py · scale.py · memory.py
-  nodes/        fetch.py · check.py · concepts.py · detect.py · save.py · q4.py
-  integrations/ edgar.py · normalize.py · q4.py · mongo.py · redis.py · http.py · html.py · playwright.py
+  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · guidance.py · industry.py · currency.py · scale.py · memory.py · indexer.py
+  nodes/        fetch.py · check.py · concepts.py · detect.py · save.py · save_guidance.py · q4.py
+  integrations/ edgar.py · normalize.py · guidance.py · q4.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
 ```
 
@@ -364,6 +365,29 @@ src/earnings_agents/
   currency, wrong-company document (identity cross-check), and truncated/
   incomplete exhibits — but it cannot catch wrong-value/scale/currency or wrong
   segment-parent mistakes that the extraction agent itself does not catch.
+- **Guidance is advisory, independent, and never fails a run.** The PHASE 3
+  guidance extraction rides the SAME single extraction pass (reported under
+  `__guidance__` in the same `finalize_extraction` — no second agent pass, no
+  verifier). Guidance records land in `guidance_values` exactly in the admin
+  backend's schema with `source="llm"`; a `source="manual"` doc for the same
+  `(cik, metric, basis, period)` key BLOCKS the LLM write (human edits win).
+  Covered `period` must be strictly AFTER the canonical `detected_period`
+  (filing text authoritative; deterministic derivation is fallback-only; past/
+  same-period records are dropped, never guessed). `is_current` is demoted
+  across accessions + `supersedes` set; `result` (beat/miss/inline) is computed
+  lazily when the covered period's actual lands. **Monetary guidance values are
+  stored in RAW units**: `normalize_guidance_records` applies the filing's
+  printed scale (`thousands`/`millions`/`billions`) exactly once before insert —
+  `$61-64 billion` → `value 62,500,000,000`, `value_low 61,000,000,000`,
+  `value_high 64,000,000,000` — so scoring deltas against the raw
+  `concept_values_*` actuals are exact (the stored `scale` field keeps the
+  filing's printed unit as provenance). Percentages, per-share/ratio values
+  (EPS, margins, growth, rates), and scale-`as-is` share counts are never
+  scaled — a model tagging EPS with `scale: "billions"` must not turn 4.85 into
+  4,850,000,000. Any guidance absence/
+  failure — no outlook section, unparseable records, non-USD band, persistence
+  error — is observability only: it never blocks, and never fails, the
+  income-statement save.
 - **Company identity is cross-checked deterministically.** The extraction agent
   reports `__company_name__` (and may flag `__company_mismatch__`); the
   pipeline runs `check_company_identity()` (normalized token overlap) on the
@@ -442,6 +466,8 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `PROMPT_HISTORY_PERIODS` | `3` | Window (stored periods) used as an extraction *prioritization* signal, not an eligibility filter |
 | `CALCULATE_Q4_AFTER_ANNUAL` | `1` | Post-save Q4 derivation (income statement only): after an ANNUAL filing is saved, derive `Q4 = Annual − (Q1+Q2+Q3)` into `concept_values_quarterly`; set `0` to disable |
 | `Q4_ALLOW_INCOMPLETE` | `0` | Treat missing Q1/Q2/Q3 as `0` in Q4 derivation (calculations-project behavior); when `0` (default) concepts with missing inputs are skipped — a fabricated Q4 is never stored |
+| `GUIDANCE_ENABLED` | `1` | Extract forward-looking Guidance/Outlook numbers (PHASE 3 of the extraction pass) into `guidance_values` (same collection the admin backend reads/writes, `source="llm"`); set `0` to disable entirely (agent ignores guidance sections as before) |
+| `GUIDANCE_MAX_RECORDS` | `15` | Cap on the agent's `__guidance__` list per filing |
 | `RUN_LOGS_ENABLED` | `1` | Write per-run admin-panel-mirror log files (`Logs/<date-time>.log`) |
 | `RUN_LOGS_DIR` | `Logs` | Directory for the per-run log files (Docker sets `/app/Logs`) |
 | `LLM_CACHE` | `0` | Dev-only LLM response disk cache |

@@ -111,7 +111,9 @@ SEGMENT / BREAKDOWN REVENUE IN PROSE — CRITICAL:
 
 WHAT TO IGNORE
   • Any section labeled "Non-GAAP", "Adjusted", "Reconciliation of GAAP"
-  • Forward-looking guidance, outlook, or forecast tables
+  • Forward-looking guidance, outlook, or forecast tables — UNLESS the
+    "GUIDANCE EXTRACTION (PHASE 3)" block is present in the system prompt,
+    in which case that block REPLACES this rule and you extract them
   • Balance sheet data (unless you need share counts for EPS)
   • Cash flow statement data
   • Footnote detail below the main income statement table
@@ -219,6 +221,11 @@ FINALIZE_DESCRIPTION = (
     "  - __derived__: a comma-separated list of bracketed keys you COMPUTED\n"
     "    (via compute()/calculate()) rather than read verbatim from the filing\n"
     "    (omit if none)\n"
+    "  - __guidance__: OPTIONAL list of forward-looking Guidance/Outlook numbers\n"
+    "    (one object per guidance number — see the GUIDANCE EXTRACTION block in\n"
+    "    the system prompt for the exact contract).  Omit when the filing has\n"
+    "    no quantitative guidance.  This is NEVER reported-period data: guidance\n"
+    "    numbers are the FUTURE-period figures from the outlook section only.\n"
     "  - Each concept's value, keyed by the EXACT bracketed key copied from the\n"
     "    concept list (never invent or alter a taxonomy key)\n"
     'Negative amounts ("(1,234)" in the filing) must carry the minus sign: -1234.\n'
@@ -226,6 +233,137 @@ FINALIZE_DESCRIPTION = (
     '\"__company_mismatch__\": true and return NO metric values.\n'
     "OMIT any concept you cannot find."
 )
+
+
+GUIDANCE_CONTRACT_BLOCK = """\
+GUIDANCE EXTRACTION (PHASE 3) — OVERRIDES the "Forward-looking guidance, outlook,
+or forecast tables" ignore rule above.  You are required to extract guidance now.
+
+After the income statement AND the segment results are done, extract the
+company's GUIDANCE / OUTLOOK / FORECAST numbers.  Guidance is what the company
+EXPECTS for FUTURE periods ("we expect revenue of $108.0 billion, plus or minus
+2%", "Q3 fiscal 2027 net revenue is expected to be approximately $18.5 billion").
+It is NEVER the reported-period actuals you already extracted.
+
+WORKFLOW
+  1. search("guidance") / search("outlook") / search("expect") / search("forecast")
+     — or use the section map's guidance range if present.  The outlook block is
+     usually the LAST section of the press release ("Outlook", "Q4 Fiscal 2027
+     Outlook", "Business Outlook", "CFO Outlook Commentary") — often a
+     COMMENTARY PARAGRAPH in mixed units ("in the range of $61-64 billion",
+     "between 15-17%"), not a table.  If search() finds nothing, call
+     find_sections("guidance") for the section map's outlook range.
+  2. read_lines() that section ONCE and extract EVERY quantitative guidance
+     number (revenue, EPS, gross margin, operating expense, capex, cash flow,
+     tax rate, ...).  Include non-GAAP basis guidance (e.g. "adjusted EPS" /
+     "non-GAAP EPS") — basis is a FIELD, not a reason to skip.
+  3. Report them in finalize_extraction under the key "__guidance__" — a JSON
+     LIST, one object per guidance number:
+
+{"metric": "revenue", "standard_label": "Total Revenues", "statement_type": "income",
+ "basis": "gaap", "form": "plus_minus_pct",
+ "value": 108.0, "plus_minus": 2, "plus_minus_unit": "percent",
+ "period": {"fiscal_year": 2027, "quarter": 3, "period_type": "quarterly"},
+ "unit": "USD", "scale": "billions", "currency": "USD",
+ "as_printed": "Revenue is expected to be approximately $108.0 billion, plus or minus 2%",
+ "condition": "excluding Data Center revenue from China",
+ "lines": [842, 856]}
+
+CONTRACT RULES
+  • metric — guidance is for ANY quantitative forward-looking metric the
+    company guides, not just revenue.  Extract EVERY number in the outlook
+    section:
+      - P&L: revenue, EPS (GAAP eps_diluted and non-GAAP eps_adjusted),
+        gross profit / gross margin, operating income, operating margin,
+        EBITDA / adjusted EBITDA / adjusted EBIT, net income, net margin
+      - Costs: total operating expense, R&D, sales & marketing, G&A,
+        cost of revenue, interest expense
+      - Cash flow / balance sheet: capex, free cash flow, cash flow from
+        operations, inventory, share count / dilution, dividends / buybacks
+      - Operating: units / deliveries / shipments, ARR, customers,
+        headcount, tax rate, revenue growth, FX impact
+    Pick the closest CURATED name from: revenue, eps_diluted, eps_basic,
+    eps_adjusted, operating_income, net_income, gross_profit, gross_margin,
+    operating_margin, net_margin, ebit, ebitda, adjusted_ebitda,
+    adjusted_ebit, operating_expense, research_development, sales_marketing,
+    capex, free_cash_flow, cash_flow_from_operations, tax_rate,
+    revenue_growth, dividend, share_count.  For anything else use a SHORT
+    free-text metric name (never a taxonomy key) — custom metrics are stored
+    as-is and still scored when an actual exists.  NEVER skip a guided metric
+    because it is not on the list.
+  • EPS guidance — per-share numbers are AS-IS: value 4.85 (not 4,850,000),
+    scale "as-is", unit "USD".  A range ("$4.70 to $4.90") → form="range",
+    value=midpoint, value_low/value_high.  "Adjusted" / "non-GAAP" EPS →
+    metric eps_adjusted, basis non_gaap.
+  • standard_label — the EXISTING mapping vocabulary when it exists: "Total
+    Revenues", "Earnings Per Share, Diluted", "Operating Income (Loss)",
+    "Net Income (Loss)", "Capital Expenditure", "Gross Profit"; otherwise
+    omit it (the metric name is stored as-is).
+  • concept (optional but encouraged) — if the guided metric maps to a row
+    you already extracted from this company's financial statements, include
+    that row's concept name (e.g. "us-gaap:Revenues",
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax").  When
+    omitted, the pipeline resolves it deterministically from standard_label
+    via the same mapping vocabulary — never leave it blank when you know it.
+  • statement_type — "income" (default), "cashflow", "balancesheet", or custom.
+  • basis — "gaap" (default), "non_gaap", "both", "not_applicable".
+  • form — how the number is stated: "point", "range", "min" ("at least"),
+    "max" ("up to"), "plus_minus_pct" (value ± %), "plus_minus_abs"
+    (value ± absolute), "approximate" ("approximately $X"),
+    "percentage_growth", "qualitative" (no number — e.g. "flat sequentially",
+    "modest growth"), or "custom".
+  • value — the point, or for range/± the MIDPOINT; value_low / value_high —
+    the band when given.  For min: value only.  For max: value only.  For
+    plus_minus: value + plus_minus (+ plus_minus_unit "percent" or
+    "absolute").  Growth percentages are % (not 0.10).  OMIT value for
+    qualitative guidance but still report it with as_printed.
+  • period — THE FUTURE PERIOD COVERED, read from the filing's own header
+    when printed ("Q3 Fiscal 2027" → fiscal_year 2027, quarter 3,
+    period_type "quarterly"; "Fiscal 2027" → fiscal_year 2027, quarter null,
+    period_type "annual"; "for the full year" → annual).  If the header
+    lacks a year, derive it: the guidance is for the NEXT period AFTER this
+    filing's reported period (reported Q2 FY27 → guidance Q3 FY27; reported
+    Q3 FY27 → guidance Q4 FY27; reported Q4 FY26 (annual) → guidance Q1 FY27).
+    period_type: "quarterly" | "annual" | "multi_year" | "ytd" |
+    "current_quarter" | custom.
+    The stored doc's TOP-LEVEL "period_type" field ("quarterly" |
+    "annual") is DERIVED automatically from this period — do not report
+    it separately, it is never accepted as raw input.
+  • unit — "USD" when monetary (currency defaults to USD); "percent" for
+    margins/growth; "shares" for share counts.  scale — "thousands",
+    "millions", "billions", or "as-is" for % and per-share.
+    The pipeline converts monetary guidance to RAW units before saving (value
+    108.0 with scale "billions" is stored as 108,000,000,000 — the same unit
+    concept_values_* stores actuals, so beat/miss scoring is exact).  You
+    STILL report the number as printed with its scale — never pre-multiply
+    and never report raw magnitudes yourself.
+  • as_printed — the EXACT quote from the filing (one sentence max).
+  • condition — any explicit caveat attached to the number ("excluding",
+    "subject to", "assuming") — omit if none.
+  • lines — [start, end] of the line range you read the guidance from.
+  • event_type (optional) — "initial" (default), "raised", "lowered",
+    "reaffirmed", "narrowed", "widened", "updated" — only when the
+    filing text says so.
+  • NEVER invent guidance numbers, NEVER convert non-USD guidance to USD, and
+    NEVER include the reported-quarter figures that appear inside an outlook
+    table as comparable columns — only the FUTURE-period figures.
+
+FINALIZE CHECKLIST — READ BEFORE CALLING finalize_extraction():
+  ☐ You searched for the guidance/outlook section (search hits on "guidance",
+    "outlook", "expect", "forecast", "anticipate").
+  ☐ If the filing contains ANY quantitative forward-looking figure, the
+    "__guidance__" list in finalize_extraction is POPULATED (range numbers
+    like "$61-64 billion" become form="range", value=midpoint, value_low/
+    value_high = the band).
+  ☐ If the filing has NO guidance section at all, set "__guidance__": [] in
+    the finalize JSON (an explicit empty list — do not omit the key silently
+    when you searched and found nothing).
+  ☐ Missing guidance is the #1 extraction failure — double-check the last
+    section of the release (after the financial tables) before finalizing.
+"""
+
+
+GUIDANCE_PHASE_NOTICE = """\n\nPHASE 3 — GUIDANCE/OUTLOOK (MANDATORY, before finalize_extraction):\nAfter the income-statement and segment extraction above, locate the\nGUIDANCE / OUTLOOK / FORECAST section (search(\"guidance\") / search(\"outlook\")\nor the section map's guidance range), read it, and extract every FUTURE-period\nguidance number into the \"__guidance__\" list (contract in the system prompt).\nThen call finalize_extraction() ONCE with the income-statement keys, the\nsegment keys, and \"__guidance__\" together.\n"""
 
 
 def build_concept_list(
