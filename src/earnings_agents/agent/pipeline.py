@@ -20,6 +20,7 @@ from earnings_agents.agent.derive import (
     build_calc_derivation_block,
     build_extraction_summary,
     build_no_scale_keys,
+    extract_financial_statements_section,
     extract_is_section,
     map_concepts,
     semantically_map_unmapped_metrics,
@@ -221,7 +222,11 @@ def _run_extraction_pass(
 
     dollar_multiplier = SCALE_MULTIPLIERS.get(doc_scale, 1) if doc_scale else 1
 
-    # Pre-read the income-statement exhibit so the agent gets the full table
+    from earnings_agents.config import TARGET_STATEMENTS
+    target_statements = state.get("target_statements") or TARGET_STATEMENTS
+    is_multi_statement = any(s in target_statements for s in ("balancesheet", "cashflow"))
+
+    # Pre-read the primary financial statement exhibit so the agent gets the table(s)
     # upfront — eliminates 5+ read_lines navigation calls.
     is_exhibit_text: str | None = None
     is_exhibit_label: str = ""
@@ -236,22 +241,34 @@ def _run_extraction_pass(
                 le = doc.get("line_end")
                 if ls and le:
                     exhibit_full = "\n".join(lines[ls - 1 : le])
-                    # Extract just the IS section (~10-15K chars) to keep
-                    # LLM context small.  Fall back to full exhibit if the
-                    # IS section can't be isolated.
-                    is_section = extract_is_section(exhibit_full)
-                    if is_section:
-                        is_exhibit_text = is_section
-                        report_call(
-                            f"  [prescan]  IS section extracted — {len(is_section):,} chars "
-                            f"(from {len(exhibit_full):,} exhibit)"
-                        )
+                    if is_multi_statement:
+                        fs_section = extract_financial_statements_section(exhibit_full)
+                        if fs_section:
+                            is_exhibit_text = fs_section
+                            report_call(
+                                f"  [prescan]  financial statements section extracted — {len(fs_section):,} chars "
+                                f"(from {len(exhibit_full):,} exhibit)"
+                            )
+                        else:
+                            is_exhibit_text = exhibit_full
+                            report_call(
+                                f"  [prescan]  financial statements section not isolated — using full exhibit "
+                                f"({len(exhibit_full):,} chars)"
+                            )
                     else:
-                        is_exhibit_text = exhibit_full
-                        report_call(
-                            f"  [prescan]  IS section not found — using full exhibit "
-                            f"({len(exhibit_full):,} chars)"
-                        )
+                        is_section = extract_is_section(exhibit_full)
+                        if is_section:
+                            is_exhibit_text = is_section
+                            report_call(
+                                f"  [prescan]  IS section extracted — {len(is_section):,} chars "
+                                f"(from {len(exhibit_full):,} exhibit)"
+                            )
+                        else:
+                            is_exhibit_text = exhibit_full
+                            report_call(
+                                f"  [prescan]  IS section not found — using full exhibit "
+                                f"({len(exhibit_full):,} chars)"
+                            )
                     is_exhibit_label = exhibit
                     break
 
@@ -422,40 +439,71 @@ def _run_extraction_pass(
         tools.append(t)
 
     if is_exhibit_text:
-        # Pre-injected income statement exhibit — agent extracts directly
+        # Pre-injected exhibit text — agent extracts directly
         # instead of navigating with read_lines.
         is_section_size = len(is_exhibit_text)
-        is_full_exhibit = is_section_size > 20_000
         is_line_start = is_hints[0]["lines"][0] if is_hints else 1
         is_line_end = is_hints[0]["lines"][1] if is_hints else n_lines
-        initial_msg = (
-            f"This is a {len(plain_text):,}-character earnings document "
-            f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
-            f"COMPANY: {state['company_name']} ({ticker})\n\n"
-            f"INCOME STATEMENT ({is_exhibit_label}) — LINES {is_line_start}-{is_line_end}:\n"
-            f"The income statement text is provided below ({is_section_size:,} chars).\n\n"
-            f"--- BEGIN {is_exhibit_label} ---\n"
-            f"{is_exhibit_text}\n"
-            f"--- END {is_exhibit_label} ---\n\n"
-            f"TWO-PHASE EXTRACTION:\n\n"
-            f"PHASE 1 — Extract from the text above (NO search/read_lines needed):\n"
-            f"  1. Call detect_scale() and detect_currency() on lines "
-            f"{is_line_start}-{is_line_end} to confirm units.\n"
-            f"  2. Extract ALL income-statement concepts (Revenue, Operating Income, "
-            f"Net Income, EPS, etc.) directly from the text above.\n"
-            f"  3. Reconcile with calculate(), verify with verify_identity().\n\n"
-            f"PHASE 2 — Search for dimensional/segment data NOT in the text above:\n"
-            f"  4. After extracting all IS concepts, use search() to find segment "
-            f"breakdowns, geographic revenue, product-line data, or other "
-            f"dimensional concepts that may be in OTHER exhibits or sections.\n"
-            f"  5. Extract any additional dimensional concepts you find.\n\n"
-            f"  6. Call finalize_extraction().\n\n"
-            f"DO NOT call get_document_info() or get_company_info() — you already "
-            f"have the document structure and company name above.\n\n"
-            f"MEMORY: When calling remember_* tools, base your notes on the "
-            f"values and labels you already extracted — do NOT re-read or "
-            f"re-search the exhibit text."
-        )
+        if is_multi_statement:
+            target_desc = ", ".join(target_statements)
+            initial_msg = (
+                f"This is a {len(plain_text):,}-character earnings document "
+                f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
+                f"COMPANY: {state['company_name']} ({ticker})\n\n"
+                f"FINANCIAL STATEMENTS ({is_exhibit_label}) — LINES {is_line_start}-{is_line_end}:\n"
+                f"The financial statements text is provided below ({is_section_size:,} chars):\n\n"
+                f"--- BEGIN {is_exhibit_label} ---\n"
+                f"{is_exhibit_text}\n"
+                f"--- END {is_exhibit_label} ---\n\n"
+                f"MULTI-STATEMENT EXTRACTION:\n\n"
+                f"PHASE 1 — Extract from the text above:\n"
+                f"  1. Call detect_scale() and detect_currency() on lines "
+                f"{is_line_start}-{is_line_end} to confirm units.\n"
+                f"  2. Extract ALL target statement concepts ({target_desc}) directly from the "
+                f"tables above (Income Statement, Balance Sheet, Cash Flow Statement).\n"
+                f"  3. Reconcile with calculate(), verify equations:\n"
+                f"     - Income Statement: verify_identity(revenue, cost_of_revenue, gross_profit)\n"
+                f"     - Balance Sheet: verify_balance_sheet_identity(total_assets, total_liabilities, total_equity)\n"
+                f"     - Cash Flow: verify_cash_flow_identity(operating_cf, investing_cf, financing_cf, net_change)\n\n"
+                f"PHASE 2 — Search for missing statements or dimensional/segment data:\n"
+                f"  4. If any target statement (e.g. Cash Flow, Balance Sheet) or segment breakdown "
+                f"is NOT in the text above, use search() and read_lines() across OTHER exhibits to find it.\n"
+                f"  5. Extract all remaining concepts from those tables.\n\n"
+                f"  6. Call finalize_extraction().\n\n"
+                f"DO NOT call get_company_info() — you already have the company name above.\n\n"
+                f"MEMORY: When calling remember_* tools, base your notes on the "
+                f"values and labels you already extracted — do NOT re-read or "
+                f"re-search the exhibit text."
+            )
+        else:
+            initial_msg = (
+                f"This is a {len(plain_text):,}-character earnings document "
+                f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
+                f"COMPANY: {state['company_name']} ({ticker})\n\n"
+                f"INCOME STATEMENT ({is_exhibit_label}) — LINES {is_line_start}-{is_line_end}:\n"
+                f"The income statement text is provided below ({is_section_size:,} chars).\n\n"
+                f"--- BEGIN {is_exhibit_label} ---\n"
+                f"{is_exhibit_text}\n"
+                f"--- END {is_exhibit_label} ---\n\n"
+                f"TWO-PHASE EXTRACTION:\n\n"
+                f"PHASE 1 — Extract from the text above (NO search/read_lines needed):\n"
+                f"  1. Call detect_scale() and detect_currency() on lines "
+                f"{is_line_start}-{is_line_end} to confirm units.\n"
+                f"  2. Extract ALL income-statement concepts (Revenue, Operating Income, "
+                f"Net Income, EPS, etc.) directly from the text above.\n"
+                f"  3. Reconcile with calculate(), verify with verify_identity().\n\n"
+                f"PHASE 2 — Search for dimensional/segment data NOT in the text above:\n"
+                f"  4. After extracting all IS concepts, use search() to find segment "
+                f"breakdowns, geographic revenue, product-line data, or other "
+                f"dimensional concepts that may be in OTHER exhibits or sections.\n"
+                f"  5. Extract any additional dimensional concepts you find.\n\n"
+                f"  6. Call finalize_extraction().\n\n"
+                f"DO NOT call get_document_info() or get_company_info() — you already "
+                f"have the document structure and company name above.\n\n"
+                f"MEMORY: When calling remember_* tools, base your notes on the "
+                f"values and labels you already extracted — do NOT re-read or "
+                f"re-search the exhibit text."
+            )
     elif prebuilt_sections and prebuilt_sections.get("sections"):
         map_text = format_section_index(prebuilt_sections)
         initial_msg = (
@@ -730,6 +778,7 @@ def _run_extraction_pass(
         ev_currency = str(ev.get("currency") or "").strip().upper()
         value_currency = ev_currency or currency_value
         value_metadata_by_id[cid] = {
+            "statement_type": c.get("statement_type") or "income",
             "dimension": bool(c.get("dimension")),
             "dimension_concept": bool(c.get("dimension_concept")),
             "dimension_member": c.get("dimension_member") or "",

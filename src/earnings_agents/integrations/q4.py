@@ -101,13 +101,22 @@ _POINT_IN_TIME_PATTERNS = [
 ]
 
 
-def _is_point_in_time_concept(concept_name: str, label: str = "") -> bool:
-    """True when *concept_name*/*label* matches a point-in-time pattern.
+def _is_point_in_time_concept(
+    concept_name: str,
+    label: str = "",
+    statement_type: str = "income",
+) -> bool:
+    """True when *concept_name*/*label* matches a point-in-time pattern or statement type.
 
-    Point-in-time concepts represent snapshots at specific dates (like cash
-    balances) rather than flows over a period, so Q4 = Annual − (Q1+Q2+Q3)
-    doesn't apply — Q4 = Annual.
+    - All Balance Sheet items are point-in-time snapshots as of the period end date
+      (Assets, Liabilities, Equity ending balances). Therefore Q4 = Annual.
+    - Cash Flow ending/beginning balances and period markers are point-in-time.
+    - Shares outstanding and per-share average figures are point-in-time.
+    - Other Income Statement and Cash Flow operating/investing/financing metrics are flows.
     """
+    if statement_type == "balancesheet":
+        return True
+
     concept_lower = concept_name.lower()
     label_lower = label.lower()
     for pattern in _POINT_IN_TIME_PATTERNS:
@@ -361,7 +370,8 @@ def calculate_q4_for_period(
     period: DetectedPeriod,
     annual_concept_ids: list[str],
     *,
-    statement_type: str = "income",
+    statement_type: str | None = "income",
+    target_statements: list[str] | None = None,
     allow_incomplete: bool = False,
     recalculate: bool = False,
 ) -> dict[str, Any]:
@@ -392,12 +402,13 @@ def calculate_q4_for_period(
 
     summary: dict[str, Any] = {
         "status": "completed",
-        "statement_type": statement_type,
+        "statement_type": statement_type or "all",
         "fiscal_year": fiscal_year,
         "recalculated": recalculate,
         "processed": 0,
         "calculated": 0,      # flow concepts — Q4 = Annual − (Q1+Q2+Q3)
         "point_in_time": 0,   # point-in-time concepts — Q4 = Annual
+        "by_statement": {},
         "skipped": 0,
         "skipped_reasons": {},
         "errors": [],
@@ -417,7 +428,16 @@ def calculate_q4_for_period(
             _bump_skip(summary, "annual concept not found")
             continue
 
-        q_concept = _find_quarterly_concept(db, annual_concept, cik, statement_type)
+        stmt = (annual_concept.get("statement_type") or statement_type or "income").strip().lower()
+
+        # If target_statements is given, filter concepts
+        if target_statements and stmt not in target_statements:
+            continue
+        # If statement_type is given (and target_statements is not), filter by that statement_type
+        if statement_type and not target_statements and stmt != statement_type:
+            continue
+
+        q_concept = _find_quarterly_concept(db, annual_concept, cik, stmt)
         if not q_concept:
             summary["skipped"] += 1
             _bump_skip(summary, "no matching quarterly concept")
@@ -428,7 +448,7 @@ def calculate_q4_for_period(
             {
                 "concept_id": annual_oid,
                 "cik": cik,
-                "statement_type": statement_type,
+                "statement_type": stmt,
                 "reporting_period.fiscal_year": fiscal_year,
             }
         )
@@ -437,16 +457,16 @@ def calculate_q4_for_period(
             _bump_skip(summary, "no annual value")
             continue
 
-        if not recalculate and _q4_exists(db, q_oid, cik, fiscal_year, statement_type):
+        if not recalculate and _q4_exists(db, q_oid, cik, fiscal_year, stmt):
             summary["skipped"] += 1
             _bump_skip(summary, "Q4 already exists")
             continue
 
-        q_rows = _load_q_values(db, q_oid, cik, fiscal_year, statement_type)
+        q_rows = _load_q_values(db, q_oid, cik, fiscal_year, stmt)
         annual_value = annual_value_row["value"]
         concept_name = annual_concept.get("concept") or ""
         label = _clean_label(annual_concept.get("label") or "")[0]
-        is_point_in_time = _is_point_in_time_concept(concept_name, label)
+        is_point_in_time = _is_point_in_time_concept(concept_name, label, statement_type=stmt)
 
         if is_point_in_time:
             q4_value = annual_value
@@ -474,7 +494,7 @@ def calculate_q4_for_period(
             doc = _build_q4_doc(
                 cik=cik,
                 q_oid=q_oid,
-                statement_type=statement_type,
+                statement_type=stmt,
                 fiscal_year=fiscal_year,
                 q4_value=q4_value,
                 annual_value_row=annual_value_row,
@@ -505,10 +525,13 @@ def calculate_q4_for_period(
             continue
 
         summary["processed"] += 1
+        summary["by_statement"].setdefault(stmt, {"calculated": 0, "point_in_time": 0})
         if is_point_in_time:
             summary["point_in_time"] += 1
+            summary["by_statement"][stmt]["point_in_time"] += 1
         else:
             summary["calculated"] += 1
+            summary["by_statement"][stmt]["calculated"] += 1
 
     logger.info(
         "calculate_q4_for_period: CIK %s FY%d (%s) — %d flow + %d point-in-time "

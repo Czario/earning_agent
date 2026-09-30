@@ -125,10 +125,12 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     # Recent history is a prioritization signal, not an eligibility filter:
     # new segments, breakdowns, and newly disclosed rows must remain
     # extractable even when they had no stored value in the recent window.
+    target_statements: list[str] = state.get("target_statements") or ["income"]
+    stmt_desc = ", ".join(target_statements)
     try:
         concepts = get_statement_concepts(
             cik,
-            statement_types=["income"],
+            statement_types=target_statements,
             period=period,
         )
     except Exception as exc:  # noqa: BLE001
@@ -143,7 +145,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if not concepts:
         return _skip(
-            f"No income-statement concepts stored for {ticker} in normalize_data "
+            f"No concepts stored for {ticker} ({stmt_desc}) in normalize_data "
             f"— we can't proceed.",
             cik=cik,
             fiscal_year_end_month=fy_end_month,
@@ -167,7 +169,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if not concepts:
         return _skip(
-            f"No usable income-statement concepts for {ticker} in "
+            f"No usable concepts for {ticker} ({stmt_desc}) in "
             "normalize_data (all rows malformed) — we can't proceed.",
             cik=cik,
             fiscal_year_end_month=fy_end_month,
@@ -178,7 +180,10 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     # ── 2. Recent-value window → prioritization (best-effort) ─────────────
     try:
         recent = get_recently_valued_concept_ids(
-            cik, period=period, n_periods=PROMPT_HISTORY_PERIODS
+            cik,
+            period=period,
+            n_periods=PROMPT_HISTORY_PERIODS,
+            statement_types=target_statements,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -208,7 +213,7 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
 
     if not target:
         return _skip(
-            f"No eligible income-statement concepts for {ticker} — nothing to extract.",
+            f"No eligible concepts for {ticker} ({stmt_desc}) — nothing to extract.",
             cik=cik,
             fiscal_year_end_month=fy_end_month,
             fiscal_year_end_code=company.get("fiscal_year_end_code"),
@@ -219,14 +224,14 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     n_recent = sum(1 for c in target if c["_id"] in recent)
     n_discovery = len(target) - n_recent
     report_call(
-        f"  [load concepts]  loaded {len(target)}/{len(concepts)} income-statement "
-        f"concept(s) ({period_type}) — {n_recent} recent + {n_discovery} discovery "
+        f"  [load concepts]  loaded {len(target)}/{len(concepts)} "
+        f"concept(s) ({period_type}) [{stmt_desc}] — {n_recent} recent + {n_discovery} discovery "
         f"(new segments/breakdowns + system/calculated)"
     )
     logger.info(
-        "load_company_concepts: targeted %d of %d income-statement concept(s) for %s "
-        "(CIK %s, %s; %d recent, %d discovery)",
-        len(target), len(concepts), ticker, cik, period_type, n_recent, n_discovery,
+        "load_company_concepts: targeted %d of %d concept(s) for %s "
+        "(CIK %s, %s; %d recent, %d discovery across %s)",
+        len(target), len(concepts), ticker, cik, period_type, n_recent, n_discovery, stmt_desc,
     )
 
     return {

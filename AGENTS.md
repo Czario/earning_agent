@@ -17,8 +17,9 @@ atomic period replace, strict save gate) keep it accurate.
 ```bash
 uv sync                                  # install deps
 uv sync --extra dev                      # + pytest (test suite)
-uv run pytest tests/ -q                  # run the test suite (189 tests)
-uv run earnings --ticker MSFT            # CLI run (SEC EDGAR path)
+uv run pytest tests/ -q                  # run the test suite (250 tests)
+uv run earnings --ticker MSFT            # CLI run (extracts income, balancesheet, cashflow by default)
+uv run earnings --ticker MSFT -s income  # extract specific statement(s) (income, balancesheet, cashflow)
 uv run earnings --ticker MSFT --dry-run  # connectivity check, no LLM
 uv run earnings --ticker MSFT -v         # DEBUG logging
 uv run earnings-failures                 # browse degraded/failed runs (raw mongo)

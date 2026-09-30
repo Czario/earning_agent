@@ -42,6 +42,7 @@ from earnings_agents.config import (  # noqa: E402
     MONGODB_URI,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
+    TARGET_STATEMENTS,
 )
 from earnings_agents.nodes.detect import detect_document_type_node  # noqa: E402
 from earnings_agents.graph import build_graph  # noqa: E402
@@ -303,6 +304,7 @@ def _build_8k_state(
     accession: str | None = None,
     printer=print,
     dry_run: bool = False,
+    target_statements: list[str] | None = None,
 ) -> dict:
     """Build the initial state for an 8-K pipeline run — shared by CLI and worker.
 
@@ -338,6 +340,7 @@ def _build_8k_state(
         "metrics": None,
         "error": None,
         "exhibit_meta": [],
+        "target_statements": target_statements if target_statements is not None else TARGET_STATEMENTS,
     }
 
     # ── Resolve filing URL, accession, and exhibit list ───────────────────
@@ -424,6 +427,7 @@ def _build_initial_state(
     local_filing_path: str | None = None,
     supplemental_urls: list[str] | None = None,
     accession: str | None = None,
+    target_statements: list[str] | None = None,
 ) -> dict:
     """Build the LangGraph initial state for one company (CLI path).
 
@@ -442,16 +446,23 @@ def _build_initial_state(
         accession=accession,
         printer=printer,
         dry_run=dry_run,
+        target_statements=target_statements,
     )
 
 
-def _run_company(graph, info: dict, printer=print) -> dict:
+def _run_company(
+    graph,
+    info: dict,
+    printer=print,
+    *,
+    target_statements: list[str] | None = None,
+) -> dict:
     label = f"{info['company_name']} ({info.get('ticker') or info['cik']})"
     printer(f"\n{SEP}")
     printer(f"  Company : {label}")
     printer(f"  CIK     : {info['cik']}")
 
-    state = _build_initial_state(info, printer=printer)
+    state = _build_initial_state(info, printer=printer, target_statements=target_statements)
 
     if state["status"] == "failed":
         printer(f"  [SKIP]  {state['error']}")
@@ -488,6 +499,8 @@ def _run_company(graph, info: dict, printer=print) -> dict:
 def _dry_run_company(
     info: dict,
     printer=print,
+    *,
+    target_statements: list[str] | None = None,
 ) -> dict:
     """Resolve URLs and check service connectivity without running the LLM or saving.
 
@@ -499,7 +512,12 @@ def _dry_run_company(
     printer(f"  DRY-RUN : {label}")
     printer(f"  CIK     : {info['cik']}")
 
-    state = _build_initial_state(info, printer=printer, dry_run=True)
+    state = _build_initial_state(
+        info,
+        printer=printer,
+        dry_run=True,
+        target_statements=target_statements,
+    )
 
     llm_ok, llm_detail = _check_llm()
     mongo_ok, mongo_detail = _check_mongodb()
@@ -564,7 +582,11 @@ def _is_already_saved(ticker: str) -> bool:
 
 def _run_company_parallel(args: tuple) -> dict:
     """Thread worker: run one company and update the shared rich Progress."""
-    graph, info, skip_existing, progress, overall_task = args
+    if len(args) >= 6:
+        graph, info, skip_existing, progress, overall_task, target_statements = args[:6]
+    else:
+        graph, info, skip_existing, progress, overall_task = args
+        target_statements = None
     ticker = info.get("ticker", "")
     name = ticker or info.get("company_name", "?")
     label = f"[cyan]{name}[/]"
@@ -701,7 +723,7 @@ def _run_company_parallel(args: tuple) -> dict:
     set_detail_callback(_detail_cb)
     from earnings_agents.hooks import set_call_callback
     set_call_callback(_call_cb)
-    result = _run_company(graph, info, printer=lambda _: None)
+    result = _run_company(graph, info, printer=lambda _: None, target_statements=target_statements)
     set_node_callback(None)
     set_detail_callback(None)
     set_call_callback(None)
@@ -721,7 +743,11 @@ def _run_company_parallel(args: tuple) -> dict:
 
 def _dry_run_company_parallel(args: tuple) -> dict:
     """Thread worker: dry-run one company and update the shared rich Progress."""
-    info, skip_existing, progress, overall_task = args
+    if len(args) >= 5:
+        info, skip_existing, progress, overall_task, target_statements = args[:5]
+    else:
+        info, skip_existing, progress, overall_task = args
+        target_statements = None
     ticker = info.get("ticker", "")
     name = ticker or info.get("company_name", "?")
     label = f"[cyan]{name}[/]"
@@ -731,7 +757,7 @@ def _dry_run_company_parallel(args: tuple) -> dict:
         return {"_dry_run_verdict": "ready", "status": "skipped", "ticker": ticker}
 
     company_task = progress.add_task(f"{label}  checking\u2026", total=None)
-    result = _dry_run_company(info, printer=lambda _: None)
+    result = _dry_run_company(info, printer=lambda _: None, target_statements=target_statements)
     verdict = result.get("_dry_run_verdict", "?")
     color = {"ready": "green", "warning": "yellow", "blocked": "red"}.get(verdict, "white")
     verdict_label = verdict
@@ -803,10 +829,26 @@ def main() -> None:
 "Save the document to MongoDB even when high-severity findings are unresolved."
         ),
     )
+    parser.add_argument(
+        "-s",
+        "--statements",
+        metavar="STATEMENTS",
+        default=None,
+        help=(
+            "Comma-separated list of financial statements to extract "
+            "(e.g. 'income,balancesheet,cashflow'). Defaults to TARGET_STATEMENTS config."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.cik and not args.ticker:
         parser.error("Provide at least one --cik or --ticker argument.")
+
+    target_statements: list[str] = (
+        [s.strip().lower() for s in args.statements.split(",") if s.strip()]
+        if args.statements
+        else TARGET_STATEMENTS
+    )
 
     if args.allow_inconsistent:
         # Flip the REAL config knob — save.py reads it lazily from the config
@@ -860,13 +902,14 @@ def main() -> None:
     else:
         llm_label = f"ollama:{OLLAMA_MODEL}"
     _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")
+    _progress.console.print(f"[bold cyan]Statements[/] : {', '.join(target_statements)}")
 
     if args.dry_run:
         total = len(companies)
         with _progress as progress:
             overall_task = progress.add_task("[bold]Dry-run[/]", total=total)
             worker_args = [
-                (c, args.skip_existing, progress, overall_task)
+                (c, args.skip_existing, progress, overall_task, target_statements)
                 for c in companies
             ]
             results = []
@@ -899,7 +942,7 @@ def main() -> None:
     with _progress as progress:
         overall_task = progress.add_task("[bold]Companies[/]", total=total)
         worker_args = [
-            (graph, c, args.skip_existing, progress, overall_task)
+            (graph, c, args.skip_existing, progress, overall_task, target_statements)
             for c in companies
         ]
         results = []

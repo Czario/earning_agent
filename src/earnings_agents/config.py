@@ -55,6 +55,15 @@ HTTP_TIMEOUT: int = 30
 
 EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "400000"))
 
+# Target financial statements to extract (comma-separated, e.g. "income,balancesheet,cashflow").
+# Defaults to extracting income statement, balance sheet, and cash flow statement.
+TARGET_STATEMENTS_RAW: str = os.getenv(
+    "TARGET_STATEMENTS", "income,balancesheet,cashflow"
+)
+TARGET_STATEMENTS: list[str] = [
+    s.strip().lower() for s in TARGET_STATEMENTS_RAW.split(",") if s.strip()
+] or ["income"]
+
 # Multi-exhibit fetching — filings can carry several EX-99 exhibits (press
 # release, presentation, supplemental information); the income statement often
 # lives in a supplemental exhibit (e.g. BofA's 99.3).  fetch_filing concatenates

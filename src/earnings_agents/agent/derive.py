@@ -272,6 +272,71 @@ def extract_is_section(exhibit_text: str, max_chars: int = 15_000) -> str | None
     return section
 
 
+_FS_START_PATTERNS = [
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+operations", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statement\s+of\s+operations", re.I),
+    re.compile(r"statements?\s+of\s+operations\s+and\s+comprehensive", re.I),
+    re.compile(r"(?:condensed\s+)?(?:consolidated\s+)?income\s+statement", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+earnings", re.I),
+    re.compile(r"statements?\s+of\s+income", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+comprehensive", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+(?:balance\s+sheets?|statements?\s+of\s+financial\s+position)", re.I),
+    re.compile(r"(?:condensed\s+)?consolidated\s+statements?\s+of\s+cash\s+flows", re.I),
+]
+
+_FS_STOP_PATTERNS = [
+    re.compile(r"notes\s+to\s+(?:the\s+)?(?:condensed\s+)?(?:consolidated\s+)?financial\s+statements", re.I),
+    re.compile(r"(?:unaudited\s+)?notes\s+to\s+financial\s+statements", re.I),
+    re.compile(r"independent\s+auditors?['']?\s+report", re.I),
+    re.compile(r"reconciliation\s+of\s+(?:non-gaap|gaap)", re.I),
+    re.compile(r"non-gaap\s+financial\s+measures", re.I),
+]
+
+
+def extract_financial_statements_section(exhibit_text: str, max_chars: int = 35_000) -> str | None:
+    """Extract financial statements section (Income Statement, Balance Sheet, Cash Flow) from exhibit text.
+
+    Scans for the first financial statement header and returns text through the end of the financial
+    statement tables (before footnotes/notes to financial statements or auditor reports).
+    """
+    lines = exhibit_text.split("\n")
+    fs_start: int | None = None
+    fs_stop: int | None = None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for pattern in _FS_START_PATTERNS:
+            if pattern.search(stripped):
+                fs_start = i
+                break
+        if fs_start is not None:
+            break
+
+    if fs_start is None:
+        return None
+
+    for i in range(fs_start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        for pattern in _FS_STOP_PATTERNS:
+            if pattern.search(stripped):
+                fs_stop = i
+                break
+        if fs_stop is not None:
+            break
+
+    if fs_stop is None:
+        fs_stop = len(lines)
+
+    section = "\n".join(lines[fs_start:fs_stop])
+    if len(section) > max_chars:
+        section = section[:max_chars] + "\n... (section continues)"
+    return section
+
+
 def build_extraction_summary(
     concept_metrics: dict | None,
     currency: str | None,
@@ -534,34 +599,36 @@ def _build_hierarchy(
     ambiguous and no parent under it receives children — deriving such a parent
     would otherwise cross-sum a child into every sibling.
     """
-    # Keep every row at a path.  ``order_key`` is part of the row identity;
-    # path alone is not unique in normalized XBRL data (geographic members,
-    # alternate concepts, and same-path statement rows are common).
-    nodes_by_path: dict[str, list[dict]] = {}
+    # Keep every row at a (statement_type, path). ``order_key`` is part of the row identity;
+    # path alone is not unique across statements (e.g. 001.001 in income vs balancesheet)
+    # or within statement XBRL data (geographic members, alternate concepts).
+    nodes_by_key: dict[tuple[str, str], list[dict]] = {}
     for c in target_concepts:
         p = (c.get("path") or "").strip()
+        stmt = (c.get("statement_type") or "income").strip().lower()
         if p:
-            nodes_by_path.setdefault(p, []).append(c)
+            nodes_by_key.setdefault((stmt, p), []).append(c)
 
     def _order_value(c: dict) -> tuple[int, str]:
         value = c.get("order_key")
         return (value is None, "" if value is None else str(value))
 
-    for nodes in nodes_by_path.values():
+    for nodes in nodes_by_key.values():
         nodes.sort(key=_order_value)
 
     parent_children: dict[str, list[str]] = {}
     ambiguous_paths: set[str] = set()
-    for parent_path, parent_nodes in nodes_by_path.items():
+    for (stmt, parent_path), parent_nodes in nodes_by_key.items():
         prefix = parent_path + "."
         parent_depth = parent_path.count(".")
         child_ids: list[str] = []
-        for child_path, child_nodes in nodes_by_path.items():
+        for (child_stmt, child_path), child_nodes in nodes_by_key.items():
             if (
-                child_path.startswith(prefix)
+                child_stmt == stmt
+                and child_path.startswith(prefix)
                 and child_path.count(".") == parent_depth + 1
             ):
-                # Preserve every child row, ordered by (path, order_key).
+                # Preserve every child row within the same statement, ordered by (path, order_key).
                 child_ids.extend(c["_id"] for c in child_nodes)
         if not child_ids:
             continue
@@ -603,10 +670,11 @@ def build_calc_derivation_block(
         label = c.get("label") or "?"
         key_str = f"[{key}]" if key else f'"{label}"'
         label_lower = label.lower()
+        stmt = (c.get("statement_type") or "income").strip().lower()
         is_margin_or_ratio = (
             "margin" in label_lower or "ratio" in label_lower or "%" in label_lower
         )
-        if "gross" in label_lower and "profit" in label_lower and not is_margin_or_ratio:
+        if stmt == "income" and "gross" in label_lower and "profit" in label_lower and not is_margin_or_ratio:
             lines.append(
                 f'  • {key_str} — "{label}"  ← COMPUTE: Gross Profit = '
                 "Revenue − |Cost of Revenue|.  Cost of Revenue is usually "
@@ -652,10 +720,20 @@ def load_prior_values(
         db = _get_client()[_NORMALIZE_DB]
         col_name = _values_collection(period)
 
+        statement_types = sorted(list({
+            (c.get("statement_type") or "income").strip().lower()
+            for c in target_concepts
+        }))
+        stmt_query: dict[str, Any] = (
+            {"statement_type": statement_types[0]}
+            if len(statement_types) == 1
+            else {"statement_type": {"$in": statement_types}}
+        )
+
         all_periods = sorted(
             db[col_name].distinct(
                 "reporting_period.end_date",
-                {"cik": cik, "statement_type": "income"},
+                {"cik": cik, **stmt_query},
             ),
             reverse=True,
         )
@@ -676,7 +754,7 @@ def load_prior_values(
 
         prior_vals = list(db[col_name].find({
             "cik": cik,
-            "statement_type": "income",
+            **stmt_query,
             "concept_id": {"$in": concept_ids},
             "reporting_period.end_date": prior_end,
         }))

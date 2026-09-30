@@ -372,6 +372,63 @@ def build_pi_tools(
                 f"Wrong column — re-read the income statement."
             )
 
+    @_lc_tool
+    def verify_balance_sheet_identity(
+        total_assets: float,
+        total_liabilities: float,
+        total_equity: float,
+    ) -> str:
+        """Verify that Total Assets = Total Liabilities + Total Equity.
+
+        Call after reading the Balance Sheet to confirm numbers match the
+        fundamental accounting equation (Assets = Liabilities + Equity).
+        """
+        rhs = total_liabilities + total_equity
+        diff = abs(total_assets - rhs)
+        pct = (diff / max(abs(total_assets), 1)) * 100
+        if pct < 1.0 or diff < 0.05:
+            return (
+                f"✓ VERIFIED: Total Assets ({total_assets:,.0f}) ≈ Liabilities "
+                f"({total_liabilities:,.0f}) + Equity ({total_equity:,.0f}) = {rhs:,.0f}. "
+                f"Balance Sheet is balanced."
+            )
+        else:
+            return (
+                f"✗ FAILED: Total Assets ({total_assets:,.0f}) != Liabilities "
+                f"({total_liabilities:,.0f}) + Equity ({total_equity:,.0f}) = {rhs:,.0f}. "
+                f"Difference: {diff:,.0f} ({pct:.2f}%). Check column selection, "
+                f"scale, or whether equity includes noncontrolling interests."
+            )
+
+    @_lc_tool
+    def verify_cash_flow_identity(
+        operating_cf: float,
+        investing_cf: float,
+        financing_cf: float,
+        net_change: float,
+    ) -> str:
+        """Verify that Net Change in Cash = Operating CF + Investing CF + Financing CF.
+
+        Call after reading the Statement of Cash Flows to verify that the
+        three section totals sum to the reported net change in cash.
+        """
+        expected = operating_cf + investing_cf + financing_cf
+        diff = abs(net_change - expected)
+        pct = (diff / max(abs(net_change), 1)) * 100 if net_change != 0 else 0.0
+        if pct < 1.0 or diff < 0.05:
+            return (
+                f"✓ VERIFIED: Operating ({operating_cf:,.0f}) + Investing ({investing_cf:,.0f}) "
+                f"+ Financing ({financing_cf:,.0f}) = {expected:,.0f} ≈ Net Change ({net_change:,.0f}). "
+                f"Cash flow section totals match net change."
+            )
+        else:
+            return (
+                f"✗ FAILED: Operating ({operating_cf:,.0f}) + Investing ({investing_cf:,.0f}) "
+                f"+ Financing ({financing_cf:,.0f}) = {expected:,.0f}, but reported Net Change "
+                f"= {net_change:,.0f}. Difference: {diff:,.0f} ({pct:.2f}%). "
+                f"Check signs (used in investing/financing) or foreign exchange effects."
+            )
+
     # ── 6. Calculator (for derived metrics) ─────────────────────────────
     def _safe_eval_expression(expression: str) -> str:
         """Evaluate a simple arithmetic expression via safe AST evaluation.
@@ -649,6 +706,8 @@ def build_pi_tools(
         read_lines,
         search,
         verify_identity,
+        verify_balance_sheet_identity,
+        verify_cash_flow_identity,
         calculate,
         get_company_info,
         detect_currency,

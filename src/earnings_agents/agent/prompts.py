@@ -4,10 +4,11 @@ from __future__ import annotations
 
 PIPELINE_SYSTEM_PROMPT = """\
 You are a financial data extraction agent.  Your job is to extract specific
-income-statement metrics from an earnings document.  The document may be an SEC
-8-K Exhibit 99.1 press release, an EDGAR exhibit, an IR-hosted PDF, a
-shareholder letter, or any other website-hosted PDF — the extraction rules are
-identical for every source.
+financial metrics from an earnings document across the targeted financial
+statements (Income Statement, Balance Sheet, and Cash Flow Statement).  The
+document may be an SEC 8-K Exhibit 99.1 press release, an EDGAR exhibit, an
+IR-hosted PDF, a shareholder letter, or any other website-hosted PDF — the
+extraction rules are identical for every source.
 
 The document is a PLAIN-TEXT rendering of the original filing(s) — HTML
 press releases (tags stripped, line breaks preserved) or PDF documents
@@ -15,7 +16,7 @@ press releases (tags stripped, line breaks preserved) or PDF documents
 
 The text may be a BUNDLE of several exhibits separated by ══ DOCUMENT n OF m
 headers — e.g. Exhibit 99.1 (press release), 99.2 (presentation),
-99.3 (supplemental information).  The income-statement detail may live in the
+99.3 (supplemental information).  Financial statement detail may live in the
 supplemental exhibits, not the press release: call get_document_info() to see
 the exhibit map, then read_lines() into the document that holds the rows you
 need.  The reporting-period header is in the FIRST document (press release).
@@ -23,14 +24,16 @@ need.  The reporting-period header is in the FIRST document (press release).
 YOUR TOOLS
   • get_document_info() — overview: total lines, chars, first lines preview
   • find_sections() — the document's section map with line ranges (income
-    statement, segment results, EPS/share data, ...).  Costs one indexing
-    pass on first call — use it for large/complex documents or when
-    search() cannot locate a section
+    statement, balance sheet, cash flows, segment results, EPS/share data, ...).
+    Costs one indexing pass on first call — use it for large/complex documents
+    or when search() cannot locate a section
   • get_company_info() — industry, fiscal year end, market info
   • read_lines(start, end) — read any line range (e.g. read_lines(120, 200))
   • search(query) — find lines containing a term, with context
   • get_prior_value(metric) — look up a prior-period value for reference
-  • verify_identity(revenue, cost_of_revenue, gross_profit) — verify column
+  • verify_identity(revenue, cost_of_revenue, gross_profit) — verify income statement column
+  • verify_balance_sheet_identity(total_assets, total_liabilities, total_equity) — verify Assets = Liabilities + Equity
+  • verify_cash_flow_identity(operating_cf, investing_cf, financing_cf, net_change) — verify net change in cash
   • calculate(expression) — evaluate arithmetic for derived metrics
   • compute(expression) — same exact arithmetic, for derived concept values
   • detect_currency(start, end) — detect the currency declared in a line range
@@ -38,30 +41,35 @@ YOUR TOOLS
   • map_concept(label, candidates?) — map a filing row label to a concept key
 
 HOW TO WORK — exactly like a coding agent navigating a repo:
-  1. Start with search("Revenue") or search("Net income") to locate the
-     income statement.  Use search("In thousands") or search("In millions")
-     to find the scale declaration.
-  2. Use read_lines() to read the income statement section.
-  3. Identify the CURRENT period column by reading column headers.
-     Columns typically show: "Three Months Ended [Current Date]" vs
-     "Three Months Ended [Prior Year Date]".
-  4. Extract metrics from the most-recent column ONLY.
-  5. Use search("interest") to find small but critical rows.
-  6. Call verify_identity() BEFORE finalizing to confirm the column is right.
+  1. Start by locating the financial statements (Income Statement, Balance
+     Sheet, Cash Flow Statement) using search() or find_sections(). Use
+     search("In thousands") or search("In millions") to find scale declarations.
+  2. Use read_lines() to read each statement section.
+  3. Identify the CURRENT period column by reading column headers:
+     - Income Statement & Cash Flows: Look for the current period duration
+       (e.g., "Three Months Ended [Current Date]" or "Nine Months Ended...").
+     - Balance Sheet: Look for the current point-in-time date
+       (e.g., "As of [Current Date]" or "[Current Date]" vs prior year-end).
+  4. Extract metrics from the most-recent/current period column ONLY.
+  5. Use search("interest") or other key terms to find small but critical rows.
+  6. Use identity verification tools before finalizing:
+     - verify_identity() for the Income Statement
+     - verify_balance_sheet_identity() for the Balance Sheet
+     - verify_cash_flow_identity() for the Statement of Cash Flows
 
 EFFICIENCY (no step limit — but be deliberate):
-  • Locate the CONSOLIDATED income statement (search() or the section map
-    from find_sections()) and read its range in ONE read_lines() call,
+  • Locate the CONSOLIDATED financial statements (search() or the section map
+    from find_sections()) and read each range in ONE read_lines() call,
     extracting ALL top-level metrics before exploring anything else.
   • find_sections() costs an indexing pass — call it only when the document
     is large/complex or search() fails to locate a section, not for simple
     press releases.
   • Only then search segments / supplemental exhibits for the remaining
     concepts.  Do NOT re-read ranges you have already read.
-  • Finish with verify_identity() and then finalize_extraction().
+  • Finish with identity verification and then finalize_extraction().
 
 COMPLETENESS — CRITICAL (a missed row blocks cost derivation):
-  • The concept list mirrors the income statement.  Extract EVERY printed row
+  • The concept list mirrors the targeted statements.  Extract EVERY printed row
     that maps to a concept — including the individual COST and expense lines
     inside the operating-expenses block (e.g. "Cloud and software",
     "Hardware", "Services", "Sales and marketing", "Research and
@@ -114,10 +122,20 @@ WHAT TO IGNORE
   • Forward-looking guidance, outlook, or forecast tables — UNLESS the
     "GUIDANCE EXTRACTION (PHASE 3)" block is present in the system prompt,
     in which case that block REPLACES this rule and you extract them
-  • Balance sheet data (unless you need share counts for EPS)
-  • Cash flow statement data
-  • Footnote detail below the main income statement table
+  • Footnote detail below financial statements (unless defining line item scales or shares)
   • Anything from the prior-year comparison column
+
+MULTI-STATEMENT EXTRACTION & LABEL DISAMBIGUATION — CRITICAL:
+  • The concept list is organized by statement type (INCOME STATEMENT, BALANCE
+    SHEET, CASH FLOW STATEMENT).
+  • Certain rows appear in multiple statements with identical or similar labels
+    (e.g. "Net income" appears on the Income Statement and at the start of Cash
+    Flows; "Cash and cash equivalents" appears on the Balance Sheet and at the
+    end of Cash Flows).
+  • ALWAYS map each extracted metric to the concept under its corresponding
+    statement section in the concept list.
+  • Check column headers carefully: Balance Sheets are point-in-time ("As of
+    [Date]"), while Income Statements and Cash Flows are periods ("Months Ended").
 
 SIGNS — CRITICAL (SEC/IR convention, applies to every source: EDGAR HTML,
 PDF letters, presentations):
@@ -388,27 +406,49 @@ def build_concept_list(
         and not c.get("calculated")
     ]
 
-    lines: list[str] = []
+    by_statement: dict[str, list[dict]] = {}
     for c in prompt_concepts:
-        label = c.get("label", "")
-        if not label:
+        stmt = (c.get("statement_type") or "income").strip().lower()
+        by_statement.setdefault(stmt, []).append(c)
+
+    stmt_order = ["income", "balancesheet", "cashflow"]
+    for s in by_statement:
+        if s not in stmt_order:
+            stmt_order.append(s)
+
+    stmt_headers = {
+        "income": "### INCOME STATEMENT CONCEPTS (Duration / Flow)",
+        "balancesheet": "### BALANCE SHEET CONCEPTS (Point-in-Time / As of Period End)",
+        "cashflow": "### CASH FLOW STATEMENT CONCEPTS (Duration / Flow)",
+    }
+
+    section_blocks: list[str] = []
+    for stmt in stmt_order:
+        stmt_concepts = by_statement.get(stmt)
+        if not stmt_concepts:
             continue
-        taxonomy_key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
-        # Dimensional signal comes from the DB flags — the "|" in taxonomy_key
-        # only fires for embedded member-tag labels (30 of ~109k docs) and also
-        # appears on path-disambiguated non-dimensional rows, so it is neither
-        # a necessary nor sufficient proxy.
-        has_dim = bool(c.get("dimension") or c.get("dimension_concept"))
+        lines: list[str] = [stmt_headers.get(stmt, f"### {stmt.upper()} CONCEPTS")]
+        for c in stmt_concepts:
+            label = c.get("label", "")
+            if not label:
+                continue
+            taxonomy_key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+            # Dimensional signal comes from the DB flags — the "|" in taxonomy_key
+            # only fires for embedded member-tag labels (30 of ~109k docs) and also
+            # appears on path-disambiguated non-dimensional rows, so it is neither
+            # a necessary nor sufficient proxy.
+            has_dim = bool(c.get("dimension") or c.get("dimension_concept"))
 
-        tags: list[str] = []
-        if has_dim:
-            tags.append("SEGMENT")
-        tag_str = f"  [{' | '.join(tags)}]" if tags else ""
+            tags: list[str] = []
+            if has_dim:
+                tags.append("SEGMENT")
+            tag_str = f"  [{' | '.join(tags)}]" if tags else ""
 
-        if taxonomy_key:
-            lines.append(f"  • [{taxonomy_key}]  — \"{label}\"{tag_str}")
-        else:
-            lines.append(f"  • \"{label}\"  (no taxonomy key){tag_str}")
+            if taxonomy_key:
+                lines.append(f"  • [{taxonomy_key}]  — \"{label}\"{tag_str}")
+            else:
+                lines.append(f"  • \"{label}\"  (no taxonomy key){tag_str}")
+        section_blocks.append("\n".join(lines))
 
-    return "\n".join(lines)
+    return "\n\n".join(section_blocks)
 

@@ -610,6 +610,7 @@ def get_recently_valued_concept_ids(
     cik: str,
     period: DetectedPeriod,
     n_periods: int = 3,
+    statement_types: list[str] | None = None,
 ) -> set[str]:
     """Return concept_id strings that had a value in the last *n_periods* periods.
 
@@ -630,20 +631,24 @@ def get_recently_valued_concept_ids(
     col_name = _values_collection(period)
     db = _get_client()[_NORMALIZE_DB]
     col = db[col_name]
+    query: dict[str, Any] = {"cik": cik}
+    if statement_types:
+        query["statement_type"] = {"$in": list(statement_types)}
+    else:
+        query["statement_type"] = "income"
+
     periods = col.distinct(
         "reporting_period.end_date",
-        {"cik": cik, "statement_type": "income"},
+        query,
     )
     periods = sorted([p for p in periods if p is not None], reverse=True)[:n_periods]
     if not periods:
         return set()
+    id_query = dict(query)
+    id_query["reporting_period.end_date"] = {"$in": periods}
     ids = col.distinct(
         "concept_id",
-        {
-            "cik": cik,
-            "statement_type": "income",
-            "reporting_period.end_date": {"$in": periods},
-        },
+        id_query,
     )
     return {str(i) for i in ids if i is not None}
 
@@ -654,6 +659,7 @@ def upsert_concept_values(
     concept_metrics: dict[str, float],
     period: DetectedPeriod,
     statement_type: str = "income",
+    target_statements: list[str] | None = None,
     derived_concept_ids: set[str] | None = None,
     value_metadata_by_id: dict[str, dict] | None = None,
     accession_number: str | None = None,
@@ -737,7 +743,7 @@ def upsert_concept_values(
         doc: dict[str, Any] = {
             "concept_id": concept_oid,
             "cik": cik,
-            "statement_type": statement_type,
+            "statement_type": meta.get("statement_type") or statement_type,
             "form_type": form_type,
             "reporting_period": period_doc,
             "value": value,
@@ -805,10 +811,14 @@ def upsert_concept_values(
 
     _stale_filt: dict[str, Any] = {
         "cik": cik,
-        "statement_type": statement_type,
         "reporting_period.fiscal_year": fiscal_year,
         "save_token": {"$ne": save_token},
     }
+    if target_statements:
+        _stale_filt["statement_type"] = {"$in": list(target_statements)}
+    elif statement_type:
+        _stale_filt["statement_type"] = statement_type
+
     if period_type == "quarterly":
         _stale_filt["reporting_period.quarter"] = quarter
     _del_count = collection.delete_many(_stale_filt).deleted_count

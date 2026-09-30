@@ -31,7 +31,7 @@ from bson import ObjectId
 from pymongo import MongoClient
 from redis import Redis
 
-from earnings_agents.config import REDIS_URL
+from earnings_agents.config import REDIS_URL, TARGET_STATEMENTS
 from earnings_agents.hooks import set_call_callback, set_detail_callback, set_node_callback
 from earnings_agents.integrations.redis import get_redis_client, serialize_message
 from earnings_agents.progress import WorkerProgressPublisher, make_call_callback, make_node_callback, WorkerHeartbeat
@@ -102,7 +102,11 @@ def _cleanup_temporary_filing(payload: dict[str, Any]) -> None:
 
 # ── Core processing — mirrors CLI's _build_initial_state + _run_company ───────
 
-def _process_payload(graph, payload: dict[str, Any]) -> bool:
+def _process_payload(
+    graph,
+    payload: dict[str, Any],
+    default_statements: list[str] | None = None,
+) -> bool:
     """Process one 8-K filing message using the same pipeline as the CLI.
 
     Steps (identical to ``uv run earnings --ticker X``):
@@ -154,6 +158,17 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         temp_dir = os.getenv("IR_TEMP_FILINGS_DIR", "/app/uploads/ir-filings")
         local_filing_path = str(Path(temp_dir) / str(temporary_filing_id))
 
+    # Parse target statements from payload or default fallback
+    raw_statements = payload.get("statements") or payload.get("target_statements")
+    target_statements: list[str] | None = None
+    if raw_statements:
+        if isinstance(raw_statements, str):
+            target_statements = [s.strip().lower() for s in raw_statements.split(",") if s.strip()]
+        elif isinstance(raw_statements, list):
+            target_statements = [str(s).strip().lower() for s in raw_statements if str(s).strip()]
+    if target_statements is None:
+        target_statements = default_statements or TARGET_STATEMENTS
+
     # A manual trigger may carry a direct filing_url (press-release HTML or
     # shareholder-letter PDF from the admin panel). When present, the EDGAR
     # lookup is skipped inside _build_8k_state and the URL is used directly.
@@ -170,6 +185,7 @@ def _process_payload(graph, payload: dict[str, Any]) -> bool:
         filing_url=payload.get("filing_url") if not temporary_filing_id else None,
         local_filing_path=local_filing_path,
         accession=payload.get("accession_number") or None,
+        target_statements=target_statements,
     )
 
     # The reporting period is decided by the period agent INSIDE the graph —
@@ -344,6 +360,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Seconds to wait between retries.")
     parser.add_argument("--once", action="store_true",
                         help="Process one message then exit (useful for testing).")
+    parser.add_argument(
+        "-s",
+        "--statements",
+        default=None,
+        help="Default comma-separated financial statements to extract if not specified in the job payload.",
+    )
     return parser.parse_args(argv)
 
 
@@ -370,6 +392,12 @@ def main(argv: list[str] | None = None) -> None:
     queue_name: str = args.queue_name
     dead_letter_queue: str = args.dead_letter_queue
     redis_url: str = args.redis_url
+
+    default_statements: list[str] | None = (
+        [s.strip().lower() for s in args.statements.split(",") if s.strip()]
+        if args.statements
+        else None
+    )
 
     # Convert SIGTERM (docker stop / docker-compose down) into SystemExit so it
     # propagates through finally blocks and the except BaseException handler in
@@ -426,7 +454,7 @@ def main(argv: list[str] | None = None) -> None:
         _update_load_request_status(payload, "processing")
 
         try:
-            success = _process_payload(graph, payload)
+            success = _process_payload(graph, payload, default_statements=default_statements)
         except (KeyboardInterrupt, SystemExit):
             # Worker is shutting down (Ctrl-C or docker stop) mid-job.
             # _process_payload already published the ✗ summary event; we just

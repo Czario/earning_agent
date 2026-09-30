@@ -115,6 +115,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 company_name=state["company_name"],
                 concept_metrics=concept_metrics,
                 period=period,
+                target_statements=state.get("target_statements"),
                 derived_concept_ids=derived_ids,
                 value_metadata_by_id=state.get("value_metadata_by_id"),
                 accession_number=state.get("accession_number"),

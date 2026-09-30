@@ -31,6 +31,8 @@ class EarningsAgentState(TypedDict):
     # triggering the generic extraction path.
     cik: NotRequired[Optional[str]]
     company_industry: NotRequired[Optional[dict]]  # {sic_code, sic_description} from normalize_data.companies
+    # Statements targeted for extraction: ["income", "balancesheet", "cashflow"]
+    target_statements: NotRequired[Optional[list[str]]]
     target_concepts: NotRequired[Optional[list]]    # concept dicts from normalized_concepts_quarterly
     # concept_id strings (subset of target_concepts) that had a value in the
     # last N stored periods. Used to prune the extraction prompt to concepts the

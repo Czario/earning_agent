@@ -68,12 +68,14 @@ def calculate_q4_node(state: EarningsAgentState) -> EarningsAgentState:
         f"{' [replace — recomputing]' if recalculate else ''})"
     )
 
+    target_statements = state.get("target_statements")
     try:
         result = calculate_q4_for_period(
             cik=cik,
             period=period,
             annual_concept_ids=list(concept_metrics.keys()),
-            statement_type="income",
+            statement_type="income" if not target_statements else None,
+            target_statements=target_statements,
             allow_incomplete=_config.Q4_ALLOW_INCOMPLETE,
             recalculate=recalculate,
         )
@@ -85,9 +87,16 @@ def calculate_q4_node(state: EarningsAgentState) -> EarningsAgentState:
             "q4_calculation": {"status": "error", "error": str(exc)},
         }
 
+    breakdown_parts = []
+    for s, counts in sorted(result.get("by_statement", {}).items()):
+        c_num = counts.get("calculated", 0)
+        p_num = counts.get("point_in_time", 0)
+        breakdown_parts.append(f"{s}: {c_num} flow + {p_num} point-in-time")
+    breakdown_str = f" ({', '.join(breakdown_parts)})" if breakdown_parts else ""
+
     report_call(
         f"  [q4]  ✓ {result['calculated']} flow + {result['point_in_time']} "
-        f"point-in-time Q4 value(s) inserted; {result['skipped']} skipped"
+        f"point-in-time Q4 value(s) inserted{breakdown_str}; {result['skipped']} skipped"
         f"{f'; {len(result['errors'])} error(s)' if result['errors'] else ''}"
     )
     for reason, n in sorted(result["skipped_reasons"].items()):
