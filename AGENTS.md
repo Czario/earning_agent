@@ -64,6 +64,12 @@ fetch_filing → detect_period → check_period → load_company_concepts
 - Runs through the **shared agent loop + tools** (`get_document_info`, `search`,
   `read_lines`, `get_company_info` + terminal `finalize_period`), **open-ended** —
   no step cap.
+- **No `find_sections`** — the period agent intentionally does NOT receive the
+  section-indexer tool (`include_find_sections=False`): it only needs the period
+  header (`search`/`read_lines`), and a stray `find_sections()` call would trigger
+  the expensive full-document LLM indexer for no benefit (observed live: ~2 min
+  stall on a slow provider, with a map that was never consumed because the
+  extraction prescan was already strong).
 - Given `fiscal_year_end` (MMDD from `normalize_data.companies`) as fiscal-calendar context; returns strict JSON
   `{period_type, period_end, quarter, fiscal_year, period_label}`. The filing's
   fiscal-year/quarter evidence is authoritative; the graph stores the complete
@@ -84,8 +90,13 @@ fetch_filing → detect_period → check_period → load_company_concepts
 
 ### Extraction pipeline internals (`agent/pipeline.py`)
 
-1. `prescan_document` (`agent/derive.py`) — deterministic **scale** detection only
-   (thousands/millions/billions); period is the period agent's job
+1. `prescan_document` (`agent/derive.py`) — deterministic **scale** detection
+   (thousands/millions/billions) **+ statement-aware exhibit routing**: per
+   exhibit it counts income-statement / balance-sheet / cash-flow keyword hits
+   and marks which statements are present (`income`/`balance_sheet`/`cash_flow`
+   booleans, sorted most-complete-exhibit first).  The pipeline skips the LLM
+   section indexer only when the best exhibit covers ALL `TARGET_STATEMENTS`
+   (`_hint_covers_targets`); period is the period agent's job
 2. `load_prior_values` — prior-period DB values for the agent's `get_prior_value` tool
 3. Prompt = `PIPELINE_SYSTEM_PROMPT` + `build_concept_list` (the verbatim
    extract list) + `build_calc_derivation_block` (CALC `system:`/`calculated`
@@ -149,14 +160,31 @@ reused automatically.
 ### Agent tools (`agent/tools.py`)
 
 `get_document_info`, `read_lines`, `search` (word-indexed, context blocks, 15-block cap),
-`get_prior_value`, `verify_identity` (GP = Rev − CoR), `calculate` (safe AST arithmetic),
+`get_prior_value`, `verify_identity` (GP = Rev − CoR),
+`verify_balance_sheet_identity` (Assets = Liabilities + Equity),
+`verify_cash_flow_identity` (Net change = Operating + Investing + Financing),
+`calculate` (safe AST arithmetic),
 `get_company_info` (cached SIC profile from state, DB fallback — advisory only),
 `detect_currency` (currency detection over a line range, backing the agent's
 `__currency__` report), `detect_scale` (scale declaration over a line range, backing
 per-value `__evidence__`), `map_concept` (map a filing row label to a concept key
-in-loop), `compute` (same exact arithmetic as `calculate`, for derived concept
-values). `calculate`/`compute` share one plain-function evaluator (both are
+in-loop), `find_sections` (LLM-backed document section map — returns prescan hints
+or a pre-built index instantly; builds the indexer only as a last resort),
+`compute` (same exact arithmetic as `calculate`, for derived concept
+values), `detect_cashflow_period_basis` (deterministic scan of the cash-flow
+header for "Three/Six/Nine Months Ended" / "Year Ended" — advisory, mirrors
+`detect_scale`/`detect_currency`), `deaccumulate_cashflow` (YTD→quarterly
+cash-flow de-accumulation — see below). `calculate`/`compute` share one plain-function evaluator (both are
 StructuredTools). Tool results truncated to 8000 chars.
+
+`find_sections` is the only tool that can trigger the expensive full-document
+LLM section indexer (`agent/indexer.py`, one JSON-mode call over the numbered
+text). It returns instantly when prescan hints or a pre-built index exist, and
+its failures/timeouts surface in the run log as `[index] section map FAILED …`
+(they were `logger`-only before). **The period agent does NOT receive it**
+(`include_find_sections=False`) — locating the period header never needs a
+section map. The extraction pass pre-builds an index only when prescan hints are
+weak, and can route that call via `INDEX_LLM_PROVIDER`/`INDEX_LLM_MODEL`.
 
 Multi-document navigation is agent-driven: `get_document_info` lists each
 exhibit's line range AND its opening lines (so the agent can classify a press
@@ -165,6 +193,36 @@ global across the whole bundle and annotates each match block with the
 exhibit it belongs to; the extraction prompt instructs a SMART (non-linear)
 strategy — identify exhibits first, jump with global search, prefer the
 fullest income statement.  **No deterministic navigation helpers.**
+
+**Cash-flow YTD de-accumulation** (`agent/deaccumulate.py`, gated by
+`DEACCUMULATE_YTD_CASHFLOW`, cash-flow targets only) — some filers present the
+cash-flow statement on a year-to-date basis only ("Six Months Ended" for Q2,
+"Nine Months Ended" for Q3) with no quarterly column.  The extraction agent is
+taught to detect that (via `detect_cashflow_period_basis`) and de-accumulate
+each **flow** row in-loop via `deaccumulate_cashflow(value, concept_key,
+ytd_months, filing_label)`: `Q2 = 6m − Q1`, `Q3 = 9m − (Q1+Q2)`, with prior
+quarters read from `concept_values_quarterly` for the SAME fiscal year (the
+tool closure bakes in the canonical `fiscal_year`/`quarter` from the detected
+period, so the agent cannot hallucinate them).  Three outcomes: flow →
+de-accumulate (report the returned value + list the key in `__derived__` →
+`calculated=True`); end-of-period snapshot ("…ending balances") → as-is;
+beginning-of-period snapshot ("…beginning balances") → SKIP (a YTD statement
+shows the fiscal-year-START balance, not the quarter-start balance).  A missing
+prior quarter is reported, never fabricated.  The period agent does NOT
+receive these tools (`include_cashflow_tools=False`).  **Forcing function:**
+the agent must report the observed cash-flow column basis in finalize under
+`__cashflow_basis__` (`quarterly` | `ytd_6m` | `ytd_9m` | `annual`).  When it
+reports `ytd_6m`/`ytd_9m` for a Q2/Q3 period (or document ground truth shows it),
+the pipeline verifies that cash-flow **flow** concepts are de-accumulated (present in
+`derived_concept_ids` via `__derived__`).  Any un-deaccumulated flow concept is
+omitted from the quarterly save (with a `cashflow_not_deaccumulated` finding) so
+raw YTD values are never persisted as quarterly actuals, and the save is **never
+blocked** — all other valid metrics (income statement, balance sheet, de-accumulated
+flows) are saved.
+`verify_cash_flow_identity` additionally REFUSES to verify a YTD cash-flow
+statement until at least one flow row has been de-accumulated this run
+(`_cf_deaccumulated`), and the identity check rejects partially
+de-accumulated values (mixed QTD/YTD rows won't reconcile).
 
 ### Concept lookup & fiscal math (`integrations/normalize.py`)
 
@@ -202,6 +260,14 @@ fullest income statement.  **No deterministic navigation helpers.**
 kinds of learnings, each written by the agent that observes them via a
 dedicated tool (a plain Mongo upsert in milliseconds, no extra LLM pass, no
 post-save node, no deterministic consolidation):
+
+Writes are **interleaved with extraction** — the prompt instructs the agent to
+record each fact in the SAME step it observes it (alias in the mapping step,
+currency in the detect_currency step, layout in the locate-the-statements
+step), never batched into a trailing memory-only turn, and **at most once per
+distinct fact per run** (at most one `layout` note per run).  The DB dedup
+(`_persist`) stays as the deterministic backstop, so a re-recorded fact is a
+no-op even when the agent ignores the prompt.
 
 - `label_alias` — the filing labels a known concept differently, via
   `remember_alias(filing_label, canonical)` (text format
@@ -254,7 +320,7 @@ overrides the filing.  Config: `MEMORY_ENABLED` (required, no default).
 ```
 src/earnings_agents/
   graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py, filelog.py
-  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · guidance.py · industry.py · currency.py · scale.py · memory.py · indexer.py
+  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · guidance.py · industry.py · currency.py · scale.py · memory.py · indexer.py · deaccumulate.py
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py · save_guidance.py · q4.py
   integrations/ edgar.py · normalize.py · guidance.py · q4.py · mongo.py · redis.py · http.py · html.py · playwright.py
   cli/          earnings.py · worker.py · failures.py
@@ -458,6 +524,7 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `GROQ_API_KEY` / `GROQ_MODEL` / `GROQ_RPM` / `GROQ_TPM` | — / `openai/gpt-oss-120b` / 30 / 12000 | Groq + rate budgets |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` | — / `deepseek-chat` | DeepSeek |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | — / `gemini-2.5-flash` | Gemini |
+| `INDEX_LLM_PROVIDER` / `INDEX_LLM_MODEL` | — | Route the document section indexer (`find_sections`) to a fast provider while the agent loops stay on `LLM_PROVIDER`; falls back to `LLM_PROVIDER` when the routed key is missing |
 | `MONGODB_URI` | `mongodb://localhost:27017` | normalize_data lives here (`_NORMALIZE_DB`) |
 | `MONGODB_DB` / `MONGODB_COLLECTION` | `earnings_db` / `earnings` | Raw earnings store |
 | `REDIS_URL` / `REDIS_QUEUE_NAME` | `redis://localhost:6379/0` / `sec:filings` | Worker queue (deploy sets `sec:filings:8k`) |
@@ -467,6 +534,7 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `PROMPT_HISTORY_PERIODS` | `3` | Window (stored periods) used as an extraction *prioritization* signal, not an eligibility filter |
 | `CALCULATE_Q4_AFTER_ANNUAL` | `1` | Post-save Q4 derivation (income statement only): after an ANNUAL filing is saved, derive `Q4 = Annual − (Q1+Q2+Q3)` into `concept_values_quarterly`; set `0` to disable |
 | `Q4_ALLOW_INCOMPLETE` | `0` | Treat missing Q1/Q2/Q3 as `0` in Q4 derivation (calculations-project behavior); when `0` (default) concepts with missing inputs are skipped — a fabricated Q4 is never stored |
+| `DEACCUMULATE_YTD_CASHFLOW` | `1` | Teach the extraction agent to de-accumulate year-to-date cash-flow statements into quarterly values (`Q2 = 6m − Q1`, `Q3 = 9m − (Q1+Q2)`) via the `deaccumulate_cashflow` tool; set `0` to disable (printed cash-flow values are then treated as quarterly) |
 | `GUIDANCE_ENABLED` | `1` | Extract forward-looking Guidance/Outlook numbers (PHASE 3 of the extraction pass) into `guidance_values` (same collection the admin backend reads/writes, `source="llm"`); set `0` to disable entirely (agent ignores guidance sections as before) |
 | `GUIDANCE_MAX_RECORDS` | `15` | Cap on the agent's `__guidance__` list per filing |
 | `RUN_LOGS_ENABLED` | `1` | Write per-run admin-panel-mirror log files (`Logs/<date-time>.log`) |

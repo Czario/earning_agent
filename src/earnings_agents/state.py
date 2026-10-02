@@ -93,10 +93,11 @@ class EarningsAgentState(TypedDict):
     # ── Agentic long-term memory ────────────────────────────────────────────
     # Advisory memory text injected into the extraction prompt (informational).
     memory_block: NotRequired[Optional[str]]
-    # LLM-built section map from the period pass's find_sections call
-    # (agent/indexer.py): {coverage, summary, sections: [{name, label,
-    # lines, scale, currency, note}]}.  Consumed by the extraction pass so its
-    # first read_lines goes straight to the income-statement range.
+    # LLM-built section map (agent/indexer.py): {coverage, summary, sections:
+    # [{name, label, lines, scale, currency, note}]}.  Formerly persisted from
+    # the period pass's find_sections call; the period agent no longer runs
+    # the indexer, so this is built (when needed) by the extraction pass
+    # itself and fed straight to the agent as prebuilt_sections.
     document_sections: NotRequired[Optional[dict]]
     # ── SEC accession number ────────────────────────────────────────────────
     # Set from the EDGAR submissions API (CLI path) or Redis payload (worker).

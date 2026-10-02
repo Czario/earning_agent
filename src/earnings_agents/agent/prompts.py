@@ -239,6 +239,12 @@ FINALIZE_DESCRIPTION = (
     "  - __derived__: a comma-separated list of bracketed keys you COMPUTED\n"
     "    (via compute()/calculate()) rather than read verbatim from the filing\n"
     "    (omit if none)\n"
+    "  - __cashflow_basis__: REQUIRED when cashflow is being extracted — the\n"
+    "    cash-flow statement's column basis you observed via\n"
+    "    detect_cashflow_period_basis(), one of: \"quarterly\", \"ytd_6m\",\n"
+    "    \"ytd_9m\", or \"annual\".  If it is ytd_6m/ytd_9m, every cash-flow\n"
+    "    FLOW row you report MUST be de-accumulated (listed in __derived__)\n"
+    "    or it will be omitted from the quarterly save.\n"
     "  - __guidance__: OPTIONAL list of forward-looking Guidance/Outlook numbers\n"
     "    (one object per guidance number — see the GUIDANCE EXTRACTION block in\n"
     "    the system prompt for the exact contract).  Omit when the filing has\n"
@@ -264,13 +270,17 @@ EXPECTS for FUTURE periods ("we expect revenue of $108.0 billion, plus or minus
 It is NEVER the reported-period actuals you already extracted.
 
 WORKFLOW
-  1. search("guidance") / search("outlook") / search("expect") / search("forecast")
-     — or use the section map's guidance range if present.  The outlook block is
+  1. search("outlook") ONCE.  If it finds an outlook/guidance section, that is
+     your target.  If it returns nothing, search("guidance") ONCE as a
+     fallback.  If that also returns nothing, the filing has NO quantitative
+     guidance: stop searching and call finalize_extraction() WITHOUT a
+     __guidance__ key.  Do NOT fire repeated synonym searches ("expect",
+     "forecast", "anticipate", "billion", "quarter", ...) — a single hit is
+     enough, and zero hits means there is no guidance.  The outlook block is
      usually the LAST section of the press release ("Outlook", "Q4 Fiscal 2027
      Outlook", "Business Outlook", "CFO Outlook Commentary") — often a
      COMMENTARY PARAGRAPH in mixed units ("in the range of $61-64 billion",
-     "between 15-17%"), not a table.  If search() finds nothing, call
-     find_sections("guidance") for the section map's outlook range.
+     "between 15-17%"), not a table.
   2. read_lines() that section ONCE and extract EVERY quantitative guidance
      number (revenue, EPS, gross margin, operating expense, capex, cash flow,
      tax rate, ...).  Include non-GAAP basis guidance (e.g. "adjusted EPS" /
@@ -382,6 +392,10 @@ FINALIZE CHECKLIST — READ BEFORE CALLING finalize_extraction():
 
 
 GUIDANCE_PHASE_NOTICE = """\n\nPHASE 3 — GUIDANCE/OUTLOOK (MANDATORY, before finalize_extraction):\nAfter the income-statement and segment extraction above, locate the\nGUIDANCE / OUTLOOK / FORECAST section (search(\"guidance\") / search(\"outlook\")\nor the section map's guidance range), read it, and extract every FUTURE-period\nguidance number into the \"__guidance__\" list (contract in the system prompt).\nThen call finalize_extraction() ONCE with the income-statement keys, the\nsegment keys, and \"__guidance__\" together.\n"""
+
+
+CF_DEACCUMULATION_BLOCK = """\
+CASH-FLOW YEAR-TO-DATE DECOMPOSITION (de-accumulation):\nSome companies present their cash-flow statement on a YEAR-TO-DATE (YTD) basis\nonly — "Six Months Ended" for a Q2 filing, "Nine Months Ended" for a Q3 filing\n— with no quarterly column.  The printed FLOW figures are then CUMULATIVE\nyear-to-date, NOT the quarter.\n\nWORKFLOW\n  1. Call detect_cashflow_period_basis() with NO arguments — it locates the\n     cash-flow statement header for you and returns its basis (quarterly /\n     ytd_6m / ytd_9m / annual) plus a directive.\n  2. quarterly ("Three Months Ended") → extract values as-is.\n  3. ytd_6m or ytd_9m → follow the tool's directive: for EVERY flow row call\n     deaccumulate_cashflow(value=<CURRENT-period YTD value>,\n     concept_key=<bracketed key>, ytd_months=6 or 9,\n     filing_label=<the row label as printed>) and report the RETURNED\n     quarterly value under the bracketed key.\n     - End-of-period snapshots ("...ending balances") → use the printed value\n       AS-IS (the tool says so).\n     - Beginning-of-period snapshots ("...beginning balances") → SKIP (the tool\n       says so — a YTD statement shows the fiscal-year-START balance, not the\n       quarter-start balance).\n  4. List every de-accumulated key in __derived__ (its value is computed, not\n     verbatim).\n  5. Use the CURRENT-period column only (e.g. "June 27, 2026"), never the\n     prior-year comparison column.\n  6. Report the observed basis in finalize_extraction under\n     "__cashflow_basis__" (one of: quarterly, ytd_6m, ytd_9m, annual).\n     If it is ytd_6m/ytd_9m, any cash-flow FLOW row not de-accumulated\n     (listed in __derived__) will be omitted from the quarterly save.\n\nNEVER de-accumulate unless the cash-flow header is YTD ("Six/Nine Months\nEnded").  NEVER de-accumulate income-statement or balance-sheet rows.  When a\nprior quarter is missing from the database the tool says so — leave that key\nout (never invent a prior-quarter value).\n"""
 
 
 def build_concept_list(

@@ -93,5 +93,54 @@ class TestBuildNoScaleKeys(unittest.TestCase):
         self.assertEqual(build_no_scale_keys(concepts), set())
 
 
+class TestSanitizeToolMessages(unittest.TestCase):
+    def test_inserts_missing_tool_message(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from earnings_agents.agent.loop import _sanitize_tool_messages
+
+        messages = [
+            HumanMessage(content="Search for revenue"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "t1", "args": {}, "id": "call_1"},
+                    {"name": "t2", "args": {}, "id": "call_2"},
+                ],
+            ),
+            ToolMessage(content="result 1", tool_call_id="call_1"),
+        ]
+        sanitized = _sanitize_tool_messages(messages)
+        self.assertEqual(len(sanitized), 4)
+        self.assertIsInstance(sanitized[3], ToolMessage)
+        self.assertEqual(sanitized[3].tool_call_id, "call_2")
+
+    def test_inserts_missing_invalid_tool_message(self):
+        from langchain_core.messages import AIMessage, ToolMessage
+        from earnings_agents.agent.loop import _sanitize_tool_messages
+
+        msg = AIMessage(content="")
+        msg.invalid_tool_calls = [{"name": "bad_tool", "args": {}, "id": "call_inv_1", "error": "bad"}]
+        messages = [msg]
+        sanitized = _sanitize_tool_messages(messages)
+        self.assertEqual(len(sanitized), 2)
+        self.assertIsInstance(sanitized[1], ToolMessage)
+        self.assertEqual(sanitized[1].tool_call_id, "call_inv_1")
+
+    def test_leaves_complete_messages_unchanged(self):
+        from langchain_core.messages import AIMessage, ToolMessage
+        from earnings_agents.agent.loop import _sanitize_tool_messages
+
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "t1", "args": {}, "id": "call_1"}],
+            ),
+            ToolMessage(content="result 1", tool_call_id="call_1"),
+        ]
+        sanitized = _sanitize_tool_messages(messages)
+        self.assertEqual(len(sanitized), 2)
+        self.assertEqual(sanitized[1].tool_call_id, "call_1")
+
+
 if __name__ == "__main__":
     unittest.main()

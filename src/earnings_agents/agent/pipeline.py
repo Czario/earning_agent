@@ -35,10 +35,30 @@ from earnings_agents.agent.prompts import (
     build_concept_list,
 )
 from earnings_agents.agent.tools import build_pi_tools
-from earnings_agents.config import EXTRACTION_MAX_CHARS
+from earnings_agents.config import EXTRACTION_MAX_CHARS, DEACCUMULATE_YTD_CASHFLOW
 from earnings_agents.state import EarningsAgentState
 
 logger = logging.getLogger(__name__)
+
+
+def _hint_covers_targets(hint: dict, target_statements: list[str]) -> bool:
+    """True when a prescan routing hint covers every requested statement.
+
+    ``hint`` is one entry from ``prescan_document``'s hints list (keys
+    ``income``/``balance_sheet``/``cash_flow`` booleans); ``target_statements``
+    is ``["income", "balancesheet", "cashflow"]`` or a subset.  A hint only
+    "covers" a statement when its exhibit actually contains that statement's
+    table (keyword-strong), so the indexer is skipped only when the best
+    exhibit holds all the statements we need.
+    """
+    wanted = {s.strip().lower() for s in target_statements}
+    if "income" in wanted and not hint.get("income"):
+        return False
+    if "balancesheet" in wanted and not hint.get("balance_sheet"):
+        return False
+    if "cashflow" in wanted and not hint.get("cash_flow"):
+        return False
+    return True
 
 
 # ── Main node ────────────────────────────────────────────────────────────────
@@ -166,7 +186,7 @@ def _run_extraction_pass(
 
     ticker = state["ticker"]
 
-    # ── 1. Document pre-scan (scale only) — deterministic mechanical step ──
+    # ── 1. Document pre-scan (scale + statement routing) — deterministic ──
     # Currency is NOT decided here: the tool-calling agent inspects each
     # table/section with detect_currency() and reports __currency__ itself.
     doc_scale, _, is_hints = prescan_document(
@@ -177,22 +197,32 @@ def _run_extraction_pass(
     if is_hints:
         for h in is_hints:
             report_call(
-                f"  [prescan]  income-statement likely in {h['exhibit']} "
-                f"(lines {h['lines'][0]}-{h['lines'][1]}, "
-                f"{h['primary_count']} IS + {h['secondary_count']} context hits)"
+                f"  [prescan]  statements likely in {h['exhibit']} "
+                f"(lines {h['lines'][0]}-{h['lines'][1]}; "
+                f"IS {h['primary_count']}+{h['secondary_count']} ctx, "
+                f"BS {h['bs_count']}, CF {h['cf_count']})"
             )
 
     # ── 1b. Section index — build only when prescan hints are insufficient ──
-    # When the prescan identified the income-statement exhibit with strong
-    # keyword signals (≥3 primary + ≥2 secondary), skip the expensive LLM
-    # indexer (60K chars → ~90s) and let the agent navigate via the exhibit
-    # routing hint instead.  Only build the index when we lack good hints
-    # or the period agent already built one (state.document_sections).
+    # When the prescan found an exhibit containing ALL target statements with
+    # strong keyword signals, skip the expensive LLM indexer (60K chars →
+    # ~90s) and let the agent navigate via the exhibit routing hint instead.
+    # Only build the index when the best exhibit is missing a target statement
+    # or no hint exists.  (state.document_sections is never populated by the
+    # period agent anymore, so this is the only index build site.)
+    from earnings_agents.config import TARGET_STATEMENTS
+    target_statements = state.get("target_statements") or TARGET_STATEMENTS
+    is_multi_statement = any(
+        s in target_statements for s in ("balancesheet", "cashflow")
+    )
+
     prebuilt_sections = state.get("document_sections")
-    if is_hints and is_hints[0]["primary_count"] >= 3:
+    best_hint = is_hints[0] if is_hints else None
+    if best_hint and _hint_covers_targets(best_hint, target_statements):
         report_call(
-            f"  [prescan]  strong income-statement signal — "
-            f"skipping LLM indexer (agent routed to {is_hints[0]['exhibit']})"
+            f"  [prescan]  strong statement signal "
+            f"({', '.join(target_statements)}) — skipping LLM indexer "
+            f"(agent routed to {best_hint['exhibit']})"
         )
     elif not prebuilt_sections:
         try:
@@ -221,10 +251,6 @@ def _run_extraction_pass(
         }
 
     dollar_multiplier = SCALE_MULTIPLIERS.get(doc_scale, 1) if doc_scale else 1
-
-    from earnings_agents.config import TARGET_STATEMENTS
-    target_statements = state.get("target_statements") or TARGET_STATEMENTS
-    is_multi_statement = any(s in target_statements for s in ("balancesheet", "cashflow"))
 
     # Pre-read the primary financial statement exhibit so the agent gets the table(s)
     # upfront — eliminates 5+ read_lines navigation calls.
@@ -393,6 +419,16 @@ def _run_extraction_pass(
         system_prompt += (
             "\n\nMEMORY GOAL — make future extraction FASTER and MORE "
             "ACCURATE.\n"
+            "  • Record memory AS YOU GO — in the SAME step where you observe "
+            "the fact: remember_alias in the step you map the concept, "
+            "remember_currency in the step you call detect_currency, "
+            "remember_layout in the step you locate the statements.  NEVER "
+            "batch memory calls into a separate step at the end — trailing "
+            "memory-only turns cost LLM steps for zero benefit.\n"
+            "  • Call each remember_* tool AT MOST ONCE per distinct fact per "
+            "run.  If the COMPANY MEMORY block above already contains the fact, "
+            "or you already recorded it this run, do NOT call remember_* for it "
+            "again.\n"
             "  • When map_concept() (or your reading) shows a filing label "
             "maps to a known concept whose name differs, call "
             "remember_alias(filing_label=..., canonical=...) — the tool "
@@ -400,8 +436,9 @@ def _run_extraction_pass(
             "  • Record stable NAVIGATIONAL layout facts via "
             "remember_layout(note=...) — which exhibit/section the income "
             "statement lives in (e.g. 'second half of the release', "
-            "'Exhibit 99.2 supplemental').  NEVER include per-filing line "
-            "numbers — they change every filing.\n"
+            "'Exhibit 99.2 supplemental').  Record AT MOST ONE layout note per "
+            "run (the single most useful navigational fact).  NEVER include "
+            "per-filing line numbers — they change every filing.\n"
             "  • NEVER record absences, dimension members/segments (handled "
             "by taxonomy keys), or filing-content descriptions (e.g. how "
             "revenue is disaggregated) that a future run re-reads anyway.\n"
@@ -421,6 +458,9 @@ def _run_extraction_pass(
             "(comma-separated bracketed keys).\n"
             + calc_block
         )
+    if DEACCUMULATE_YTD_CASHFLOW and "cashflow" in target_statements:
+        from earnings_agents.agent.prompts import CF_DEACCUMULATION_BLOCK
+        system_prompt += f"\n\n{CF_DEACCUMULATION_BLOCK}"
 
     # ── 4. Build tools and run agent ─────────────────────────────────────
     # The section map built by the period pass (find_sections) rides in state;
@@ -434,6 +474,9 @@ def _run_extraction_pass(
         target_concepts=target_concepts,
         prebuilt_sections=prebuilt_sections,
         prescan_is_hints=is_hints,
+        fiscal_year=getattr(period, "fiscal_year", None),
+        quarter=getattr(period, "quarter", None),
+        period=period,
     )
     for t in memory_tools:
         tools.append(t)
@@ -446,6 +489,75 @@ def _run_extraction_pass(
         is_line_end = is_hints[0]["lines"][1] if is_hints else n_lines
         if is_multi_statement:
             target_desc = ", ".join(target_statements)
+            # Which statements are actually inside the injected text (the
+            # prescan marks them per exhibit; a split multi-exhibit filing may
+            # leave one statement in another exhibit).
+            present_names: list[str] = []
+            missing_names: list[str] = []
+            for key, label in (
+                ("income", "Income Statement"),
+                ("balance_sheet", "Balance Sheet"),
+                ("cash_flow", "Cash Flow Statement"),
+            ):
+                if best_hint and best_hint.get(key):
+                    present_names.append(label)
+                elif key in ("balance_sheet", "cash_flow"):
+                    missing_names.append(label)
+            present_txt = ", ".join(present_names) if present_names else "the financial statements"
+            missing_txt = ", ".join(missing_names)
+            injected_note = (
+                f"The text above already contains the {present_txt} tables.  "
+                f"Treat them as ALREADY READ: do NOT call read_lines() again on "
+                f"those table ranges — extract their rows directly from the text "
+                f"above."
+            )
+            if missing_names:
+                injected_note += (
+                    f"  The {missing_txt} is NOT in the text above — locate it "
+                    f"with search()/read_lines() across the other exhibits in "
+                    f"PHASE 2."
+                )
+            # Cash-flow de-accumulation step (inlined into PHASE 1 so it is
+            # followed — the agent ignores late system-prompt blocks).
+            if DEACCUMULATE_YTD_CASHFLOW and "cashflow" in target_statements:
+                from earnings_agents.agent.deaccumulate import detect_cashflow_statement_basis
+                prescan_cf = detect_cashflow_statement_basis(plain_text)
+                is_cf_ytd = bool(
+                    prescan_cf
+                    and prescan_cf.get("basis") in ("ytd_6m", "ytd_9m")
+                    and getattr(period, "quarter", None) in (2, 3)
+                )
+                if is_cf_ytd:
+                    m = prescan_cf["months"]
+                    b = prescan_cf["basis"]
+                    ev = prescan_cf["evidence"]
+                    cf_step = (
+                        f"     - Cash Flow: ⚠️ MANDATORY DE-ACCUMULATION REQUIRED:\n"
+                        f"       The statement is {m}-month YEAR-TO-DATE (\"{ev}\").\n"
+                        f"       Printed flow numbers are CUMULATIVE for {m} months, NOT the Q{period.quarter} quarter!\n"
+                        f"       For EVERY flow row call: deaccumulate_cashflow(value=<CURRENT-period printed value>,\n"
+                        f"       concept_key=<bracketed key>, ytd_months={m}, filing_label=<row label>)\n"
+                        f"       and report the RETURNED quarterly value (DO NOT report raw cumulative values).\n"
+                        f"       * \"...ending balances\" → use printed value as-is (quarter-end snapshot).\n"
+                        f"       * \"...beginning balances\" → SKIP.\n"
+                        f"       * List EVERY de-accumulated key in __derived__.\n"
+                        f"       * In finalize_extraction, report \"__cashflow_basis__\": \"{b}\".\n"
+                    )
+                else:
+                    cf_step = (
+                        f"     - Cash Flow: FIRST call detect_cashflow_period_basis() (no\n"
+                        f"       arguments — it reads the cash-flow header for you).  Then:\n"
+                        f"       * quarterly (\"Three Months Ended\") → extract as-is.\n"
+                        f"       * ytd_6m / ytd_9m (\"Six/Nine Months Ended\", YEAR-TO-DATE) →\n"
+                        f"         the printed flow values are CUMULATIVE, NOT the quarter.  For\n"
+                        f"         EVERY flow row call deaccumulate_cashflow(value=<printed\n"
+                        f"         value>, concept_key=<bracketed key>, ytd_months=6 or 9,\n"
+                        f"         filing_label=<row label>) and report the RETURNED quarterly\n"
+                        f"         value.  \"...ending balances\" → as-is; \"...beginning\n"
+                        f"         balances\" → skip.  List every de-accumulated key in __derived__.\n"
+                    )
+            else:
+                cf_step = f"     - Cash Flow: extract as-is.\n"
             initial_msg = (
                 f"This is a {len(plain_text):,}-character earnings document "
                 f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
@@ -455,25 +567,32 @@ def _run_extraction_pass(
                 f"--- BEGIN {is_exhibit_label} ---\n"
                 f"{is_exhibit_text}\n"
                 f"--- END {is_exhibit_label} ---\n\n"
+                f"{injected_note}\n\n"
                 f"MULTI-STATEMENT EXTRACTION:\n\n"
                 f"PHASE 1 — Extract from the text above:\n"
                 f"  1. Call detect_scale() and detect_currency() on lines "
                 f"{is_line_start}-{is_line_end} to confirm units.\n"
-                f"  2. Extract ALL target statement concepts ({target_desc}) directly from the "
-                f"tables above (Income Statement, Balance Sheet, Cash Flow Statement).\n"
+                f"  2. Extract ALL target statement concepts ({target_desc}) from the "
+                f"tables above:\n"
+                f"     - Income Statement: the \"Three Months Ended\" (quarter) column.\n"
+                f"     - Balance Sheet: as-of (point-in-time) values, as-is.\n"
+                + cf_step +
                 f"  3. Reconcile with calculate(), verify equations:\n"
                 f"     - Income Statement: verify_identity(revenue, cost_of_revenue, gross_profit)\n"
                 f"     - Balance Sheet: verify_balance_sheet_identity(total_assets, total_liabilities, total_equity)\n"
                 f"     - Cash Flow: verify_cash_flow_identity(operating_cf, investing_cf, financing_cf, net_change)\n\n"
-                f"PHASE 2 — Search for missing statements or dimensional/segment data:\n"
-                f"  4. If any target statement (e.g. Cash Flow, Balance Sheet) or segment breakdown "
-                f"is NOT in the text above, use search() and read_lines() across OTHER exhibits to find it.\n"
-                f"  5. Extract all remaining concepts from those tables.\n\n"
+                f"PHASE 2 — Search ONLY for data NOT in the text above:\n"
+                f"  4. Use search()/read_lines() only for concepts NOT present in the "
+                f"tables above — segment/geographic/product-line revenue breakdowns, "
+                f"and any statement table that is missing from the text above.\n"
+                f"  5. Extract any remaining concepts you find.\n\n"
                 f"  6. Call finalize_extraction().\n\n"
                 f"DO NOT call get_company_info() — you already have the company name above.\n\n"
-                f"MEMORY: When calling remember_* tools, base your notes on the "
-                f"values and labels you already extracted — do NOT re-read or "
-                f"re-search the exhibit text."
+                f"MEMORY: record remember_* facts in the SAME step you observe them "
+                f"(interleaved with extraction), then call finalize_extraction() "
+                f"right after your last extraction — do NOT add a separate "
+                f"memory-writing step at the end, and do NOT re-read or re-search "
+                f"the exhibit text for memory."
             )
         else:
             initial_msg = (
@@ -500,9 +619,11 @@ def _run_extraction_pass(
                 f"  6. Call finalize_extraction().\n\n"
                 f"DO NOT call get_document_info() or get_company_info() — you already "
                 f"have the document structure and company name above.\n\n"
-                f"MEMORY: When calling remember_* tools, base your notes on the "
-                f"values and labels you already extracted — do NOT re-read or "
-                f"re-search the exhibit text."
+                f"MEMORY: record remember_* facts in the SAME step you observe them "
+                f"(interleaved with extraction), then call finalize_extraction() "
+                f"right after your last extraction — do NOT add a separate "
+                f"memory-writing step at the end, and do NOT re-read or re-search "
+                f"the exhibit text for memory."
             )
     elif prebuilt_sections and prebuilt_sections.get("sections"):
         map_text = format_section_index(prebuilt_sections)
@@ -520,22 +641,22 @@ def _run_extraction_pass(
     elif is_hints:
         best = is_hints[0]
         map_text = (
-            f"EXHIBIT ROUTING HINT (from prescan — the income statement is "
+            f"EXHIBIT ROUTING HINT (from prescan — the financial statements are "
             f"likely in {best['exhibit']}, lines {best['lines'][0]}-{best['lines'][1]}\n"
-            f"with {best['primary_count']} income-statement keywords and "
-            f"{best['secondary_count']} context keywords)."
+            f"IS {best['primary_count']}+{best['secondary_count']} ctx, "
+            f"BS {best['bs_count']}, CF {best['cf_count']})."
         )
         initial_msg = (
             f"This is a {len(plain_text):,}-character earnings document "
             f"with {n_lines:,} lines.\n\n"
             f"{map_text}\n\n"
             f"Start by calling read_lines({best['lines'][0]}, {best['lines'][1]}) "
-            f"to read the full income-statement exhibit in ONE call, then call "
+            f"to read the full financial-statements exhibit in ONE call, then call "
             f"detect_scale() and detect_currency() on that same range.  Extract "
             f"every concept row from the CURRENT period column, reconcile with "
             f"calculate(), verify with verify_identity(), then call "
             f"finalize_extraction.  If other exhibits contain additional segment "
-            f"data, use search() to locate it."
+            f"or statement data, use search() to locate it."
         )
     else:
         initial_msg = (
@@ -555,6 +676,26 @@ def _run_extraction_pass(
     if guidance_block:
         from earnings_agents.agent.prompts import GUIDANCE_PHASE_NOTICE
         initial_msg += GUIDANCE_PHASE_NOTICE
+
+    if calc_block:
+        initial_msg += (
+            "\n\nCOMPUTE-ONLY concepts (marked 'not printed in the filing' in the "
+            "concept list) — compute each with compute() after you finish extracting "
+            "printed rows, and list every computed key in __derived__."
+        )
+
+    if DEACCUMULATE_YTD_CASHFLOW and "cashflow" in target_statements:
+        from earnings_agents.agent.deaccumulate import detect_cashflow_statement_basis
+        prescan_cf = detect_cashflow_statement_basis(plain_text)
+        if prescan_cf and prescan_cf.get("basis") in ("ytd_6m", "ytd_9m") and getattr(period, "quarter", None) in (2, 3):
+            initial_msg += (
+                f"\n\n⚠️ CASH-FLOW DIRECTIVE: The Cash Flow statement is {prescan_cf['months']}-month "
+                f"YEAR-TO-DATE (\"{prescan_cf['evidence']}\").  Printed flow values are cumulative "
+                f"for {prescan_cf['months']} months, NOT the quarter.  You MUST call deaccumulate_cashflow() for every "
+                f"flow row and list every computed key in __derived__.  Report \"__cashflow_basis__\": "
+                f"\"{prescan_cf['basis']}\" in finalize_extraction().  Any raw cumulative "
+                f"flow rows not de-accumulated will be omitted from the quarterly save."
+            )
 
     final_result = run_agent_loop(
         system_prompt=system_prompt,
@@ -637,6 +778,14 @@ def _run_extraction_pass(
         agent_missing = [x.strip() for x in agent_missing.split(",") if x.strip()]
     if not isinstance(agent_missing, list):
         agent_missing = []
+    # The cash-flow statement's column basis the agent observed via
+    # detect_cashflow_period_basis(): "quarterly" | "ytd_6m" | "ytd_9m" |
+    # "annual" (or None when the agent did not report it).
+    agent_cashflow_basis = metrics.pop("__cashflow_basis__", None)
+    if isinstance(agent_cashflow_basis, str):
+        agent_cashflow_basis = agent_cashflow_basis.strip().lower()
+    else:
+        agent_cashflow_basis = None
 
     # Currency authority = the tool-calling agent's report.  A deterministic
     # whole-document scan is only a fallback for confirmed foreign/mixed codes
@@ -733,8 +882,89 @@ def _run_extraction_pass(
             derived_ids.add(cid)
             continue
         mk = (_reverse_map.get(cid) or "").strip().strip("[]")
-        if mk and mk in derived_keys:
+        mk_base = mk.split("|")[0]
+        derived_bases = {dk.split("|")[0] for dk in derived_keys}
+        concept_name = (c.get("concept") or "").strip().lower()
+        if mk and (
+            mk in derived_keys
+            or mk_base in derived_keys
+            or mk_base.lower() in derived_bases
+            or concept_name in derived_bases
+        ):
             derived_ids.add(cid)
+
+    # ── Non-blocking cash-flow de-accumulation check ───────────────────
+    # The cash-flow statement's basis is checked against both the agent's report
+    # and deterministic document scan as ground truth: the agent may omit
+    # __cashflow_basis__ or mistakenly claim "quarterly" despite the table header
+    # saying "Six/Nine Months Ended".  When the filing or the agent declares YTD
+    # for a Q2/Q3 period, any cash-flow flow concept that was not de-accumulated
+    # is omitted from concept_metrics so raw YTD values are not saved as
+    # quarterly actuals, and a medium-severity finding is recorded.
+    # Non-deaccumulated concepts NEVER block the save — all other valid
+    # metrics (income statement, balance sheet, de-accumulated flows) are saved.
+    from earnings_agents.agent.deaccumulate import (
+        classify_cashflow_kind,
+        detect_cashflow_statement_basis,
+    )
+    doc_cf = detect_cashflow_statement_basis(plain_text)
+    doc_basis = doc_cf["basis"] if doc_cf else None
+
+    effective_cf_basis = agent_cashflow_basis
+    basis_source = "agent"
+    if effective_cf_basis not in ("ytd_6m", "ytd_9m") and doc_basis in ("ytd_6m", "ytd_9m"):
+        effective_cf_basis = doc_basis
+        basis_source = "document"
+
+    cf_deaccum_findings: list[dict] = []
+    if (
+        effective_cf_basis in ("ytd_6m", "ytd_9m")
+        and period.quarter in (2, 3)
+    ):
+        not_deaccumulated: list[str] = []
+        not_deaccumulated_cids: list[str] = []
+        for cid in list(concept_metrics.keys()):
+            c = concept_by_id.get(cid, {})
+            if (c.get("statement_type") or "").strip().lower() != "cashflow":
+                continue
+            if classify_cashflow_kind(
+                c.get("concept") or "", c.get("label") or "",
+            ) != "flow":
+                continue  # ending/beginning snapshots are as-is / skip
+            if cid not in derived_ids:
+                not_deaccumulated.append(
+                    c.get("label") or c.get("concept") or str(cid)
+                )
+                not_deaccumulated_cids.append(cid)
+        if not_deaccumulated:
+            # Omit un-deaccumulated flow concepts so cumulative YTD values are
+            # not persisted as quarterly actuals, while saving all valid metrics.
+            for cid in not_deaccumulated_cids:
+                concept_metrics.pop(cid, None)
+            reason = (
+                f"Cash-flow statement is {effective_cf_basis} (year-to-date, detected from {basis_source})"
+            )
+            if basis_source == "document" and agent_cashflow_basis:
+                reason += f" although agent reported '{agent_cashflow_basis}'"
+            cf_deaccum_findings.append({
+                "type": "cashflow_not_deaccumulated",
+                "severity": "medium",
+                "message": (
+                    f"{reason} — {len(not_deaccumulated)} flow concept(s) were not "
+                    f"de-accumulated and omitted from save: {', '.join(not_deaccumulated[:10])}."
+                ),
+                "evidence": {
+                    "cashflow_basis": effective_cf_basis,
+                    "agent_cashflow_basis": agent_cashflow_basis,
+                    "doc_cashflow_basis": doc_basis,
+                    "not_deaccumulated": not_deaccumulated[:20],
+                },
+            })
+            report_call(
+                f"  [pipeline]  ⚠️ cash-flow is {effective_cf_basis} ({basis_source}) — "
+                f"{len(not_deaccumulated)} flow concept(s) not de-accumulated "
+                f"(omitted from quarterly save, run continues)"
+            )
 
     # ── 6. Return state ──────────────────────────────────────────────────
     raw_text = plain_text[:EXTRACTION_MAX_CHARS]
@@ -802,6 +1032,7 @@ def _run_extraction_pass(
         currency_meta, state.get("document_map"), agent_missing
     )
     findings.extend(ambiguity_findings)
+    findings.extend(cf_deaccum_findings)
 
     # Deterministic company-identity cross-check: the agent reports the
     # company name it actually read (__company_name__); compare (normalized)

@@ -128,18 +128,54 @@ _IS_SECONDARY_KW = re.compile(
     re.I,
 )
 
+# Balance-sheet and cash-flow keyword sets for statement-aware routing hints.
+# Strong indicators of the statement tables (not narrative mentions).
+_BS_KW = re.compile(
+    r"\b(?:total\s+assets|total\s+liabilities"
+    r"|(?:shareholders|stockholders)['\u2019]?\s+equity"
+    r"|total\s+liabilities\s+and\s+(?:shareholders|stockholders)['\u2019]?\s+equity"
+    r"|cash\s+and\s+cash\s+equivalents|marketable\s+securities"
+    r"|accounts\s+receivable|inventories"
+    r"|property[,.]?\s+plant\s+and\s+equipment|property\s+and\s+equipment"
+    r"|goodwill|current\s+assets|current\s+liabilities"
+    r"|long-term\s+debt|retained\s+earnings"
+    r"|accumulated\s+other\s+comprehensive\s+income)",
+    re.I,
+)
+_CF_KW = re.compile(
+    r"\b(?:cash\s+flow[s]?\s+from\s+(?:operating|investing|financing)\s+activities"
+    r"|cash\s+(?:generated\s+by|used\s+in|provided\s+by)\s+(?:operating|investing|financing)\s+activities"
+    r"|net\s+cash\s+(?:provided\s+by|used\s+in)\s+(?:operating|investing|financing)\s+activities"
+    r"|net\s+(?:increase|decrease|change)\s+in\s+cash"
+    r"|(?:increase|decrease)\s+in\s+cash,\s+cash\s+equivalents"
+    r"|cash,\s+cash\s+equivalents\s+and\s+restricted\s+cash"
+    r"|purchases?\s+of\s+marketable\s+securities"
+    r"|proceeds\s+from\s+(?:sales?|maturities)\s+of\s+marketable\s+securities"
+    r"|payments?\s+for\s+acquisition\s+of\s+property"
+    r"|capital\s+expenditures?|purchases?\s+of\s+property\s+and\s+equipment"
+    r"|dividends?\s+(?:and\s+dividend\s+equivalents\s+)?paid"
+    r"|payments?\s+for\s+dividends"
+    r"|repurchases?\s+of\s+common\s+stock)",
+    re.I,
+)
+
 def prescan_document(
     raw_text: str,
     document_map: list[dict] | None = None,
 ) -> tuple[str | None, str | None, dict | None]:
     """Scan the full document once for scale and (optionally) exhibit-level
-    income-statement routing hints.
+    financial-statement routing hints.
 
-    Returns ``(scale, shares_scale, is_hints)`` where *is_hints* is
-    ``{"exhibit": str, "lines": [start, end], "primary_count": int,
-    "secondary_count": int}`` for each exhibit range that appears to contain
-    income-statement content.  ``None`` when no document_map is provided
-    (backward-compatible with callers that only want scale).
+    Returns ``(scale, shares_scale, hints)`` where *hints* is a list of
+    ``{"exhibit", "lines", "primary_count", "secondary_count", "bs_count",
+    "cf_count", "income", "balance_sheet", "cash_flow"}`` — one entry per
+    exhibit range that appears to contain at least one of the income
+    statement, balance sheet, or cash flow statement (``primary_count``/
+    ``secondary_count`` are the income-statement counts; ``income``/
+    ``balance_sheet``/``cash_flow`` are booleans marking which statements are
+    present).  Sorted most-complete-exhibit first.  ``None`` when no
+    document_map is provided (backward-compatible with callers that only
+    want scale).
 
     Period detection is NOT done here — the period agent reads the document
     header itself.
@@ -168,7 +204,7 @@ def prescan_document(
     if _PRESCAN_SHARES_IN_THOUSANDS_RX.search(text):
         shares_scale = "thousands"
 
-    # ── Per-exhibit income-statement routing hints ──────────────────────
+    # ── Per-exhibit statement routing hints (income + balance sheet + cash flow) ──
     is_hints: list[dict] | None = None
     if document_map:
         lines = raw_text.split("\n")
@@ -180,7 +216,12 @@ def prescan_document(
             exhibit_text = "\n".join(lines[ls - 1 : le])
             primary_count = len(_IS_PRIMARY_KW.findall(exhibit_text))
             secondary_count = len(_IS_SECONDARY_KW.findall(exhibit_text))
-            if primary_count >= 3 and secondary_count >= 2:
+            bs_count = len(_BS_KW.findall(exhibit_text))
+            cf_count = len(_CF_KW.findall(exhibit_text))
+            income_ok = primary_count >= 3 and secondary_count >= 2
+            bs_ok = bs_count >= 3
+            cf_ok = cf_count >= 3
+            if income_ok or bs_ok or cf_ok:
                 if is_hints is None:
                     is_hints = []
                 is_hints.append({
@@ -188,10 +229,22 @@ def prescan_document(
                     "lines": [ls, le],
                     "primary_count": primary_count,
                     "secondary_count": secondary_count,
+                    "bs_count": bs_count,
+                    "cf_count": cf_count,
+                    "income": income_ok,
+                    "balance_sheet": bs_ok,
+                    "cash_flow": cf_ok,
                 })
-        # Sort by primary keyword density so the best exhibit is first.
+        # Sort by statement coverage (how many statements are present), then
+        # by total keyword density, so the most complete exhibit is first.
         if is_hints:
-            is_hints.sort(key=lambda h: h["primary_count"], reverse=True)
+            is_hints.sort(
+                key=lambda h: (
+                    int(h["income"]) + int(h["balance_sheet"]) + int(h["cash_flow"]),
+                    h["primary_count"] + h["bs_count"] + h["cf_count"],
+                ),
+                reverse=True,
+            )
 
     return scale, shares_scale, is_hints
 
@@ -384,6 +437,17 @@ def map_concepts(
     """Map extracted metric keys to concept_ids via Tier 0 (bracket/taxonomy key)
     and Tier 1 (deterministic label match).
 
+    Handles cross-statement concepts (e.g. us-gaap:NetIncomeLoss present in both
+    income and cashflow statements):
+    1. Statement-qualified keys (e.g. [us-gaap:NetIncomeLoss|income],
+       [us-gaap:NetIncomeLoss|cashflow]) map directly to their statement row.
+    2. Base concept keys without statement suffix (e.g. [us-gaap:NetIncomeLoss])
+       map to all matching concepts across different statements (one per statement_type)
+       that have not already been mapped.
+    3. Statement aliases (|is, |bs, |cf) resolve to their canonical statement.
+    4. Exact and normalized label matches similarly map across different statement
+       types (one per statement_type) when not already mapped.
+
     Returns:
         concept_metrics:  concept_id → float
         reverse_map:      concept_id → metric_key (for mapped_metric_keys)
@@ -392,40 +456,145 @@ def map_concepts(
     def _norm(s: str) -> str:
         return _norm_label(s)
 
-    taxonomy_key_to_id: dict[str, str] = {}
-    bracket_key_to_id: dict[str, str] = {}
-    exact_label_to_id: dict[str, str] = {}
-    norm_label_to_id: dict[str, str] = {}
+    _STMT_ALIASES: dict[str, str] = {
+        "is": "income",
+        "incomestatement": "income",
+        "income": "income",
+        "bs": "balancesheet",
+        "balance_sheet": "balancesheet",
+        "balancesheet": "balancesheet",
+        "cf": "cashflow",
+        "cash_flow": "cashflow",
+        "cashflow": "cashflow",
+        "cashflowstatement": "cashflow",
+    }
+
+    # 1. Exact taxonomy / bracket key lookups
+    taxonomy_key_to_concept: dict[str, dict] = {}
+    bracket_key_to_concept: dict[str, dict] = {}
+
+    # 2. Statement-alias lookups: (base_tkey, canonical_statement) -> concept
+    alias_key_to_concept: dict[tuple[str, str], dict] = {}
+
+    # 3. Base concept / taxonomy key lookups across statements: base_key -> {stmt_type: [concept, ...]}
+    base_key_to_concepts: dict[str, dict[str, list[dict]]] = {}
+    bracket_base_key_to_concepts: dict[str, dict[str, list[dict]]] = {}
+
+    # 4. Label lookups across statements: label -> {stmt_type: [concept, ...]}
+    exact_label_to_concepts: dict[str, dict[str, list[dict]]] = {}
+    norm_label_to_concepts: dict[str, dict[str, list[dict]]] = {}
 
     for c in target_concepts:
-        cid = c["_id"]
-        exact_label_to_id[c["label"]] = cid
-        norm_label_to_id[_norm(c["label"])] = cid
-        key = c.get("taxonomy_key") or c.get("concept") or ""
-        if key:
-            taxonomy_key_to_id[key] = cid
-            bracket_key_to_id[f"[{key}]"] = cid
+        st = (c.get("statement_type") or "income").strip().lower()
+        tkey = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+        concept = (c.get("concept") or "").strip()
+        label = (c.get("label") or "").strip()
+
+        if tkey:
+            taxonomy_key_to_concept[tkey] = c
+            bracket_key_to_concept[f"[{tkey}]"] = c
+
+            parts = tkey.split("|")
+            base_part = parts[0].lower()
+            if len(parts) >= 2:
+                stmt_part = parts[1].lower()
+                canonical_st = _STMT_ALIASES.get(stmt_part, stmt_part)
+                alias_key_to_concept[(base_part, canonical_st)] = c
+
+        for bk in filter(None, {concept, tkey.split("|")[0]}):
+            base_key_to_concepts.setdefault(bk, {}).setdefault(st, []).append(c)
+            bracket_base_key_to_concepts.setdefault(f"[{bk}]", {}).setdefault(st, []).append(c)
+
+        if label:
+            exact_label_to_concepts.setdefault(label, {}).setdefault(st, []).append(c)
+            norm_label_to_concepts.setdefault(_norm(label), {}).setdefault(st, []).append(c)
 
     concept_metrics: dict[str, float] = {}
     reverse_map: dict[str, str] = {}
     mapped_keys: set[str] = set()
 
+    # Pass 1: Exact taxonomy_key or [taxonomy_key] matches
     for key, value in metrics.items():
         if not isinstance(value, (int, float)):
             continue
-        if key in taxonomy_key_to_id:
-            cid = taxonomy_key_to_id[key]
-        elif key in bracket_key_to_id:
-            cid = bracket_key_to_id[key]
-        elif key in exact_label_to_id:
-            cid = exact_label_to_id[key]
-        elif _norm(key) in norm_label_to_id:
-            cid = norm_label_to_id[_norm(key)]
-        else:
+        c = taxonomy_key_to_concept.get(key) or bracket_key_to_concept.get(key)
+        if c:
+            cid = c["_id"]
+            concept_metrics[cid] = float(value)
+            reverse_map[cid] = key
+            mapped_keys.add(key)
+
+    # Pass 2: Statement-alias matches (e.g. [foo|cf] when tkey is foo|cashflow)
+    for key, value in metrics.items():
+        if not isinstance(value, (int, float)):
             continue
-        concept_metrics[cid] = float(value)
-        reverse_map[cid] = key
-        mapped_keys.add(key)
+        raw_key = key.strip().strip("[]")
+        parts = raw_key.split("|")
+        if len(parts) == 2:
+            base_part, suffix = parts[0].strip().lower(), parts[1].strip().lower()
+            canonical_st = _STMT_ALIASES.get(suffix)
+            if canonical_st:
+                c = alias_key_to_concept.get((base_part, canonical_st))
+                if c and c["_id"] not in concept_metrics:
+                    cid = c["_id"]
+                    concept_metrics[cid] = float(value)
+                    reverse_map[cid] = key
+                    mapped_keys.add(key)
+
+    # Pass 3: Base concept / bracket base key matches (spreads across statements)
+    for key, value in metrics.items():
+        if not isinstance(value, (int, float)):
+            continue
+        stmt_map = bracket_base_key_to_concepts.get(key) or base_key_to_concepts.get(key)
+        if stmt_map:
+            matched_any = False
+            for st, clist in stmt_map.items():
+                if len(clist) == 1:
+                    c = clist[0]
+                    cid = c["_id"]
+                    if cid not in concept_metrics:
+                        concept_metrics[cid] = float(value)
+                        reverse_map[cid] = key
+                        matched_any = True
+            if matched_any:
+                mapped_keys.add(key)
+
+    # Pass 4: Exact label matches (spreads across statements)
+    for key, value in metrics.items():
+        if not isinstance(value, (int, float)):
+            continue
+        stmt_map = exact_label_to_concepts.get(key)
+        if stmt_map:
+            matched_any = False
+            for st, clist in stmt_map.items():
+                if len(clist) == 1:
+                    c = clist[0]
+                    cid = c["_id"]
+                    if cid not in concept_metrics:
+                        concept_metrics[cid] = float(value)
+                        reverse_map[cid] = key
+                        matched_any = True
+            if matched_any:
+                mapped_keys.add(key)
+
+    # Pass 5: Normalized label matches (spreads across statements)
+    for key, value in metrics.items():
+        if not isinstance(value, (int, float)):
+            continue
+        norm_k = _norm(key)
+        stmt_map = norm_label_to_concepts.get(norm_k)
+        if stmt_map:
+            matched_any = False
+            for st, clist in stmt_map.items():
+                if len(clist) == 1:
+                    c = clist[0]
+                    cid = c["_id"]
+                    if cid not in concept_metrics:
+                        concept_metrics[cid] = float(value)
+                        reverse_map[cid] = key
+                        matched_any = True
+            if matched_any:
+                mapped_keys.add(key)
 
     return concept_metrics, reverse_map, mapped_keys
 

@@ -323,6 +323,7 @@ def get_statement_concepts(
     parsed: list[tuple[dict[str, Any], str, str, str, str]] = []  # (doc, head, member, member_tag, path)
     base_counts: dict[tuple[str, str], int] = {}
     base_key_counts: dict[tuple[str, str], int] = {}
+    stmt_types_per_key: dict[str, set[str]] = {}
     label_groups: dict[tuple[str, str], list[str]] = {}
     path_to_head: dict[str, str] = {}
     for d in cursor:
@@ -352,6 +353,7 @@ def get_statement_concepts(
         label_groups.setdefault(key, []).append(path)
         tkey = (f"{concept}|{member_tag}" if member_tag else concept).lower()
         base_key_counts[(st, tkey)] = base_key_counts.get((st, tkey), 0) + 1
+        stmt_types_per_key.setdefault(tkey, set()).add(st)
         # The first sorted row at a path is used only as the fallback parent
         # label for label disambiguation.  The hierarchy builder retains every
         # (path, order_key) row; this map must not be used for hierarchy edges.
@@ -385,10 +387,16 @@ def get_statement_concepts(
             final_label = head
 
         # Taxonomy key must be unique per row or the LLM's JSON keys collide
-        # (e.g. us-gaap:ServiceMember under both Revenue and Cost of Revenue).
+        # (e.g. us-gaap:ServiceMember under both Revenue and Cost of Revenue,
+        # or us-gaap:NetIncomeLoss across income and cashflow).
         taxonomy_key = f"{concept}|{member_tag}" if member_tag else concept
         tkey = taxonomy_key.lower()
-        if base_key_counts[(st, tkey)] > 1 and path:
+        has_cross_stmt = len(stmt_types_per_key.get(tkey, set())) > 1
+        has_intra_stmt = base_key_counts.get((st, tkey), 0) > 1
+
+        if has_cross_stmt:
+            taxonomy_key = f"{taxonomy_key}|{st}"
+        if has_intra_stmt and path:
             taxonomy_key = f"{taxonomy_key}|{path}"
 
         # Drop only exact duplicates (same concept + path in the same statement).

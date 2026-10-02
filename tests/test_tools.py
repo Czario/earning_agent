@@ -118,5 +118,33 @@ class TestScaleCurrencyTools(unittest.TestCase):
         self.assertIn("Invalid range", out)
 
 
+class TestGetPriorValue(unittest.TestCase):
+    def test_always_present_in_pi_tools(self):
+        tools = build_pi_tools("doc text", {})
+        pv_tool = _tool(tools, "get_prior_value")
+        self.assertIsNotNone(pv_tool)
+
+    def test_lookup_with_metric_arg(self):
+        pvs = {"Revenue": 12345.0, "Net Income": 678.0}
+        tools = build_pi_tools("doc text", {}, prior_values=pvs)
+        out = _tool(tools, "get_prior_value").invoke({"metric": "Revenue"})
+        self.assertIn("12,345", out)
+        self.assertIn("Revenue", out)
+
+    def test_lookup_with_metric_description_arg(self):
+        pvs = {"Weighted Average Number of Shares Outstanding, Basic": 15000000.0}
+        tools = build_pi_tools("doc text", {}, prior_values=pvs)
+        out = _tool(tools, "get_prior_value").invoke(
+            {"metric_description": "Weighted Average Number of Shares Outstanding, Basic"}
+        )
+        self.assertIn("15,000,000", out)
+
+    def test_substring_match(self):
+        pvs = {"Total Net Sales": 50000.0}
+        tools = build_pi_tools("doc text", {}, prior_values=pvs)
+        out = _tool(tools, "get_prior_value").invoke({"metric": "Net Sales"})
+        self.assertIn("50,000", out)
+
+
 if __name__ == "__main__":
     unittest.main()

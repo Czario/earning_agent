@@ -222,6 +222,56 @@ def _parse_llm_response(
     return parsed
 
 
+def _sanitize_tool_messages(messages: list) -> list:
+    """Ensure every tool_call in an AIMessage is followed by a matching ToolMessage.
+
+    Providers like DeepSeek and OpenAI reject requests with a 400 error if any
+    assistant message with tool_calls is not followed by tool messages for every
+    tool_call_id.
+    """
+    sanitized: list = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        sanitized.append(msg)
+        if isinstance(msg, AIMessage):
+            expected_ids: list[str] = []
+            for tc in getattr(msg, "tool_calls", None) or []:
+                tid = tc.get("id")
+                if tid:
+                    expected_ids.append(tid)
+            for itc in getattr(msg, "invalid_tool_calls", None) or []:
+                tid = itc.get("id")
+                if tid:
+                    expected_ids.append(tid)
+
+            if expected_ids:
+                j = i + 1
+                seen_ids: set[str] = set()
+                while j < n and isinstance(messages[j], ToolMessage):
+                    seen_ids.add(getattr(messages[j], "tool_call_id", ""))
+                    sanitized.append(messages[j])
+                    j += 1
+
+                for expected_id in expected_ids:
+                    if expected_id not in seen_ids:
+                        logger.warning(
+                            "Sanitizing: inserting placeholder ToolMessage for missing tool_call_id=%s",
+                            expected_id,
+                        )
+                        sanitized.append(
+                            ToolMessage(
+                                content="Error: Tool call was not executed or response was missing.",
+                                tool_call_id=expected_id,
+                            )
+                        )
+                i = j
+                continue
+        i += 1
+    return sanitized
+
+
 def run_agent_loop(
     system_prompt: str,
     initial_message: str,
@@ -307,6 +357,7 @@ def run_agent_loop(
             f"({LLM_PROVIDER or 'llm'})"
         )
 
+        messages = _sanitize_tool_messages(messages)
         try:
             _step_t0 = time.perf_counter()
             response = llm_with_tools.invoke(messages)
@@ -333,7 +384,8 @@ def run_agent_loop(
         messages.append(response)
 
         tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
+        invalid_tool_calls = getattr(response, "invalid_tool_calls", None) or []
+        if not tool_calls and not invalid_tool_calls:
             content = getattr(response, "content", "") or ""
             if "finalize" in content.lower() or "{" in content:
                 break
@@ -397,8 +449,6 @@ def run_agent_loop(
                     ),
                     tool_call_id=tool_call_id,
                 ))
-                messages.extend(tool_messages)
-                break
             else:
                 tool_fn = next((t for t in all_tools if t.name == tool_name), None)
                 if tool_fn is not None:
@@ -418,6 +468,20 @@ def run_agent_loop(
                     cap = _TOOL_RESULT_CAPS.get(tool_name, 8000)
                     result = result[:cap] + "\n... (truncated)"
                 tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+
+        for itc in invalid_tool_calls:
+            tool_call_id = itc.get("id") or ""
+            err = itc.get("error") or "Invalid tool call arguments"
+            tool_name = itc.get("name") or "unknown"
+            logger.warning(
+                "Agent step %d for %s → invalid tool call: %s: %s",
+                step, ticker, tool_name, err,
+            )
+            report_call(f"  [tool]  ✗ invalid call to {tool_name}: {str(err)[:100]}")
+            tool_messages.append(ToolMessage(
+                content=f"Error: Invalid arguments for tool {tool_name}: {err}",
+                tool_call_id=tool_call_id,
+            ))
 
         messages.extend(tool_messages)
         if final_result is not None:

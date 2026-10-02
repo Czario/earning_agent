@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # truncated exhibit, non-USD currency) remain blocking.
 _ABSENCE_ONLY_FINDING_TYPES = frozenset({
     "missing_concept",         # agent: searched but could not locate
+    "cashflow_not_deaccumulated",  # un-deaccumulated cash flow concept never blocks save
 })
 
 

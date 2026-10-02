@@ -42,6 +42,12 @@ def build_pi_tools(
     section_store: dict | None = None,
     section_builder: Callable[[str], tuple[dict, float]] | None = None,
     prescan_is_hints: list[dict] | None = None,
+    include_find_sections: bool = True,
+    fiscal_year: int | None = None,
+    quarter: int | None = None,
+    include_cashflow_tools: bool = True,
+    period: Any | None = None,
+    prior_values: dict[str, float] | None = None,
 ) -> list:
     """Build the pi-style tool set for raw document navigation.
 
@@ -66,21 +72,53 @@ def build_pi_tools(
         section_builder: Callable ``(text, query=None) -> (index, elapsed)``
             used by ``find_sections`` on a cold cache.  Defaults to the LLM
             section locator (``agent/indexer.build_section_index``).
-        prescan_is_hints: Prescan-detected income-statement exhibit hints
-            (``[{exhibit, lines, primary_count, secondary_count}]``).  When
-            present, ``find_sections`` returns an instant routing hint instead
-            of calling the expensive LLM indexer.
+        prescan_is_hints: Prescan-detected financial-statement exhibit hints
+            (``[{exhibit, lines, primary_count, secondary_count, bs_count,
+            cf_count, income, balance_sheet, cash_flow}]``).  When present,
+            ``find_sections`` returns an instant routing hint instead of
+            calling the expensive LLM indexer.
+        include_find_sections: When False, ``find_sections`` is omitted from
+            the returned tool set.  The period agent uses this — it only
+            needs the period header (get_document_info/search/read_lines),
+            and a stray ``find_sections()`` call there would trigger the
+            expensive full-document LLM indexer for no benefit.
+        fiscal_year: The canonical fiscal year from the detected period —
+            baked into the ``deaccumulate_cashflow`` tool closure so the
+            agent cannot hallucinate the fiscal year.
+        quarter: The canonical quarter (1–3, or None for annual) from the
+            detected period — baked into ``deaccumulate_cashflow``.
+        include_cashflow_tools: When False, the cash-flow de-accumulation tools
+            (``detect_cashflow_period_basis`` / ``deaccumulate_cashflow``) are
+            omitted.  The period agent uses this — it runs before period
+            detection and never touches the cash-flow statement.
     """
     lines = document_text.split("\n")
     total_lines = len(lines)
     total_chars = len(document_text)
     document_map = document_map or []
 
+    if prior_values is None and cik and target_concepts and period is not None:
+        try:
+            from earnings_agents.agent.derive import load_prior_values
+            prior_values = load_prior_values(target_concepts, cik, period)
+        except Exception as exc:
+            logger.debug("Failed to load prior values in build_pi_tools: %s", exc)
+            prior_values = {}
+    elif prior_values is None:
+        prior_values = {}
+
     # ── Search index: word → line numbers ──────────────────────────────
     _line_index: dict[str, list[int]] = {}
     for i, line in enumerate(lines):
         for word in re.findall(r"[a-zA-Z]{4,}", line.lower()):
             _line_index.setdefault(word, []).append(i)
+
+    # Cash-flow concepts the agent has de-accumulated THIS run (normalized
+    # concept keys).  verify_cash_flow_identity refuses to verify a YTD
+    # cash-flow statement until at least one flow row has been
+    # de-accumulated — this FORCES the de-accumulation instead of relying on
+    # the agent to optionally follow the prompt.
+    _cf_deaccumulated: set[str] = set()
 
     def _exhibit_for_line(ln: int) -> str:
         """Which exhibit does a line belong to (empty when single-document)."""
@@ -192,15 +230,17 @@ def build_pi_tools(
         if prescan_is_hints:
             best = prescan_is_hints[0]
             parts = [
-                f"Income-statement exhibit (prescan): {best['exhibit']}",
+                f"Financial-statement exhibit (prescan): {best['exhibit']}",
                 f"  lines {best['lines'][0]}-{best['lines'][1]}"
-                f" ({best['primary_count']} IS + {best['secondary_count']} context hits)",
+                f" (IS {best.get('primary_count', 0)}+{best.get('secondary_count', 0)} ctx, "
+                f"BS {best.get('bs_count', 0)}, CF {best.get('cf_count', 0)})",
             ]
             # Add remaining exhibits as secondary targets.
             for h in prescan_is_hints[1:]:
                 parts.append(
                     f"  Also: {h['exhibit']} lines {h['lines'][0]}-{h['lines'][1]}"
-                    f" ({h['primary_count']} IS + {h['secondary_count']} context hits)"
+                    f" (IS {h.get('primary_count', 0)}+{h.get('secondary_count', 0)} ctx, "
+                    f"BS {h.get('bs_count', 0)}, CF {h.get('cf_count', 0)})"
                 )
             return "\n".join(parts)
 
@@ -209,6 +249,12 @@ def build_pi_tools(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "find_sections failed for %s: %s", cik or "?", exc, exc_info=True
+            )
+            from earnings_agents.hooks import report_call
+
+            report_call(
+                f"  [index]  section map FAILED ({str(exc)[:80]}) — "
+                f"agent will navigate with search()/read_lines()"
             )
             return (
                 "Section indexing failed. Use search() and read_lines() to "
@@ -322,26 +368,34 @@ def build_pi_tools(
 
     # ── 4. Prior value lookup ──────────────────────────────────────────
     @_lc_tool
-    def get_prior_value(metric_description: str) -> str:
+    def get_prior_value(
+        metric: str | None = None,
+        metric_description: str | None = None,
+    ) -> str:
         """Look up the prior reporting period's value for a metric.
 
         Args:
-            metric_description: A short description, e.g. "Revenue".
+            metric: A short description, e.g. "Revenue" or "Weighted Average Number of Shares Outstanding".
+            metric_description: Synonym for metric.
 
         Returns the prior period's value for reference.  Use ONLY to
         confirm the correct column — do NOT return it as your answer.
         """
-        desc_lower = metric_description.lower().strip()
-        for label, value in prior_values.items():
+        raw = metric or metric_description or ""
+        desc_lower = raw.lower().strip()
+        if not desc_lower:
+            return "Please provide a metric description, e.g. get_prior_value(metric='Revenue')."
+        pv = prior_values or {}
+        for label, value in pv.items():
             if label.lower() == desc_lower:
                 return f"Prior period '{label}': {value:,.0f}"
-        for label, value in prior_values.items():
+        for label, value in pv.items():
             label_lower = label.lower()
             if desc_lower in label_lower or label_lower in desc_lower:
                 return f"Prior period '{label}': {value:,.0f}"
-        if prior_values:
-            available = ", ".join(list(prior_values.keys())[:10])
-            return f"No prior value for '{metric_description}'. Available: {available}"
+        if pv:
+            available = ", ".join(list(pv.keys())[:10])
+            return f"No prior value for '{raw}'. Available: {available}"
         return "No prior-period reference values available."
 
     # ── 5. Identity verification ──────────────────────────────────────
@@ -412,6 +466,30 @@ def build_pi_tools(
         Call after reading the Statement of Cash Flows to verify that the
         three section totals sum to the reported net change in cash.
         """
+        # FORCING FUNCTION: if the cash-flow statement is year-to-date
+        # ("Six/Nine Months Ended") and the agent has not yet de-accumulated
+        # any flow row, REFUSE to verify.  This blocks the agent from
+        # reporting YTD values as the quarter.
+        from earnings_agents.agent.deaccumulate import detect_cashflow_statement_basis
+        basis = detect_cashflow_statement_basis(document_text)
+        if (
+            basis
+            and basis["basis"] in ("ytd_6m", "ytd_9m")
+            and quarter in (2, 3)
+            and not _cf_deaccumulated
+        ):
+            return (
+                f"✗ NOT VERIFIED — the cash-flow statement is \"{basis['evidence']}\" "
+                f"(YEAR-TO-DATE, {basis['months']} months).  The values you passed "
+                f"(operating {operating_cf:,.0f}, investing {investing_cf:,.0f}, "
+                f"financing {financing_cf:,.0f}, net change {net_change:,.0f}) are "
+                f"{basis['months']}-month CUMULATIVES, NOT the quarter.  De-accumulate "
+                f"EVERY cash-flow flow row via deaccumulate_cashflow(value=<printed>,"
+                f"concept_key=<bracketed key>, ytd_months={basis['months']},"
+                f"filing_label=<row label>), then call verify_cash_flow_identity() again "
+                f"with the de-accumulated quarterly values."
+            )
+
         expected = operating_cf + investing_cf + financing_cf
         diff = abs(net_change - expected)
         pct = (diff / max(abs(net_change), 1)) * 100 if net_change != 0 else 0.0
@@ -419,7 +497,11 @@ def build_pi_tools(
             return (
                 f"✓ VERIFIED: Operating ({operating_cf:,.0f}) + Investing ({investing_cf:,.0f}) "
                 f"+ Financing ({financing_cf:,.0f}) = {expected:,.0f} ≈ Net Change ({net_change:,.0f}). "
-                f"Cash flow section totals match net change."
+                f"Cash flow section totals match net change.\n"
+                f"⚠ This identity holds for BOTH quarterly and year-to-date (YTD) values. "
+                f"If the cash-flow header is 'Six/Nine Months Ended', the figures are YTD — "
+                f"call detect_cashflow_period_basis() then deaccumulate_cashflow() per flow row "
+                f"before reporting."
             )
         else:
             return (
@@ -625,7 +707,11 @@ def build_pi_tools(
 
     # ── 10. Concept mapping (in-loop semantic mapping) ─────────────────
     @_lc_tool
-    def map_concept(metric_label: str, candidates: list[str] | None = None) -> str:
+    def map_concept(
+        metric_label: str,
+        candidates: list[str] | None = None,
+        statement_type: str | None = None,
+    ) -> str:
         """Map a filing row label to a concept from the target concept list.
 
         Args:
@@ -633,6 +719,8 @@ def build_pi_tools(
                 "Total revenue" or "Cloud and software".
             candidates: Optional list of concept labels to restrict the
                 search to. Omit to search the full target list.
+            statement_type: Optional statement to filter to ("income",
+                "balancesheet", "cashflow").
 
         Returns the matching concept's exact bracketed key (and concept id).
         Use when a filing row's wording does not exactly match the concept
@@ -647,10 +735,16 @@ def build_pi_tools(
         from earnings_agents.agent.derive import _norm_label
 
         cands = target_concepts
+        if statement_type:
+            st_norm = statement_type.strip().lower()
+            st_map = {"is": "income", "bs": "balancesheet", "cf": "cashflow"}
+            st_target = st_map.get(st_norm, st_norm)
+            cands = [c for c in cands if (c.get("statement_type") or "").strip().lower() == st_target]
+
         if candidates:
             cset = {c.strip().lower() for c in candidates}
             cands = [
-                c for c in target_concepts
+                c for c in cands
                 if (c.get("label") or "").strip().lower() in cset
                 or (c.get("taxonomy_key") or c.get("concept") or "").strip().lower() in cset
             ]
@@ -700,11 +794,128 @@ def build_pi_tools(
         """
         return _safe_eval_expression(expression)
 
-    return [
+    # ── 12. Cash-flow period-basis detection (advisory) ────────────────
+    @_lc_tool
+    def detect_cashflow_period_basis(start: int | None = None, end: int | None = None) -> str:
+        """Detect the CASH-FLOW statement's period basis (quarterly vs year-to-date).
+
+        Args:
+            start: Optional first line (1-based) to restrict the scan.
+            end: Optional last line (1-based) to restrict the scan.
+
+        Call this with NO arguments BEFORE extracting cash-flow numbers — it
+        locates the cash-flow statement header and reports its column basis.
+        ytd_6m / ytd_9m ("Six/Nine Months Ended") means the printed flow
+        values are CUMULATIVE year-to-date and must be de-accumulated via
+        deaccumulate_cashflow() before reporting.  quarterly ("Three Months
+        Ended") means the printed values are already the quarter.
+        """
+        from earnings_agents.agent.deaccumulate import (
+            detect_cashflow_period_basis as _detect_basis,
+            detect_cashflow_statement_basis as _detect_cf_basis,
+        )
+
+        if start is None and end is None:
+            b = _detect_cf_basis(document_text)
+            if not b:
+                return (
+                    "No cash-flow statement header found. Use search(\"cash flows\") "
+                    "to locate it, then call detect_cashflow_period_basis(start, end) "
+                    "on its header lines."
+                )
+            if b["basis"] in ("ytd_6m", "ytd_9m"):
+                directive = (
+                    f"YEAR-TO-DATE ({b['months']} months) — the printed flow values are "
+                    f"CUMULATIVE, NOT the quarter.  De-accumulate EVERY flow row via "
+                    f"deaccumulate_cashflow(value=<printed>, concept_key=<bracketed key>, "
+                    f"ytd_months={b['months']}, filing_label=<row label>) and report the "
+                    f"RETURNED quarterly value.  \"...ending balances\" → as-is; "
+                    f"\"...beginning balances\" → skip."
+                )
+            elif b["basis"] == "annual":
+                directive = (
+                    "Annual (12 months) — treat as the full fiscal year, not a quarter."
+                )
+            else:
+                directive = "quarterly — extract the printed values as-is."
+            return (
+                f"Cash-flow statement basis: {b['basis']} ({b['months']} months) — "
+                f"evidence: \"{b['evidence']}\"\n{directive}"
+            )
+
+        if start is None or end is None:
+            snippet = document_text
+        else:
+            if start < 1 or end > total_lines or start > end:
+                return f"Invalid range. Document has {total_lines:,} lines."
+            snippet = "\n".join(lines[start - 1 : end])
+
+        found = _detect_basis(snippet)
+        if not found:
+            return "No 'X Months Ended' / 'Year Ended' header in this range."
+        parts = [
+            f"Period basis: {f['basis']} ({f['months']} months) — evidence: \"{f['evidence']}\""
+            for f in found
+        ]
+        parts.append(
+            "If the cash-flow column header is 'Six/Nine Months Ended' "
+            "(ytd_6m/ytd_9m), the printed flow values are year-to-date — "
+            "de-accumulate each flow via deaccumulate_cashflow(). "
+            "'Three Months Ended' = the quarter itself (no de-accumulation)."
+        )
+        return "\n".join(parts)
+
+    # ── 13. Cash-flow YTD de-accumulation ─────────────────────────────
+    @_lc_tool
+    def deaccumulate_cashflow(
+        value: float,
+        concept_key: str,
+        ytd_months: int,
+        filing_label: str | None = None,
+    ) -> str:
+        """De-accumulate one year-to-date (YTD) cash-flow value into its quarter.
+
+        Args:
+            value: The CURRENT-period YTD value read from the cash-flow
+                statement (e.g. the "Six/Nine Months Ended" column).
+            concept_key: The bracketed taxonomy key of the cash-flow row
+                (resolve the filing label with map_concept() first), e.g.
+                "[us-gaap:PaymentsToAcquirePropertyPlantAndEquipment]".
+            ytd_months: The cash-flow header's month count — 6 for Q2, 9 for Q3.
+            filing_label: The row label AS PRINTED in the filing (e.g. "Cash,
+                cash equivalents and restricted cash, ending balances") — used
+                to distinguish end-of-period snapshots (as-is) from
+                beginning-of-period snapshots (skip).
+
+        Returns the quarterly value (Q2 = 6m − Q1, Q3 = 9m − (Q1+Q2)), or a
+        directive: AS-IS (end-of-period snapshot), SKIP (beginning-of-period
+        snapshot), or MISSING (a prior quarter isn't stored yet).  Report the
+        returned quarterly value under the bracketed key and list it in
+        __derived__.  Never de-accumulate unless the header is YTD.
+        """
+        from earnings_agents.agent.deaccumulate import deaccumulate_cashflow_value
+
+        result = deaccumulate_cashflow_value(
+            cik=cik,
+            value=value,
+            concept_key=concept_key,
+            fiscal_year=fiscal_year,
+            quarter=quarter,
+            ytd_months=ytd_months,
+            target_concepts=target_concepts,
+            filing_label=filing_label or "",
+        )
+        # Record a successful de-accumulation so verify_cash_flow_identity
+        # knows the agent has de-accumulated (unblocks its YTD refusal).
+        if result.startswith("De-accumulated"):
+            _cf_deaccumulated.add((concept_key or "").strip().strip("[]"))
+        return result
+
+    tools = [
         get_document_info,
-        find_sections,
         read_lines,
         search,
+        get_prior_value,
         verify_identity,
         verify_balance_sheet_identity,
         verify_cash_flow_identity,
@@ -715,3 +926,8 @@ def build_pi_tools(
         map_concept,
         compute,
     ]
+    if include_cashflow_tools:
+        tools.extend([detect_cashflow_period_basis, deaccumulate_cashflow])
+    if include_find_sections:
+        tools.insert(1, find_sections)
+    return tools

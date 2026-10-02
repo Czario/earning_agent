@@ -122,6 +122,20 @@ You can also set the default statements globally in your `.env` file:
 ```dotenv
 # Comma-separated list of statements (default: income,balancesheet,cashflow)
 TARGET_STATEMENTS=income,balancesheet,cashflow
+
+# De-accumulate year-to-date cash-flow statements into quarterly values
+# (Q2 = 6m - Q1, Q3 = 9m - (Q1+Q2)). Default on.
+DEACCUMULATE_YTD_CASHFLOW=1
+```
+
+Optional: route the document **section indexer** (used to locate the income
+statement when the prescan can't) to a fast provider, independent of the main
+agent-loop provider:
+
+```dotenv
+# Falls back to LLM_PROVIDER when the routed provider's key is missing.
+INDEX_LLM_PROVIDER=gemini
+INDEX_LLM_MODEL=gemini-2.5-flash
 ```
 
 ---

@@ -64,6 +64,17 @@ TARGET_STATEMENTS: list[str] = [
     s.strip().lower() for s in TARGET_STATEMENTS_RAW.split(",") if s.strip()
 ] or ["income"]
 
+# When True (default), teach the extraction agent to de-accumulate year-to-date
+# (YTD) cash-flow statements into quarterly values.  Some filers present their
+# cash-flow statement on a YTD basis only ("Six Months Ended" for Q2, "Nine
+# Months Ended" for Q3); those flow values are cumulative, so the quarter is
+# derived as Q2 = 6m − Q1, Q3 = 9m − (Q1+Q2) via the deaccumulate_cashflow
+# tool (prior quarters come from concept_values_quarterly).  Set to 0 to
+# disable (the agent then treats printed cash-flow values as quarterly).
+DEACCUMULATE_YTD_CASHFLOW: bool = os.getenv(
+    "DEACCUMULATE_YTD_CASHFLOW", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
 # Multi-exhibit fetching — filings can carry several EX-99 exhibits (press
 # release, presentation, supplemental information); the income statement often
 # lives in a supplemental exhibit (e.g. BofA's 99.3).  fetch_filing concatenates
