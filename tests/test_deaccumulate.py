@@ -9,6 +9,9 @@ from earnings_agents.agent.deaccumulate import (
     deaccumulate_cashflow_value,
     detect_cashflow_period_basis,
     detect_cashflow_statement_basis,
+    is_beginning_cash_concept,
+    is_ending_cash_concept,
+    load_prior_quarter_ending_cash,
     resolve_cashflow_concept,
 )
 from earnings_agents.agent.tools import build_pi_tools
@@ -32,6 +35,8 @@ CF_CONCEPTS = [
         "Payments to acquire property, plant and equipment"),
     _cf("cf3", "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
         "Cash, cash equivalents, restricted cash, and restricted cash equivalents"),
+    _cf("cf4", "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+        "Cash, cash equivalents and restricted cash, beginning of period"),
     _cf("bs1", "us-gaap:CashAndCashEquivalentsAtCarryingValue",
         "Cash and cash equivalents at carrying value", statement_type="balancesheet"),
 ]
@@ -73,6 +78,37 @@ class TestClassifyKind(unittest.TestCase):
         self.assertEqual(classify_cashflow_kind(
             "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
             "Cash, Cash Equivalent, Period Increase (Decrease)"), "flow")
+
+    def test_is_beginning_cash_concept(self):
+        self.assertTrue(is_beginning_cash_concept(
+            "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances"
+        ))
+        self.assertTrue(is_beginning_cash_concept(
+            "us-gaap:CashAndCashEquivalentsBeginningBalance"
+        ))
+        self.assertTrue(is_beginning_cash_concept(
+            "", "[custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances|cf]"
+        ))
+        self.assertFalse(is_beginning_cash_concept(
+            "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
+        ))
+        self.assertFalse(is_beginning_cash_concept(
+            "us-gaap:NetCashProvidedByUsedInOperatingActivities"
+        ))
+
+    def test_is_ending_cash_concept(self):
+        self.assertTrue(is_ending_cash_concept(
+            "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
+        ))
+        self.assertTrue(is_ending_cash_concept(
+            "us-gaap:CashAndCashEquivalentsAtCarryingValue"
+        ))
+        self.assertTrue(is_ending_cash_concept(
+            "", "[us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents|cf]"
+        ))
+        self.assertFalse(is_ending_cash_concept(
+            "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances"
+        ))
 
 
 class TestDetectBasis(unittest.TestCase):
@@ -198,6 +234,55 @@ class TestDeaccumulateValue(unittest.TestCase):
         )
         self.assertIn("AS-IS", out)
         self.assertNotIn("De-accumulated", out)
+
+    def test_q2_beginning_cash_takes_from_q1_ending_cash(self):
+        with mock.patch(
+            "earnings_agents.agent.deaccumulate.load_prior_quarter_ending_cash",
+            return_value=28000.0,
+        ) as mock_load:
+            out = self._run(
+                15000,
+                "[custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances]",
+                quarter=2, ytd_months=6,
+                filing_label="Cash, cash equivalents and restricted cash, beginning balances",
+            )
+            mock_load.assert_called_once()
+            self.assertEqual(mock_load.call_args.kwargs["prior_quarter"], 1)
+            self.assertIn("28,000", out)
+            self.assertIn("Q1 ending cash", out)
+            self.assertIn("[us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]", out)
+            self.assertIn("__derived__", out)
+
+    def test_q3_beginning_cash_takes_from_q2_ending_cash(self):
+        with mock.patch(
+            "earnings_agents.agent.deaccumulate.load_prior_quarter_ending_cash",
+            return_value=32000.0,
+        ) as mock_load:
+            out = self._run(
+                15000,
+                "[custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances]",
+                quarter=3, ytd_months=9,
+                filing_label="Cash, cash equivalents and restricted cash, beginning balances",
+            )
+            mock_load.assert_called_once()
+            self.assertEqual(mock_load.call_args.kwargs["prior_quarter"], 2)
+            self.assertIn("32,000", out)
+            self.assertIn("Q2 ending cash", out)
+            self.assertIn("[us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]", out)
+            self.assertIn("__derived__", out)
+
+    def test_beginning_cash_missing_prior_ending_cash(self):
+        with mock.patch(
+            "earnings_agents.agent.deaccumulate.load_prior_quarter_ending_cash",
+            return_value=None,
+        ):
+            out = self._run(
+                15000,
+                "[custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances]",
+                quarter=2, ytd_months=6,
+            )
+            self.assertIn("missing prior quarter Q1 ending cash", out)
+            self.assertIn("Leave the key out of finalize", out)
 
     def test_beginning_snapshot_skip(self):
         out = self._run(
@@ -385,6 +470,135 @@ class TestPipelineForcesDeaccumulation(unittest.TestCase):
               if f.get("type") == "cashflow_not_deaccumulated"]
         self.assertEqual(len(cf), 1)
         self.assertEqual(cf[0]["severity"], "medium")
+
+    def test_pipeline_populates_beginning_cash_and_preserves_ending_cash(self):
+        """Rule 1: beginning cash populated from prior ending cash.
+        Rule 2: ending cash remains unchanged as extracted and inserted as is."""
+        sample = (
+            "CONDENSED CONSOLIDATED STATEMENTS OF CASH FLOWS (Unaudited)\n"
+            "(In millions)\n"
+            "Nine Months Ended June 27, 2026\n"
+            "Cash generated by operating activities 116,996\n"
+            "Cash, cash equivalents and restricted cash, ending balances 36,100\n"
+        )
+        targets = [
+            {
+                "_id": "c1",
+                "concept": "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+                "taxonomy_key": "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+                "label": "Net cash provided by operating activities",
+                "statement_type": "cashflow",
+                "dimension": False, "dimension_concept": False, "calculated": False,
+            },
+            {
+                "_id": "c2",
+                "concept": "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                "taxonomy_key": "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                "label": "Cash, cash equivalents and restricted cash, beginning of period",
+                "statement_type": "cashflow",
+                "dimension": False, "dimension_concept": False, "calculated": False,
+            },
+            {
+                "_id": "c3",
+                "concept": "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                "taxonomy_key": "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                "label": "Cash, cash equivalents and restricted cash, ending of period",
+                "statement_type": "cashflow",
+                "dimension": False, "dimension_concept": False, "calculated": False,
+            },
+        ]
+        original = pipeline_module.run_agent_loop
+        pipeline_module.run_agent_loop = lambda **kw: {
+            "__currency__": "USD", "__scale__": "millions",
+            "__company_name__": "Apple Inc.", "__evidence__": {},
+            "__missing__": "",
+            "__derived__": "[us-gaap:NetCashProvidedByUsedInOperatingActivities]",
+            "__cashflow_basis__": "ytd_9m",
+            "[us-gaap:NetCashProvidedByUsedInOperatingActivities]": 41996,
+            "[us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]": 36100,
+        }
+        state = {
+            "ticker": "AAPL", "company_name": "Apple Inc.",
+            "cik": "0000320193", "raw_text": sample,
+            "document_map": [{"exhibit": "EX-99.1", "line_start": 1,
+                              "line_end": sample.count(chr(10)) + 1}],
+            "detected_period": {
+                "period_type": "quarterly", "period_end": "2026-06-27",
+                "quarter": 3, "period_label": "Three Months Ended June 27, 2026",
+                "fiscal_year": 2026,
+            },
+            "target_statements": ["cashflow"],
+            "target_concepts": targets,
+            "company_industry": {"sic_code": "3571", "sic_description": "Electronic Computers"},
+            "recent_concept_ids": [], "calculated_concepts": [], "findings": [],
+        }
+        try:
+            with mock.patch(
+                "earnings_agents.agent.deaccumulate.load_prior_quarter_ending_cash",
+                return_value=32000.0,
+            ) as mock_prior_cash:
+                out = pipeline_module._run_extraction_pass(state, sample, targets)
+                mock_prior_cash.assert_called_once()
+                self.assertEqual(mock_prior_cash.call_args.kwargs["prior_quarter"], 2)
+        finally:
+            pipeline_module.run_agent_loop = original
+
+        # Rule 1: beginning cash taken from Q2 ending cash
+        self.assertEqual(out.get("concept_metrics", {}).get("c2"), 32000.0)
+        self.assertIn("c2", out.get("derived_concept_ids") or [])
+        # Rule 2: ending cash remains unchanged as extracted and inserted as is
+        self.assertEqual(out.get("concept_metrics", {}).get("c3"), 36100.0)
+        self.assertNotIn("c3", out.get("derived_concept_ids") or [])
+
+    def test_pipeline_omits_un_deaccumulated_beginning_cash_when_prior_ending_cash_missing(self):
+        """When prior ending cash is missing, raw YTD beginning balance is omitted."""
+        targets = [
+            {
+                "_id": "c2",
+                "concept": "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                "taxonomy_key": "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                "label": "Cash, cash equivalents and restricted cash, beginning of period",
+                "statement_type": "cashflow",
+                "dimension": False, "dimension_concept": False, "calculated": False,
+            },
+        ]
+        original = pipeline_module.run_agent_loop
+        # Agent extracted the printed start-of-year balance (not derived)
+        pipeline_module.run_agent_loop = lambda **kw: {
+            "__currency__": "USD", "__scale__": "millions",
+            "__company_name__": "Apple Inc.", "__evidence__": {},
+            "__missing__": "", "__derived__": "",
+            "__cashflow_basis__": "ytd_9m",
+            "[custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances]": 15000,
+        }
+        sample = "CONDENSED STATEMENTS OF CASH FLOWS\nNine Months Ended June 27, 2026\n"
+        state = {
+            "ticker": "AAPL", "company_name": "Apple Inc.",
+            "cik": "0000320193", "raw_text": sample,
+            "document_map": [{"exhibit": "EX-99.1", "line_start": 1,
+                              "line_end": sample.count(chr(10)) + 1}],
+            "detected_period": {
+                "period_type": "quarterly", "period_end": "2026-06-27",
+                "quarter": 3, "period_label": "Three Months Ended June 27, 2026",
+                "fiscal_year": 2026,
+            },
+            "target_statements": ["cashflow"],
+            "target_concepts": targets,
+            "company_industry": {"sic_code": "3571", "sic_description": "Electronic Computers"},
+            "recent_concept_ids": [], "calculated_concepts": [], "findings": [],
+        }
+        try:
+            with mock.patch(
+                "earnings_agents.agent.deaccumulate.load_prior_quarter_ending_cash",
+                return_value=None,
+            ):
+                out = pipeline_module._run_extraction_pass(state, sample, targets)
+        finally:
+            pipeline_module.run_agent_loop = original
+
+        # Raw YTD beginning balance omitted from concept_metrics
+        self.assertNotIn("c2", out.get("concept_metrics", {}))
+
     def test_cashflow_not_deaccumulated_never_blocks_save(self):
         """mongodb_save_node must not fail on cashflow_not_deaccumulated finding."""
         from earnings_agents.nodes.save import mongodb_save_node

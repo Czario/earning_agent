@@ -203,12 +203,15 @@ each **flow** row in-loop via `deaccumulate_cashflow(value, concept_key,
 ytd_months, filing_label)`: `Q2 = 6m − Q1`, `Q3 = 9m − (Q1+Q2)`, with prior
 quarters read from `concept_values_quarterly` for the SAME fiscal year (the
 tool closure bakes in the canonical `fiscal_year`/`quarter` from the detected
-period, so the agent cannot hallucinate them).  Three outcomes: flow →
+period, so the agent cannot hallucinate them).  Outcomes: flow →
 de-accumulate (report the returned value + list the key in `__derived__` →
-`calculated=True`); end-of-period snapshot ("…ending balances") → as-is;
-beginning-of-period snapshot ("…beginning balances") → SKIP (a YTD statement
-shows the fiscal-year-START balance, not the quarter-start balance).  A missing
-prior quarter is reported, never fabricated.  The period agent does NOT
+`calculated=True`); end-of-period snapshot ("…ending balances", e.g.
+`us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`) → as-is (unchanged);
+beginning cash snapshot (`custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances`)
+→ taken from prior quarter ending cash (`us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`,
+Q1 ending for Q2, Q2 ending for Q3) as-is and marked derived; other beginning-of-period
+snapshots → SKIP (a YTD statement shows the fiscal-year-START balance, not the quarter-start
+balance).  A missing prior quarter is reported, never fabricated.  The period agent does NOT
 receive these tools (`include_cashflow_tools=False`).  **Forcing function:**
 the agent must report the observed cash-flow column basis in finalize under
 `__cashflow_basis__` (`quarterly` | `ytd_6m` | `ytd_9m` | `annual`).  When it
@@ -416,7 +419,12 @@ src/earnings_agents/
   (flow concepts) or `Q4 = Annual` (point-in-time concepts — cash balances,
   shares outstanding, period markers) and inserted into
   `concept_values_quarterly` with `calculated: True`, `form_type: 10-Q`,
-  `quarter: 4`, and a `note` marking the derivation. It never runs for
+  `quarter: 4`, and a `note` marking the derivation. For cash flow,
+  `custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances`
+  takes Q3 ending cash (`us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`)
+  as Q4 beginning cash (never `Annual − (Q1+Q2+Q3)` or annual Jan 1 balance), while
+  `us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents` remains unchanged
+  as `Q4 = Annual`. It never runs for
   quarterly filings, never fails the run (summary in `state.q4_calculation`),
   and never skips a concept because of it. Strict by default
   (`Q4_ALLOW_INCOMPLETE=0`): a missing Q1/Q2/Q3 or annual value skips the

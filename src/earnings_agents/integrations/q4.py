@@ -41,6 +41,10 @@ from typing import Any, Optional
 from bson import ObjectId
 from pymongo import MongoClient
 
+from earnings_agents.agent.deaccumulate import (
+    is_beginning_cash_concept,
+    is_ending_cash_concept,
+)
 from earnings_agents.agent.period import DetectedPeriod
 from earnings_agents.config import MONGODB_URI
 from earnings_agents.integrations.normalize import _clean_label
@@ -287,6 +291,47 @@ def _q4_exists(
     )
 
 
+def _find_q3_ending_cash(
+    db: Any,
+    cik: str,
+    fiscal_year: int,
+) -> float | None:
+    """Find the Q3 ending cash balance for *cik* and *fiscal_year*.
+
+    Looks for us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents
+    or us-gaap:CashAndCashEquivalentsAtCarryingValue in normalized_concepts_quarterly
+    and reads quarter=3 value from concept_values_quarterly.
+    """
+    q_col = db["normalized_concepts_quarterly"]
+    qv_col = db["concept_values_quarterly"]
+
+    all_q_concepts = list(q_col.find({"cik": cik}))
+    ending_concepts = [
+        c for c in all_q_concepts
+        if is_ending_cash_concept(c.get("concept") or "", c.get("taxonomy_key") or "")
+    ]
+    ending_concepts.sort(key=lambda d: 0 if (d.get("statement_type") or "").lower() == "cashflow" else 1)
+    for c in ending_concepts:
+        cid = c.get("_id")
+        if not cid:
+            continue
+        try:
+            oid = cid if isinstance(cid, ObjectId) else ObjectId(str(cid))
+        except Exception:
+            oid = cid
+        row = qv_col.find_one(
+            {
+                "cik": cik,
+                "concept_id": oid,
+                "reporting_period.fiscal_year": fiscal_year,
+                "reporting_period.quarter": 3,
+            }
+        )
+        if row and isinstance(row.get("value"), (int, float)):
+            return float(row["value"])
+    return None
+
+
 def _build_q4_doc(
     *,
     cik: str,
@@ -298,6 +343,7 @@ def _build_q4_doc(
     q_rows: dict[int, dict[str, Any]],
     is_point_in_time: bool,
     fallback_end: Any,
+    note: str | None = None,
 ) -> dict[str, Any]:
     """Build the Q4 concept-value doc matching the pipeline's save schema.
 
@@ -330,9 +376,13 @@ def _build_q4_doc(
         "fiscal_year": fiscal_year,
         "quarter": 4,
         "note": (
-            "Q4 = annual value (point-in-time concept)"
-            if is_point_in_time
-            else "Q4 calculated from annual 10-K minus Q1-Q3"
+            note
+            if note is not None
+            else (
+                "Q4 = annual value (point-in-time concept)"
+                if is_point_in_time
+                else "Q4 calculated from annual 10-K minus Q1-Q3"
+            )
         ),
     }
     if start_date is not None:
@@ -465,10 +515,26 @@ def calculate_q4_for_period(
         q_rows = _load_q_values(db, q_oid, cik, fiscal_year, stmt)
         annual_value = annual_value_row["value"]
         concept_name = annual_concept.get("concept") or ""
+        tkey = annual_concept.get("taxonomy_key") or ""
         label = _clean_label(annual_concept.get("label") or "")[0]
-        is_point_in_time = _is_point_in_time_concept(concept_name, label, statement_type=stmt)
 
-        if is_point_in_time:
+        is_beg_cash = is_beginning_cash_concept(concept_name, tkey)
+        is_ending_cash = is_ending_cash_concept(concept_name, tkey)
+        is_point_in_time = is_ending_cash or _is_point_in_time_concept(concept_name, label, statement_type=stmt)
+
+        note = None
+        if is_beg_cash:
+            # Rule 1: beginning cash takes Q3 ending cash (never Annual - (Q1+Q2+Q3))
+            q3_cash = _find_q3_ending_cash(db, cik, fiscal_year)
+            if q3_cash is None:
+                summary["skipped"] += 1
+                _bump_skip(summary, "missing Q3 ending cash")
+                continue
+            q4_value = q3_cash
+            is_point_in_time = True
+            note = "Q4 = Q3 ending cash (beginning cash snapshot)"
+        elif is_point_in_time:
+            # Rule 2: ending cash remains unchanged as extracted: Q4 = Annual (never Annual - (Q1+Q2+Q3))
             q4_value = annual_value
         else:
             q1 = q_rows.get(1)
@@ -501,6 +567,7 @@ def calculate_q4_for_period(
                 q_rows=q_rows,
                 is_point_in_time=is_point_in_time,
                 fallback_end=period.period_end,
+                note=note,
             )
             if recalculate:
                 # Write-first upsert on the exact unique-index key

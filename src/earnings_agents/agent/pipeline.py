@@ -921,6 +921,45 @@ def _run_extraction_pass(
         effective_cf_basis in ("ytd_6m", "ytd_9m")
         and period.quarter in (2, 3)
     ):
+        # Rule 1: custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances
+        # Values for this concept should be taken from last quarter (Q1 for Q2, Q2 for Q3)
+        # from us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents.
+        from earnings_agents.agent.deaccumulate import (
+            is_beginning_cash_concept,
+            load_prior_quarter_ending_cash,
+        )
+        prior_q = period.quarter - 1
+        beg_cash_concept = None
+        for c in target_concepts:
+            if (c.get("statement_type") or "").strip().lower() == "cashflow":
+                if is_beginning_cash_concept(c.get("concept") or "", c.get("taxonomy_key") or ""):
+                    beg_cash_concept = c
+                    break
+
+        if beg_cash_concept is not None:
+            beg_cid = beg_cash_concept["_id"]
+            prior_ending_cash = load_prior_quarter_ending_cash(
+                cik=state.get("cik") or "",
+                fiscal_year=period.fiscal_year,
+                prior_quarter=prior_q,
+                target_concepts=target_concepts,
+            )
+            if prior_ending_cash is not None:
+                concept_metrics[beg_cid] = prior_ending_cash
+                derived_ids.add(beg_cid)
+                report_call(
+                    f"  [pipeline]  deaccumulate: beginning cash for Q{period.quarter} set to "
+                    f"Q{prior_q} ending cash ({prior_ending_cash:,.0f})"
+                )
+            else:
+                # If prior quarter ending cash is missing, omit raw YTD beginning balance
+                if beg_cid in concept_metrics and beg_cid not in derived_ids:
+                    concept_metrics.pop(beg_cid, None)
+                    report_call(
+                        f"  [pipeline]  ⚠️ beginning cash omitted: prior quarter Q{prior_q} ending cash "
+                        f"is not stored in database"
+                    )
+
         not_deaccumulated: list[str] = []
         not_deaccumulated_cids: list[str] = []
         for cid in list(concept_metrics.keys()):

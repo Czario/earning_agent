@@ -394,8 +394,44 @@ FINALIZE CHECKLIST — READ BEFORE CALLING finalize_extraction():
 GUIDANCE_PHASE_NOTICE = """\n\nPHASE 3 — GUIDANCE/OUTLOOK (MANDATORY, before finalize_extraction):\nAfter the income-statement and segment extraction above, locate the\nGUIDANCE / OUTLOOK / FORECAST section (search(\"guidance\") / search(\"outlook\")\nor the section map's guidance range), read it, and extract every FUTURE-period\nguidance number into the \"__guidance__\" list (contract in the system prompt).\nThen call finalize_extraction() ONCE with the income-statement keys, the\nsegment keys, and \"__guidance__\" together.\n"""
 
 
-CF_DEACCUMULATION_BLOCK = """\
-CASH-FLOW YEAR-TO-DATE DECOMPOSITION (de-accumulation):\nSome companies present their cash-flow statement on a YEAR-TO-DATE (YTD) basis\nonly — "Six Months Ended" for a Q2 filing, "Nine Months Ended" for a Q3 filing\n— with no quarterly column.  The printed FLOW figures are then CUMULATIVE\nyear-to-date, NOT the quarter.\n\nWORKFLOW\n  1. Call detect_cashflow_period_basis() with NO arguments — it locates the\n     cash-flow statement header for you and returns its basis (quarterly /\n     ytd_6m / ytd_9m / annual) plus a directive.\n  2. quarterly ("Three Months Ended") → extract values as-is.\n  3. ytd_6m or ytd_9m → follow the tool's directive: for EVERY flow row call\n     deaccumulate_cashflow(value=<CURRENT-period YTD value>,\n     concept_key=<bracketed key>, ytd_months=6 or 9,\n     filing_label=<the row label as printed>) and report the RETURNED\n     quarterly value under the bracketed key.\n     - End-of-period snapshots ("...ending balances") → use the printed value\n       AS-IS (the tool says so).\n     - Beginning-of-period snapshots ("...beginning balances") → SKIP (the tool\n       says so — a YTD statement shows the fiscal-year-START balance, not the\n       quarter-start balance).\n  4. List every de-accumulated key in __derived__ (its value is computed, not\n     verbatim).\n  5. Use the CURRENT-period column only (e.g. "June 27, 2026"), never the\n     prior-year comparison column.\n  6. Report the observed basis in finalize_extraction under\n     "__cashflow_basis__" (one of: quarterly, ytd_6m, ytd_9m, annual).\n     If it is ytd_6m/ytd_9m, any cash-flow FLOW row not de-accumulated\n     (listed in __derived__) will be omitted from the quarterly save.\n\nNEVER de-accumulate unless the cash-flow header is YTD ("Six/Nine Months\nEnded").  NEVER de-accumulate income-statement or balance-sheet rows.  When a\nprior quarter is missing from the database the tool says so — leave that key\nout (never invent a prior-quarter value).\n"""
+CF_DEACCUMULATION_BLOCK = """
+CASH-FLOW YEAR-TO-DATE DECOMPOSITION (de-accumulation):
+Some companies present their cash-flow statement on a YEAR-TO-DATE (YTD) basis
+only — "Six Months Ended" for a Q2 filing, "Nine Months Ended" for a Q3 filing
+— with no quarterly column.  The printed FLOW figures are then CUMULATIVE
+year-to-date, NOT the quarter.
+
+WORKFLOW
+  1. Call detect_cashflow_period_basis() with NO arguments — it locates the
+     cash-flow statement header for you and returns its basis (quarterly /
+     ytd_6m / ytd_9m / annual) plus a directive.
+  2. quarterly ("Three Months Ended") → extract values as-is.
+  3. ytd_6m or ytd_9m → follow the tool's directive: for EVERY flow row call
+     deaccumulate_cashflow(value=<CURRENT-period YTD value>,
+     concept_key=<bracketed key>, ytd_months=6 or 9,
+     filing_label=<the row label as printed>) and report the RETURNED
+     quarterly value under the bracketed key.
+     - End-of-period snapshots ("...ending balances", [us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents])
+       → use the printed value AS-IS (the tool says so, report unchanged).
+     - Beginning cash snapshot ([custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances])
+       → call deaccumulate_cashflow(): it takes the prior quarter's ending cash
+       (Q1 ending for Q2, Q2 ending for Q3) as-is; report the returned value and list in __derived__.
+     - Other beginning-of-period snapshots → SKIP (the tool says so — a YTD
+       statement shows the fiscal-year-START balance, not the quarter-start balance).
+  4. List every de-accumulated key in __derived__ (its value is computed, not
+     verbatim).
+  5. Use the CURRENT-period column only (e.g. "June 27, 2026"), never the
+     prior-year comparison column.
+  6. Report the observed basis in finalize_extraction under
+     "__cashflow_basis__" (one of: quarterly, ytd_6m, ytd_9m, annual).
+     If it is ytd_6m/ytd_9m, any cash-flow FLOW row not de-accumulated
+     (listed in __derived__) will be omitted from the quarterly save.
+
+NEVER de-accumulate unless the cash-flow header is YTD ("Six/Nine Months
+Ended").  NEVER de-accumulate income-statement or balance-sheet rows.  When a
+prior quarter is missing from the database the tool says so — leave that key
+out (never invent a prior-quarter value).
+"""
 
 
 def build_concept_list(

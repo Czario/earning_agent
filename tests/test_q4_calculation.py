@@ -135,11 +135,11 @@ def _period():
     )
 
 
-def _concept(oid, concept, label, path, cik="000123", dimensions=None):
+def _concept(oid, concept, label, path, cik="000123", dimensions=None, statement_type="income"):
     doc = {
         "_id": ObjectId(oid),
         "cik": cik,
-        "statement_type": "income",
+        "statement_type": statement_type,
         "concept": concept,
         "label": label,
         "path": path,
@@ -250,6 +250,105 @@ class TestPointInTime(Q4EngineTestBase):
             inserted["reporting_period"]["note"],
             "Q4 = annual value (point-in-time concept)",
         )
+
+    def test_ending_cash_rule2_remains_unchanged_for_q4(self):
+        """Rule 2: us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents
+        remains unchanged for Q4 (annual value copied as-is, not Annual - (Q1+Q2+Q3))."""
+        a_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        q_oid = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        self._seed(
+            annual_concepts=[
+                _concept(a_oid, "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                         "Cash, cash equivalents and restricted cash", "001", statement_type="cashflow")
+            ],
+            quarterly_concepts=[
+                _concept(q_oid, "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                         "Cash, cash equivalents and restricted cash", "001", statement_type="cashflow")
+            ],
+            annual_values=[_value(a_oid, "000123", 2026, None, 500.0, (2026, 12, 31), statement_type="cashflow")],
+            quarterly_values=[
+                _value(q_oid, "000123", 2026, 1, 100.0, (2026, 3, 31), statement_type="cashflow"),
+                _value(q_oid, "000123", 2026, 2, 120.0, (2026, 6, 30), statement_type="cashflow"),
+                _value(q_oid, "000123", 2026, 3, 140.0, (2026, 9, 30), statement_type="cashflow"),
+            ],
+        )
+        result = calculate_q4_for_period("000123", _period(), [a_oid], target_statements=["cashflow"])
+        self.assertEqual(result["point_in_time"], 1)
+        inserted = self.db["concept_values_quarterly"].inserted[0]
+        # Must be 500.0 (annual value copied as is), NOT 500 - (100+120+140) = 140
+        self.assertEqual(inserted["value"], 500.0)
+        self.assertEqual(
+            inserted["reporting_period"]["note"],
+            "Q4 = annual value (point-in-time concept)",
+        )
+
+    def test_beginning_cash_rule1_takes_q3_ending_cash_for_q4(self):
+        """Rule 1: custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances
+        for Q4 takes value from Q3 ending cash, not Annual - (Q1+Q2+Q3) and not Annual value."""
+        a_beg_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        q_beg_oid = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        q_end_oid = "cccccccccccccccccccccccc"
+        self._seed(
+            annual_concepts=[
+                _concept(a_beg_oid,
+                         "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                         "Cash, cash equivalents and restricted cash, beginning balances", "001",
+                         statement_type="cashflow")
+            ],
+            quarterly_concepts=[
+                _concept(q_beg_oid,
+                         "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                         "Cash, cash equivalents and restricted cash, beginning balances", "001",
+                         statement_type="cashflow"),
+                _concept(q_end_oid,
+                         "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                         "Cash, cash equivalents and restricted cash, ending balances", "002",
+                         statement_type="cashflow"),
+            ],
+            annual_values=[
+                # Annual value is beginning of year (Jan 1) balance
+                _value(a_beg_oid, "000123", 2026, None, 200.0, (2026, 12, 31), statement_type="cashflow")
+            ],
+            quarterly_values=[
+                # Q3 ending cash balance is 450.0
+                _value(q_end_oid, "000123", 2026, 3, 450.0, (2026, 9, 30), statement_type="cashflow"),
+            ],
+        )
+        result = calculate_q4_for_period("000123", _period(), [a_beg_oid], target_statements=["cashflow"])
+        self.assertEqual(result["point_in_time"], 1)
+        inserted = self.db["concept_values_quarterly"].inserted[0]
+        # Must be 450.0 (taken from Q3 ending cash), NOT 200.0 (annual Jan 1 balance)
+        self.assertEqual(inserted["value"], 450.0)
+        self.assertEqual(
+            inserted["reporting_period"]["note"],
+            "Q4 = Q3 ending cash (beginning cash snapshot)",
+        )
+
+    def test_beginning_cash_skips_when_q3_ending_cash_missing(self):
+        """When Q3 ending cash is missing, beginning cash is skipped rather than fabricating."""
+        a_beg_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        q_beg_oid = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        self._seed(
+            annual_concepts=[
+                _concept(a_beg_oid,
+                         "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                         "Cash, cash equivalents and restricted cash, beginning balances", "001",
+                         statement_type="cashflow")
+            ],
+            quarterly_concepts=[
+                _concept(q_beg_oid,
+                         "custom:CashCashEquivalentsAndRestrictedCashAndCashEquivalentsBeginningBalances",
+                         "Cash, cash equivalents and restricted cash, beginning balances", "001",
+                         statement_type="cashflow"),
+            ],
+            annual_values=[
+                _value(a_beg_oid, "000123", 2026, None, 200.0, (2026, 12, 31), statement_type="cashflow")
+            ],
+            quarterly_values=[],  # No Q3 ending cash!
+        )
+        result = calculate_q4_for_period("000123", _period(), [a_beg_oid], target_statements=["cashflow"])
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["skipped_reasons"].get("missing Q3 ending cash"), 1)
 
 
 class TestMissingValuesPolicy(Q4EngineTestBase):

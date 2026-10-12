@@ -63,6 +63,42 @@ _END_CONCEPT_RX = re.compile(
     re.I,
 )
 
+# Specific beginning cash concept patterns (Rule 1: taken from prior quarter ending cash)
+_BEGINNING_CASH_CONCEPT_RX = re.compile(
+    r"(?:^|:)(?:Cash.*BeginningBalances?|RestrictedCash.*BeginningBalances?)$",
+    re.I,
+)
+
+# Specific ending cash concept patterns (Rule 2: kept unchanged as extracted, inserted as-is)
+_ENDING_CASH_CONCEPT_RX = re.compile(
+    r"(?:^|:)(?:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents|CashAndCashEquivalentsAtCarryingValue|RestrictedCash(?:AndCashEquivalents)?AtCarryingValue|CashAndCashEquivalents|RestrictedCash)$",
+    re.I,
+)
+
+
+def is_beginning_cash_concept(
+    concept_name: str = "",
+    taxonomy_key: str = "",
+) -> bool:
+    """True when *concept_name* or *taxonomy_key* represents the beginning cash balance."""
+    for s in (concept_name, taxonomy_key):
+        base = (s or "").split("|")[0].strip()
+        if _BEGINNING_CASH_CONCEPT_RX.search(base):
+            return True
+    return False
+
+
+def is_ending_cash_concept(
+    concept_name: str = "",
+    taxonomy_key: str = "",
+) -> bool:
+    """True when *concept_name* or *taxonomy_key* represents ending cash and cash equivalents."""
+    for s in (concept_name, taxonomy_key):
+        base = (s or "").split("|")[0].strip()
+        if _ENDING_CASH_CONCEPT_RX.search(base):
+            return True
+    return False
+
 
 def classify_cashflow_kind(
     concept_name: str,
@@ -223,6 +259,89 @@ def load_prior_quarter_values(
     return out
 
 
+def load_prior_quarter_ending_cash(
+    cik: str | None,
+    fiscal_year: int | None,
+    prior_quarter: int | None,
+    target_concepts: list[dict] | None = None,
+) -> float | None:
+    """Load the ending cash and cash equivalents balance for the prior quarter.
+
+    Queries concept_values_quarterly for the company's ending cash concept
+    (us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents or
+    CashAndCashEquivalentsAtCarryingValue) for fiscal_year and prior_quarter.
+    """
+    if not cik or fiscal_year is None or prior_quarter is None:
+        return None
+
+    ending_cids: list[Any] = []
+    if target_concepts:
+        # Check cashflow concepts first
+        for c in target_concepts:
+            if (c.get("statement_type") or "").strip().lower() == "cashflow":
+                name = c.get("concept") or ""
+                tkey = c.get("taxonomy_key") or ""
+                if is_ending_cash_concept(name, tkey) and c.get("_id"):
+                    ending_cids.append(c["_id"])
+        # Fall back to other statements (e.g. balancesheet)
+        if not ending_cids:
+            for c in target_concepts:
+                name = c.get("concept") or ""
+                tkey = c.get("taxonomy_key") or ""
+                if is_ending_cash_concept(name, tkey) and c.get("_id"):
+                    ending_cids.append(c["_id"])
+
+    if not ending_cids:
+        try:
+            db = _get_client()[_NORMALIZE_DB]
+            docs = list(
+                db["normalized_concepts_quarterly"].find(
+                    {
+                        "cik": cik,
+                        "$or": [
+                            {"concept": re.compile(r"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", re.I)},
+                            {"taxonomy_key": re.compile(r"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", re.I)},
+                            {"concept": re.compile(r"CashAndCashEquivalentsAtCarryingValue", re.I)},
+                        ],
+                    },
+                    {"_id": 1, "statement_type": 1},
+                )
+            )
+            docs.sort(key=lambda d: 0 if (d.get("statement_type") or "").lower() == "cashflow" else 1)
+            ending_cids = [d["_id"] for d in docs if d.get("_id")]
+        except Exception as exc:
+            logger.warning("load_prior_quarter_ending_cash: concept lookup failed (%s)", exc)
+
+    if ending_cids:
+        try:
+            db = _get_client()[_NORMALIZE_DB]
+            oids = []
+            for cid in ending_cids:
+                try:
+                    oids.append(cid if isinstance(cid, ObjectId) else ObjectId(str(cid)))
+                except Exception:
+                    oids.append(cid)
+            rows = list(
+                db["concept_values_quarterly"].find(
+                    {
+                        "cik": cik,
+                        "concept_id": {"$in": oids},
+                        "reporting_period.fiscal_year": fiscal_year,
+                        "reporting_period.quarter": prior_quarter,
+                    }
+                )
+            )
+            if rows:
+                rows.sort(key=lambda r: 0 if (r.get("statement_type") or "").lower() == "cashflow" else 1)
+                val = rows[0].get("value")
+                if isinstance(val, (int, float)):
+                    return float(val)
+        except Exception as exc:
+            logger.warning("load_prior_quarter_ending_cash: value query failed (%s)", exc)
+
+    return None
+
+
 def deaccumulate_cashflow_value(
     *,
     cik: str | None,
@@ -269,6 +388,29 @@ def deaccumulate_cashflow_value(
     label = concept.get("label") or ""
     stmt = (concept.get("statement_type") or "cashflow").strip().lower()
     key = (concept.get("taxonomy_key") or concept.get("concept") or "").strip()
+
+    # Rule 1: Beginning cash balance snapshot in Q2/Q3 takes value from
+    # prior quarter ending cash (us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents)
+    if is_beginning_cash_concept(name, key):
+        prior_q = quarter - 1
+        prior_cash = load_prior_quarter_ending_cash(
+            cik=cik,
+            fiscal_year=fiscal_year,
+            prior_quarter=prior_q,
+            target_concepts=target_concepts,
+        )
+        if prior_cash is not None:
+            return (
+                f"De-accumulated Q{quarter} = {prior_cash:,.0f} (taken as-is from prior quarter Q{prior_q} "
+                f"ending cash [us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]).\n"
+                f"Report {prior_cash:,.0f} under [{key}] and list [{key}] in __derived__ "
+                f"(computed, not verbatim)."
+            )
+        return (
+            f"Cannot de-accumulate [{key}]: missing prior quarter Q{prior_q} ending cash "
+            f"([us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]) for fiscal_year={fiscal_year}. "
+            f"Leave the key out of finalize (or report it missing). Do NOT invent a prior-quarter value."
+        )
 
     kind = classify_cashflow_kind(name, label, filing_label)
     if kind == "beginning":

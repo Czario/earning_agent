@@ -888,7 +888,8 @@ def build_pi_tools(
                 beginning-of-period snapshots (skip).
 
         Returns the quarterly value (Q2 = 6m − Q1, Q3 = 9m − (Q1+Q2)), or a
-        directive: AS-IS (end-of-period snapshot), SKIP (beginning-of-period
+        directive: AS-IS (end-of-period snapshot, e.g. ending cash), beginning cash
+        balance (resolved from prior quarter ending cash), SKIP (other beginning-of-period
         snapshot), or MISSING (a prior quarter isn't stored yet).  Report the
         returned quarterly value under the bracketed key and list it in
         __derived__.  Never de-accumulate unless the header is YTD.
