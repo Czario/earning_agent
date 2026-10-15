@@ -93,8 +93,9 @@ class TestPhase2ConceptLoading(unittest.TestCase):
     @patch("earnings_agents.nodes.concepts.get_company_by_ticker")
     @patch("earnings_agents.nodes.concepts.get_statement_concepts")
     @patch("earnings_agents.nodes.concepts.get_recently_valued_concept_ids")
+    @patch("earnings_agents.nodes.concepts.bootstrap_quarterly_concepts_from_annual")
     def test_load_company_concepts_passes_target_statements(
-        self, mock_get_recent, mock_get_concepts, mock_get_company
+        self, mock_bootstrap, mock_get_recent, mock_get_concepts, mock_get_company
     ):
         mock_get_company.return_value = {
             "cik": "0001234567",
@@ -133,6 +134,9 @@ class TestPhase2ConceptLoading(unittest.TestCase):
         new_state = load_company_concepts_node(state)
         from earnings_agents.agent.period import require_detected_period
         expected_period = require_detected_period(state)
+
+        # Quarterly runs run the bootstrap before the regular period-specific lookup.
+        mock_bootstrap.assert_called_once_with("0001234567")
 
         # Assert target_statements was passed to get_statement_concepts
         mock_get_concepts.assert_called_once_with(

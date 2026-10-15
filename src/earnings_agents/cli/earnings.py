@@ -48,8 +48,12 @@ from earnings_agents.nodes.detect import detect_document_type_node  # noqa: E402
 from earnings_agents.graph import build_graph  # noqa: E402
 from earnings_agents.registry import lookup_by_cik, lookup_by_ticker  # noqa: E402
 from earnings_agents.integrations.edgar import (  # noqa: E402
+    EARNINGS_FORMS,
+    accession_from_url,
     get_exhibits_for_accession,
+    get_filing_form_type,
     get_latest_earnings_url,
+    get_latest_filing_url,
 )
 from earnings_agents.hooks import set_detail_callback, set_node_callback  # noqa: E402
 
@@ -58,112 +62,16 @@ SEP = "=" * 64
 _logger = logging.getLogger(__name__)
 
 
-def _fmt_dur(ms: float) -> str:
-    """Format a millisecond duration as a human-readable string.
-
-    Examples: 450 ms → "0.5s", 5300 ms → "5.3s", 196200 ms → "3m 16s".
-    """
-    s = ms / 1000
-    if s < 60:
-        return f"{s:.1f}s"
-    m = int(s // 60)
-    return f"{m}m {s - m * 60:.0f}s"
-
-
-# Human-readable stage names for the rich progress description
-_NODE_LABELS: dict[str, str] = {
-    "fetch_filing_node":              "fetch",
-    "detect_period_node":             "period",
-    "check_period_node":              "check period",
-    "load_company_concepts_node":     "load concepts",
-    "detect_document_type_node":      "detect type",
-    "mongodb_save_node":              "save",
-    "agent_document_pipeline_node":   "agent pipeline",
-}
-
-_SHORT_STAGE: dict[str, str] = {
-    "fetch":          "fetch",
-    "period":         "period",
-    "check period":   "check",
-    "load concepts":  "cncpt",
-    "detect type":    "type",
-    "save":           "save",
-    "agent pipeline": "agent",
-}
-
-
-def _format_step_line(node_name: str, state: dict) -> str | None:
-    """Return a single-line human-readable summary for a completed node.
-
-    Returns ``None`` when no summary is needed.
-    """
-    if node_name == "load_company_concepts_node":
-        if state.get("status") in ("skipped", "failed"):
-            reason = (state.get("error") or "no concepts")[:70]
-            return f"  [load concepts]  skipped — {reason}"
-        n = len(state.get("target_concepts") or [])
-        try:
-            from earnings_agents.agent.period import require_detected_period
-            pt = require_detected_period(state).period_type
-        except Exception:
-            pt = "unknown"
-        return f"  [load concepts]  {n} concepts  ({pt})"
-
-    if node_name == "detect_document_type_node":
-        if state.get("status") == "failed":
-            return f"  [detect type]    failed — {(state.get('error') or '')[:60]}"
-        return f"  [detect type]    {state.get('file_type') or '?'}"
-
-    if node_name == "detect_period_node":
-        if state.get("status") in ("failed", "skipped"):
-            return f"  [period]         ✗  {(state.get('error') or '')[:70]}"
-        try:
-            from earnings_agents.agent.period import require_detected_period
-            period = require_detected_period(state)
-            label = period.period_label or period.period_end.isoformat()
-            return f"  [period]         ✓  {period.period_type}  {label}"
-        except Exception as exc:  # defensive: hooks must not break the CLI
-            return f"  [period]         ✗  invalid result — {str(exc)[:50]}"
-
-    if node_name == "check_period_node":
-        s = state.get("status", "?")
-        if s == "failed":
-            return f"  [check period]   ✗  {(state.get('error') or '')[:70]}"
-        if state.get("_pending_replace"):
-            lbl = state.get("_replace_period_label") or "existing period"
-            return f"  [check period]   re-extract {lbl} — replace after successful save"
-        return "  [check period]   new period — proceeding"
-
-    if node_name == "mongodb_save_node":
-        s = state.get("status", "?")
-        if s == "failed":
-            return f"  [save]           ✗  {(state.get('error') or 'failed')[:70]}"
-        # Success is already fully reported by the in-node [save]/[db] lines —
-        # no extra summary line.
-        return None
-
-    if node_name == "agent_document_pipeline_node":
-        metrics = state.get("metrics") or {}
-        n_metrics = len([k for k in metrics if not k.startswith("__")])
-        if state.get("status") == "failed":
-            return f"  [agent pipe]  failed — {(state.get('error') or '')[:60]}"
-        concept_metrics = state.get("concept_metrics") or {}
-        derived_ids = set(state.get("derived_concept_ids") or [])
-        target_concepts = state.get("target_concepts") or []
-        n_total = len(target_concepts) + len(state.get("calculated_concepts") or [])
-        n_mapped = len(concept_metrics) - len(derived_ids)
-        n_derived = len(derived_ids)
-        n_absent = len([c for c in target_concepts if c["_id"] not in concept_metrics])
-        lines = [f"  [agent pipe]  → {n_metrics} metrics extracted"]
-        if n_total:
-            lines.append(
-                f"  [agent pipe]  concepts: "
-                f"{n_mapped} mapped  {n_derived} derived  {n_absent} not in filing"
-                f"  (of {n_total})"
-            )
-        return "\n".join(lines)
-
-    return None
+# Progress presentation lives in ``cli/run_ui.py`` so the single-ticker CLI and
+# the historical backfill CLI print the identical stage/step/[llm] trace.  The
+# names are re-exported here because ``progress.py`` imports them.
+from earnings_agents.cli.run_ui import (  # noqa: E402
+    NODE_LABELS as _NODE_LABELS,
+    SHORT_STAGE as _SHORT_STAGE,
+    RunPresenter,
+    fmt_duration as _fmt_dur,
+    format_step_line as _format_step_line,
+)
 
 
 def _check_ollama() -> tuple[bool, str]:
@@ -293,6 +201,23 @@ def _resolve_companies(ciks: list[str], tickers: list[str]) -> list[dict]:
     return companies
 
 
+def _forms_for_source_form(source_form_type: str | None) -> tuple[str, ...]:
+    """Map a requested source form to the EDGAR forms to search.
+
+    The form is ALWAYS explicit — there is no AUTO mode and no default filing:
+    callers must name the form they want (``8-K`` for US issuers, ``6-K`` for
+    foreign private issuers such as ASML/TSM).  An empty value yields ``()``,
+    which callers treat as "no form supplied" and refuse EDGAR discovery.
+
+    This only chooses which filing to fetch — the period agent decides the
+    reporting period after the document is read.
+    """
+    requested = str(source_form_type or "").strip().upper()
+    if not requested:
+        return ()
+    return (requested,)
+
+
 def _build_8k_state(
     ticker: str,
     company_name: str,
@@ -302,6 +227,8 @@ def _build_8k_state(
     local_filing_path: str | None = None,
     supplemental_urls: list[str] | None = None,
     accession: str | None = None,
+    source_form_type: str | None = None,
+    quarterly_only: bool = False,
     printer=print,
     dry_run: bool = False,
     target_statements: list[str] | None = None,
@@ -342,15 +269,48 @@ def _build_8k_state(
         "exhibit_meta": [],
         "target_statements": target_statements if target_statements is not None else TARGET_STATEMENTS,
     }
+    if quarterly_only:
+        # Opt-in: the period agent still decides the period, but an annual
+        # result is skipped before extraction/save and Q4 is never derived.
+        _base["quarterly_only"] = True
 
     # ── Resolve filing URL, accession, and exhibit list ───────────────────
     exhibits: list[dict] = []
+    forms = _forms_for_source_form(source_form_type)
+
+    def _discover() -> tuple[str | None, list[str], str | None, list[dict], str | None]:
+        """Search EDGAR for the latest earnings filing of the requested form.
+
+        The 8-K path keeps calling ``get_latest_earnings_url`` (its historical
+        signature/behavior); other forms use the generalized discovery.
+        """
+        if forms == ("8-K",):  # explicit --form 8-K keeps the legacy path
+            url, supp, acc, exb = get_latest_earnings_url(cik)
+            return url, supp, acc, exb, "8-K"
+        return get_latest_filing_url(cik, forms=forms)
+
+    # A form is required whenever we must SEARCH EDGAR for a filing.  A pinned
+    # accession or a supplied URL needs no form: the accession resolves its own
+    # index and the form is looked up / derived from it.
+    if not filing_url and not local_filing_path and not accession and not forms:
+        return {
+            **_base,
+            "discovered_file_url": None,
+            "supplemental_file_urls": [],
+            "status": "failed",
+            "error": (
+                "No source form supplied — EDGAR discovery requires an explicit "
+                "form (--form 8-K or --form 6-K). Nothing is fetched by default."
+            ),
+        }
+
     if not filing_url and not local_filing_path:
         if accession:
             # RSS-polled filing: the accession identifies the EXACT filing the
-            # poller saw.  Resolve its exhibits directly from the filing index
-            # — NO submissions-API "latest 8-K" scan, so there is no race with
-            # submissions-API lag / empty items on a brand-new filing.
+            # poller saw (8-K or 6-K).  Resolve its exhibits directly from the
+            # filing index — NO submissions-API "latest filing" scan, so there
+            # is no race with submissions-API lag / empty items on a brand-new
+            # filing.  Works for any form because it is accession-pinned.
             printer(
                 f"  [EDGAR]  {company_name} ({ticker or cik}) resolving pinned "
                 f"accession {accession}..."
@@ -362,22 +322,33 @@ def _build_8k_state(
             else:
                 printer(
                     f"  [EDGAR]  pinned accession {accession} has no documents "
-                    f"— falling back to latest 8-K"
+                    f"— falling back to latest earnings filing"
                 )
                 (
                     filing_url,
                     supplemental_urls,
                     accession,
                     exhibits,
-                ) = get_latest_earnings_url(cik)
+                    discovered_form,
+                ) = _discover()
+                source_form_type = source_form_type or discovered_form
+            # Provenance: the caller (worker payload) usually knows the form;
+            # otherwise look it up from the submissions API (best effort).
+            if not source_form_type and accession:
+                source_form_type = get_filing_form_type(cik, accession)
         else:
-            printer(f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR...")
+            printer(
+                f"  [EDGAR]  {company_name} ({ticker or cik}) querying SEC EDGAR "
+                f"for {'/'.join(forms)}..."
+            )
             (
                 filing_url,
                 supplemental_urls,
                 accession,
                 exhibits,
-            ) = get_latest_earnings_url(cik)
+                discovered_form,
+            ) = _discover()
+            source_form_type = source_form_type or discovered_form
     elif filing_url:
         printer(
             f"  [URL]    {company_name} ({ticker or cik}) using provided filing URL "
@@ -389,8 +360,27 @@ def _build_8k_state(
             f"— EDGAR lookup skipped"
         )
 
+    # Provenance for manual runs: no EDGAR lookup happened, so the source SEC
+    # form is unknown.  Recover it best-effort when the URL/filename embeds an
+    # accession (EDGAR archive links and pasted accession filenames); otherwise
+    # leave it unset and the value writer falls back to the period-family label.
+    if not source_form_type and (filing_url or local_filing_path):
+        derived_acc = accession_from_url(filing_url) or accession_from_url(
+            local_filing_path
+        )
+        if derived_acc:
+            if not accession:
+                accession = derived_acc
+            source_form_type = get_filing_form_type(cik, derived_acc)
+            printer(
+                f"  [form]   derived source form from URL accession "
+                f"{derived_acc}: {source_form_type or 'unknown'}"
+            )
+
     if accession:
         _base["accession_number"] = accession
+    if source_form_type:
+        _base["source_form_type"] = str(source_form_type).strip().upper()
     if exhibits:
         _base["exhibit_meta"] = exhibits
 
@@ -400,7 +390,10 @@ def _build_8k_state(
             "discovered_file_url": None,
             "supplemental_file_urls": [],
             "status": "failed",
-            "error": f"No 8-K earnings filing found on SEC EDGAR for CIK {cik}",
+            "error": (
+                f"No {'/'.join(forms)} earnings filing found on SEC EDGAR "
+                f"for CIK {cik}"
+            ),
         }
 
     if supplemental_urls:
@@ -427,6 +420,8 @@ def _build_initial_state(
     local_filing_path: str | None = None,
     supplemental_urls: list[str] | None = None,
     accession: str | None = None,
+    source_form_type: str | None = None,
+    quarterly_only: bool = False,
     target_statements: list[str] | None = None,
 ) -> dict:
     """Build the LangGraph initial state for one company (CLI path).
@@ -434,7 +429,8 @@ def _build_initial_state(
     Thin wrapper around :func:`_build_8k_state` — resolves the filing URL
     from SEC EDGAR and delegates all period detection to the shared function.
     When *filing_url* is provided (Redis worker manual trigger), the EDGAR
-    lookup is skipped and the given URL is used directly.
+    lookup is skipped and the given URL is used directly.  *source_form_type*
+    requests 8-K (default) or 6-K discovery for the auto-fetch path.
     """
     return _build_8k_state(
         ticker=info.get("ticker") or "",
@@ -444,6 +440,8 @@ def _build_initial_state(
         local_filing_path=local_filing_path,
         supplemental_urls=supplemental_urls,
         accession=accession,
+        source_form_type=source_form_type,
+        quarterly_only=quarterly_only,
         printer=printer,
         dry_run=dry_run,
         target_statements=target_statements,
@@ -461,8 +459,18 @@ def _run_company(
     printer(f"\n{SEP}")
     printer(f"  Company : {label}")
     printer(f"  CIK     : {info['cik']}")
+    if info.get("source_form_type"):
+        printer(f"  Form    : {info['source_form_type']}")
 
-    state = _build_initial_state(info, printer=printer, target_statements=target_statements)
+    state = _build_initial_state(
+        info,
+        printer=printer,
+        target_statements=target_statements,
+        filing_url=info.get("filing_url"),
+        accession=info.get("accession"),
+        source_form_type=info.get("source_form_type"),
+        quarterly_only=bool(info.get("quarterly_only")),
+    )
 
     if state["status"] == "failed":
         printer(f"  [SKIP]  {state['error']}")
@@ -517,6 +525,10 @@ def _dry_run_company(
         printer=printer,
         dry_run=True,
         target_statements=target_statements,
+        filing_url=info.get("filing_url"),
+        accession=info.get("accession"),
+        source_form_type=info.get("source_form_type"),
+        quarterly_only=bool(info.get("quarterly_only")),
     )
 
     llm_ok, llm_detail = _check_llm()
@@ -597,145 +609,16 @@ def _run_company_parallel(args: tuple) -> dict:
 
     company_task = progress.add_task(f"{label}  resolving\u2026", total=None)
 
-    _completed: list[str] = []
-    _current_stage: list[str] = ["resolving\u2026"]
-    _current_detail: list[str] = [""]
-    _extract_pass: list[int] = [0]  # counts how many extraction passes have started
-    _last_chunk_done: list[int] = [0]  # tracks last printed chunk-done count per pass
-    _llm_calls: list[int] = [0]  # total LLM API requests fired this run
-
-    def _render() -> str:
-        """Build a terminal-width-aware progress description.
-
-        Completed stages are abbreviated (e.g. "\u2713disc \u2713type \u2713fetch"). When
-        the full string exceeds the available terminal width, the breadcrumb
-        is replaced with a compact count ("(3\u2713)") and, if still too long,
-        the active-stage detail is truncated to fit.
-        """
-        try:
-            term_w = progress.console.width
-        except Exception:  # noqa: BLE001
-            term_w = 80
-        # Overhead: spinner(2) + bar(36) + timer(10) + padding(6) \u2248 54 chars
-        max_chars = max(30, term_w - 54)
-
-        active_stage = _current_stage[0]
-        detail = _current_detail[0]
-        active_text = f"{active_stage}: {detail}" if detail else active_stage
-
-        done_parts = [f"\u2713{_SHORT_STAGE.get(s, s[:5])}" for s in _completed]
-        done_plain = " ".join(done_parts)
-
-        # Attempt 1: name + all abbreviated completed stages + active stage
-        sep = "  \u2192 "
-        full_plain = (
-            f"{name}  {done_plain}{sep}{active_text}"
-            if done_parts
-            else f"{name}  \u2192 {active_text}"
-        )
-        if len(full_plain) <= max_chars:
-            done_markup = f"[green]{done_plain}[/]" if done_parts else ""
-            return f"{label}  {done_markup}{sep}[bold]{active_text}[/]"
-
-        # Attempt 2: name + count of completed + active stage
-        n = len(_completed)
-        count_plain = f"{name}  ({n}\u2713){sep}{active_text}"
-        if len(count_plain) <= max_chars:
-            count_markup = f"[green]({n}\u2713)[/]" if n > 0 else ""
-            return f"{label}  {count_markup}{sep}[bold]{active_text}[/]"
-
-        # Attempt 3: name + count + active stage, truncating detail to fit
-        avail = max_chars - len(name) - len(active_stage) - 8
-        short_detail = detail[:max(0, avail)] if detail else ""
-        trunc_ellipsis = "\u2026" if detail and len(detail) > avail else ""
-        active_trunc = (
-            f"{active_stage}: {short_detail}{trunc_ellipsis}" if short_detail else active_stage
-        )
-        count_markup = f"[green]({n}\u2713)[/]  " if n > 0 else ""
-        return f"{label}  {count_markup}[bold]\u2192 {active_trunc}[/]"
-
-    def _node_cb(node_name: str, event: str, _ticker: str, node_state=None, elapsed_ms: float | None = None) -> None:
-        stage = _NODE_LABELS.get(node_name, node_name.replace("_node", ""))
-        if event == "start":
-            if node_name == "agent_document_pipeline_node":
-                _extract_pass[0] += 1
-                if _extract_pass[0] > 1:
-                    stage = f"re-extract #{_extract_pass[0]}"
-            _current_stage[0] = stage
-            _current_detail[0] = ""
-            progress.update(company_task, description=_render())
-            from rich.markup import escape as _escape
-            progress.console.print(f"[dim]{name}[/]  [bold cyan]▶ {_escape(stage)}[/]")
-        elif event == "end":
-            finished = _current_stage[0]  # may be "re-extract #2" etc.
-            if finished not in _completed:
-                _completed.append(finished)
-            progress.update(company_task, description=_render())
-            # Print a one-line step summary above the spinner so the operator
-            # can see the full A-to-Z flow as it unfolds.
-            if node_state is not None:
-                line = _format_step_line(node_name, node_state)
-                if line:
-                    from rich.markup import escape as _escape
-                    dur = f"  [dim]{_fmt_dur(elapsed_ms)}[/]" if elapsed_ms is not None else ""
-                    parts = line.split("\n")
-                    for i, part in enumerate(parts):
-                        suffix = dur if i == len(parts) - 1 else ""
-                        progress.console.print(f"[dim]{name}[/]{_escape(part)}{suffix}")
-
-    def _detail_cb(detail: str) -> None:
-        _current_detail[0] = detail
-        progress.update(company_task, description=_render())
-        # Print one line per chunk completion. The detail string looks like:
-        #   "chunks 1✓ 2✓ 3⟳ (2/4)"
-        # Parse the done/total counts and only print when done advances.
-        if "chunks " in detail and ("✓" in detail or "✗" in detail):
-            import re as _re
-            m = _re.search(r'\((\d+)/(\d+)\)', detail)
-            if m:
-                done, total = int(m.group(1)), int(m.group(2))
-                if done > _last_chunk_done[0]:
-                    _last_chunk_done[0] = done
-                    from rich.markup import escape as _escape
-                    pass_label = f"re-extract #{_extract_pass[0]}" if _extract_pass[0] > 1 else "extract"
-                    progress.console.print(
-                        f"[dim]{name}[/]  {_escape(f'[{pass_label}]')}  chunk {done}/{total}  "
-                        + _escape(detail.split("(")[0].strip())
-                    )
-
-    def _call_cb(msg: str) -> None:
-        from rich.markup import escape as _escape
-        esc_msg = _escape(msg)
-        # Highlight LLM-related messages (direct calls and LLM-triggered steps)
-        # distinctly so they stand out from DB/HTTP operational messages.
-        is_llm = " [llm]" in msg or ("llm" in msg.lower() and "\u2192" in msg)
-        if is_llm:
-            if "\u2192 calling llm" in msg:
-                _llm_calls[0] += 1
-            progress.console.print(f"[dim]{name}[/][bold yellow]{esc_msg}[/]")
-        elif "[industry]" in msg:
-            # Single industry-context line per extraction pass (SIC injected).
-            progress.console.print(f"[dim]{name}[/][bold cyan]{esc_msg}[/]")
-        else:
-            progress.console.print(f"[dim]{name}[/]{esc_msg}")
-
-    set_node_callback(_node_cb)
-    set_detail_callback(_detail_cb)
-    from earnings_agents.hooks import set_call_callback
-    set_call_callback(_call_cb)
+    # The SAME presenter the backfill CLI uses — one implementation, so both
+    # paths print byte-identical stage/step/[llm]/[tool]/[db] output.
+    presenter = RunPresenter(
+        name, label=label, progress=progress, task=company_task,
+    )
+    presenter.install()
     result = _run_company(graph, info, printer=lambda _: None, target_statements=target_statements)
-    set_node_callback(None)
-    set_detail_callback(None)
-    set_call_callback(None)
+    RunPresenter.uninstall()
 
-    status = result.get("status", "?")
-    llm_tag = f"  [dim]({_llm_calls[0]} LLM calls)[/]" if _llm_calls[0] else ""
-    if status == "saved":
-        desc = f"[green]{name}[/]  saved \u2713{llm_tag}"
-    elif status == "failed":
-        desc = f"[red]{name}[/]  failed \u2717{llm_tag}"
-    else:
-        desc = f"[yellow]{name}[/]  {status}"
+    desc, _ok = presenter.result_description(result)
     progress.update(company_task, total=1, completed=1, description=desc)
     progress.update(overall_task, advance=1)
     return result
@@ -774,8 +657,10 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  uv run earnings --cik 0000320193\n"
-            "  uv run earnings --cik 0000320193 0000789019\n"
             "  uv run earnings --ticker AAPL MSFT\n"
+            "  uv run earnings --ticker ASML --form 6-K\n"
+            "  uv run earnings --ticker ASML --accession 0000937966-26-000012\n"
+            "  uv run earnings --ticker TSM --filing-url https://.../tsm-6k.htm\n"
         ),
     )
     parser.add_argument(
@@ -791,6 +676,49 @@ def main() -> None:
         metavar="TICKER",
         default=[],
         help="One or more ticker symbols (e.g. AAPL MSFT)",
+    )
+    parser.add_argument(
+        "--quarterly-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Process reported QUARTERLY periods only: the period agent still "
+            "identifies the period, but an annual filing is skipped before "
+            "extraction/save and Q4 is never derived."
+        ),
+    )
+    parser.add_argument(
+        "--form",
+        "--form-type",
+        dest="source_form_type",
+        choices=["8-K", "6-K"],
+        required=True,
+        help=(
+            "REQUIRED. Source SEC form to fetch: 8-K (US issuers, Item 2.02) or "
+            "6-K (foreign private issuers such as ASML/TSM). There is no "
+            "default and no auto-detection — nothing is fetched without it. "
+            "The form never decides the reporting period; the period agent "
+            "reads it from the document."
+        ),
+    )
+    parser.add_argument(
+        "--filing-url",
+        metavar="URL",
+        default=None,
+        help=(
+            "Use this exact filing document URL (press-release HTML or PDF) "
+            "instead of SEC EDGAR discovery."
+        ),
+    )
+    parser.add_argument(
+        "--accession",
+        metavar="ACCESSION",
+        default=None,
+        help=(
+            "Pin the exact SEC accession number (e.g. 0000937966-26-000012) — "
+            "resolves its exhibits from the filing index with no 'latest "
+            "filing' scan. Works for 8-K and 6-K."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -857,13 +785,24 @@ def main() -> None:
         import earnings_agents.config as _cfg
         _cfg.STRICT_ACCURACY = False
         print("  [config]  --allow-inconsistent: STRICT_ACCURACY disabled "
-              "(high-severity findings will not block the save; non-USD "
-              "currency still blocks)")
+              "(high-severity findings will not block the save; values with "
+              "an unconfirmed currency are still omitted, never assumed USD)")
 
     companies = _resolve_companies(args.cik, args.ticker)
     if not companies:
         print("No valid companies resolved. Exiting.")
         sys.exit(1)
+
+    # Per-company filing-selection options.  A pinned accession or a manual URL
+    # takes precedence over EDGAR discovery; the source form only selects which
+    # form to look for (it never decides the reporting period).
+    if args.accession and len(companies) > 1:
+        parser.error("--accession pins ONE filing — pass a single --ticker/--cik")
+    for _info in companies:
+        _info["source_form_type"] = args.source_form_type
+        _info["filing_url"] = args.filing_url
+        _info["accession"] = args.accession
+        _info["quarterly_only"] = args.quarterly_only
 
     _progress = Progress(
         SpinnerColumn(finished_text="[green]\u2713[/]"),

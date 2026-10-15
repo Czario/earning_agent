@@ -53,6 +53,50 @@ class TestMapConcept(unittest.TestCase):
         self.assertIn("No concept found", out)
 
 
+class TestProposeNewConcept(unittest.TestCase):
+    def test_records_only_with_explicit_existing_parent_or_root(self):
+        concepts = [_concept("rev", "Revenue", "us-gaap:Revenues")]
+        proposals = []
+        tools = build_pi_tools(
+            "Revenue 100\nNew product revenue 25",
+            {},
+            target_concepts=concepts,
+            new_concept_candidates=proposals,
+            allowed_statements=["income"],
+        )
+        propose = _tool(tools, "propose_new_concept")
+        out = propose.invoke({
+            "metric_key": "New product revenue",
+            "metric_label": "New product revenue",
+            "statement_type": "income",
+            "parent_key": "[us-gaap:Revenues]",
+        })
+        self.assertIn("Candidate recorded", out)
+        self.assertEqual(proposals[0]["parent_key"], "us-gaap:Revenues")
+        self.assertEqual(proposals[0]["metric_key"], "New product revenue")
+
+    def test_rejects_unknown_parent_and_untargeted_statement(self):
+        tools = build_pi_tools(
+            "text", {}, target_concepts=[_concept("rev", "Revenue", "us-gaap:Revenues")],
+            new_concept_candidates=[], allowed_statements=["income"],
+        )
+        propose = _tool(tools, "propose_new_concept")
+        out = propose.invoke({
+            "metric_key": "Revenue by region",
+            "metric_label": "Revenue by region",
+            "statement_type": "income",
+            "parent_key": "unknown:Parent",
+        })
+        self.assertIn("parent_key", out)
+        out = propose.invoke({
+            "metric_key": "New asset",
+            "metric_label": "New asset",
+            "statement_type": "balancesheet",
+            "parent_key": "ROOT",
+        })
+        self.assertIn("not among the statements targeted", out)
+
+
 class TestMultiDocumentNavigation(unittest.TestCase):
     def setUp(self):
         # Two exhibits: press release (EX-99.1) + supplemental (EX-99.2).

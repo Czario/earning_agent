@@ -24,6 +24,7 @@ import re
 
 from earnings_agents.config import PROMPT_HISTORY_PERIODS
 from earnings_agents.integrations.normalize import (
+    bootstrap_quarterly_concepts_from_annual,
     get_company_by_ticker,
     get_recently_valued_concept_ids,
     get_statement_concepts,
@@ -127,6 +128,22 @@ def load_company_concepts_node(state: EarningsAgentState) -> EarningsAgentState:
     # extractable even when they had no stored value in the recent window.
     target_statements: list[str] = state.get("target_statements") or ["income"]
     stmt_desc = ", ".join(target_statements)
+    if period_type == "quarterly":
+        # Company-level bootstrap: copy all annual concept definitions only
+        # when the quarterly concept collection has no rows at all for this
+        # CIK. The extraction target is then loaded from the quarterly
+        # collection as usual; annual values are never used as quarter data.
+        try:
+            bootstrap_quarterly_concepts_from_annual(cik)
+        except Exception as exc:  # noqa: BLE001
+            return _skip(
+                f"Quarterly concept bootstrap failed for {ticker} ({exc}).",
+                cik=cik,
+                fiscal_year_end_month=fy_end_month,
+                fiscal_year_end_code=company.get("fiscal_year_end_code"),
+                detected_period=state.get("detected_period"),
+            )
+
     try:
         concepts = get_statement_concepts(
             cik,

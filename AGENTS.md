@@ -17,12 +17,20 @@ atomic period replace, strict save gate) keep it accurate.
 ```bash
 uv sync                                  # install deps
 uv sync --extra dev                      # + pytest (test suite)
-uv run pytest tests/ -q                  # run the test suite (250 tests)
+uv run pytest tests/ -q                  # run the test suite
 uv run earnings --ticker MSFT            # CLI run (extracts income, balancesheet, cashflow by default)
 uv run earnings --ticker MSFT -s income  # extract specific statement(s) (income, balancesheet, cashflow)
 uv run earnings --ticker MSFT --dry-run  # connectivity check, no LLM
+uv run earnings --ticker ASML --form 6-K # REQUIRED: 8-K (US) or 6-K (foreign issuer)
+uv run earnings --ticker ASML --accession 0001628280-26-048235  # pin one filing
+uv run earnings --ticker ASML --form 6-K --quarterly-only  # skip annual + no Q4
 uv run earnings --ticker MSFT -v         # DEBUG logging
 uv run earnings-failures                 # browse degraded/failed runs (raw mongo)
+uv run earnings-backfill --ticker ASML --form 6-K --from-year 2023   # historical run
+uv run earnings-backfill --ticker ASML --form 6-K --from-year 2023 --dry-run  # manifest only
+uv run earnings-backfill --ticker TSM --accession 0001046179-26-000451        # pinned 6-K
+STAGING_MONGODB_URI=... STAGING_NORMALIZE_DB_NAME=normalize_data_staging \
+  scripts/phase6_6k_staging_pilot.sh       # read-only Phase 6 preflight
 docker compose up -d --build             # start 8-K worker
 docker compose restart worker-8k         # after code edits (src is volume-mounted)
 ```
@@ -43,9 +51,9 @@ fetch_filing → detect_period → check_period → load_company_concepts
 | 1 | `fetch_filing` | `nodes/fetch.py` | Fetch **ALL** EX-99 text exhibits AND PDF documents (press release + presentation + supplemental — income statements often live in a supplemental exhibit, e.g. BofA's 99.3; manually-triggered shareholder letters arrive as PDFs, e.g. on Q4CDN), convert each to plain text (HTML via BeautifulSoup, PDF via pdfplumber with `PDF page n of m` separators), concatenate with `DOCUMENT n OF m` headers; records `document_map` (doc line ranges, truncation, skips) in state. Non-fetchable exhibits (images) skipped; per-exhibit/total size caps; `file_type` = `pdf` when any PDF was fetched, else `html`. |
 | 2 | `detect_period` | `agent/period.py` | **The period agent** (below). Reads the document header and writes the canonical `detected_period` record `{period_type, period_end, quarter, period_label, fiscal_year}`. Failure = run failure — **no deterministic period inference anywhere**. |
 | 3 | `check_period` | `nodes/check.py` | Consumes the canonical agent-detected period (including its already-resolved `fiscal_year` and `quarter`) and checks **exact-period existence only** (no accession checks): same fiscal period stored → schedule `_pending_replace` and **continue** (replacement stays deferred to save — atomic write-first inside `upsert_concept_values`); else proceed. An annual period is checked/replaced in `concept_values_annual` only — a quarterly Q4 record for the same fiscal year is never checked or touched. |
-| 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes the canonical `detected_period` (no period decision here). Loads the **full eligible concept universe**, then builds the target as **recent concepts ∪ all dimensional (segment/breakdown) rows ∪ `system:`/`calculated` concepts**. The recent-value window (`get_recently_valued_concept_ids`, last `PROMPT_HISTORY_PERIODS` periods) is a *prioritization* signal, not an eligibility filter — new segments/newly disclosed rows stay extractable without history. `system:`/`calculated` concepts are CALC derivation targets — rendered to the agent as compute-only (not extracted verbatim from the filing). No history → full-universe bootstrap; no concepts at all → skip. Malformed upstream rows (labels with no alphabetic word, e.g. `custom:404` page-number pollution) and rows whose hierarchy `path` carries a bare page-number segment (`404`/`555`) are dropped before the target is built — no filing prints them. |
-| 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop (single pass) → map → derive → findings (below). No verifier agent, no retry loop. |
-| 6 | `mongodb_save` | `nodes/save.py` | STRICT_ACCURACY gate → currency gate → **atomic period replace** inside `upsert_concept_values` (write-first, then a stale sweep deletes only docs not carrying the current save token — no delete-before-write window) → upsert into `concept_values_{quarterly\|annual}`. |
+| 4 | `load_company_concepts` | `nodes/concepts.py` | Consumes the canonical `detected_period` (no period decision here). Before loading a quarterly target, if the company has zero rows in `normalized_concepts_quarterly`, it bulk-copies all of that CIK's annual concept rows into the quarterly collection, changing `form_type` to `10-Q` and preserving `_id`/metadata (no bookkeeping collection — the quarterly collection itself is the state, and `$setOnInsert` makes a retry harmless). This is company-level all-or-nothing: any existing quarterly concept row suppresses the annual bootstrap, even if other statements/concepts are missing. No annual values are copied. Then loads the **full eligible concept universe**, then builds the target as **recent concepts ∪ all dimensional (segment/breakdown) rows ∪ `system:`/`calculated` concepts**. The recent-value window (`get_recently_valued_concept_ids`, last `PROMPT_HISTORY_PERIODS` periods) is a *prioritization* signal, not an eligibility filter — new segments/newly disclosed rows stay extractable without history. `system:`/`calculated` concepts are CALC derivation targets — rendered to the agent as compute-only (not extracted verbatim from the filing). No history → full-universe bootstrap; no concepts at all → skip. Malformed upstream rows (labels with no alphabetic word, e.g. `custom:404` page-number pollution) and rows whose hierarchy `path` carries a bare page-number segment (`404`/`555`) are dropped before the target is built — no filing prints them. |
+| 5 | `agent_document_pipeline` | `agent/pipeline.py` | Prescan → prior values → prompt → extraction agent loop (single pass) → exact/semantic map → validate explicit `propose_new_concept` candidates → derive → findings. A proposed new row must be numeric, cited, in a targeted statement, and still unmapped after semantic resolution; its parent is an exact existing target key or explicit statement root. No verifier agent or extraction retry loop. |
+| 6 | `mongodb_save` | `nodes/save.py` | STRICT_ACCURACY gate → per-value currency filter (unconfirmed-currency values omitted; native ISO currency persisted as reported) → materialize/reuse valid new concept rows in the period's normalized-concept collection → **atomic period replace** inside `upsert_concept_values` (write-first, then a stale sweep deletes only docs not carrying the current save token — no delete-before-write window) → upsert into `concept_values_{quarterly\|annual}`. New concept creation is after the gates; proposal failures are non-fatal to already mapped values. |
 | 7 | `calculate_q4` | `nodes/q4.py` | Post-save Q4 derivation — **income statement only** (same scope as the calculations project's `--calculate-q4 --statement is`). After an ANNUAL save succeeds, derives `Q4 = Annual − (Q1 + Q2 + Q3)` per just-saved concept and inserts into `concept_values_quarterly` (point-in-time concepts: `Q4 = Annual` copy). Ported from `services/q4_calculation_service.py` + `repositories/financial_repository.py` in the `calculations` project. Guards: `CALCULATE_Q4_AFTER_ANNUAL` on (default), `status="saved"`, annual period. Never fails the run — summary in `state.q4_calculation` (observability). |
 | 7b | `save_guidance` | `agent/guidance.py` · `integrations/guidance.py` · `nodes/save_guidance.py` | **Post-save forward-looking guidance** (runs after a successful save, before Q4 derivation). The extraction agent's PHASE 3 step reads the filing's Guidance/Outlook section (same loop, same tools) and reports `__guidance__` in `finalize_extraction`; the pipeline normalizes each record to the `guidance_values` schema — the SAME collection the admin backend reads/writes, docs shaped exactly like `GuidanceService.buildDoc` (`source="llm"` is the only difference from manual entries): `{cik, accession_number, form_type, filing_period, period{...}, period_type, metric, standard_label, concept, statement_type, basis, form, value, value_low, value_high, plus_minus, plus_minus_unit, unit, scale, currency, as_printed, condition, event_type, supersedes, is_current, source, result, ...}`. Every doc carries a top-level `period_type` (`quarterly`|`annual`) — the binary class of the COVERED period, DERIVED from the nested `period.period_type` extended enum (annual/multi_year → `annual`; quarterly/ytd/current_quarter → `quarterly`) on both the agent path (`_period_type_binary`, never accepted as raw input) and the admin backend's `buildDoc` (derive-only, client values ignored), so the two can never drift. `scripts/backfill_guidance_period_type.py` backfills the field on docs written before it existed. Covered `period` is the FUTURE period after the canonical `detected_period` (filing text authoritative; deterministic next-period derivation only as fallback — past/same-period records are dropped, never saved). `upsert_guidance_records` keys on `(cik, accession_number, metric, basis, period)`, demotes `is_current` across accessions, sets `supersedes`, and skips any key holding `source="manual"` (human edits win). `score_guidance_for_cik` then resolves current guidance whose covered period has arrived to the company's concept row via the existing `concepts_standard_mapping` vocabulary, reads the stored actual, and writes `result {actual_value, actual_accession_number, delta_abs, delta_pct, outcome}` (beat/miss/inline/qualitative — direction per metric in code). **`concept` is never null when a matching row exists**: at save time each doc resolves `standard_label` → the company's concept NAME via `concepts_standard_mapping` (label variants: Total/singular/plural), falling back to a normalized-label match against the company's own `normalized_concepts_*` rows (covers GAAP labels the 18-row mapping vocabulary lacks, e.g. "Provision for income taxes"); the agent's own `concept` when provided stays authoritative; the key is always present on the stored doc — null only when the company genuinely has no matching row (non-GAAP/custom metrics). Injection is non-fatal everywhere: no guidance section → no records (normal); extraction/normalization/persistence errors → observability only; never fails a run and never blocks the income-statement save. |
 
@@ -232,7 +240,9 @@ de-accumulated values (mixed QTD/YTD rows won't reconcile).
 - `get_statement_concepts(cik, statement_types, period=DetectedPeriod)` — returns `{_id, concept,
   label, path, statement_type, taxonomy_key, dimension, dimension_concept, calculated,
   dimension_member, dimension_member_label}`, sorted by `(path, order_key)`; labels
-  disambiguated on collision; taxonomy keys path-qualified.
+  disambiguated on collision; taxonomy keys path-qualified. Stored dimension member fields
+  are preferred when present; legacy labels continue to be parsed as before.
+- `bootstrap_quarterly_concepts_from_annual(cik)` — quarterly-only company-level bootstrap. It runs before the usual quarterly concept query, and only when there are no quarterly concept documents for the CIK. It bulk-upserts every annual concept document with the same `_id` and metadata except `form_type="10-Q"`; annual values are never copied. If any quarterly concept document already exists for that company, it does nothing. There is **no ledger collection** — the quarterly concept collection is the bootstrap state, so a re-run is a no-op and `$setOnInsert` never rewrites an already-copied row.
 - Collection routing is DRY: `_concepts_collection(period)` →
   `normalized_concepts_{quarterly|annual}` and `_values_collection(period)` →
   `concept_values_{quarterly|annual}` are the single routing helpers used by every
@@ -246,15 +256,25 @@ de-accumulated values (mixed QTD/YTD rows won't reconcile).
   period identity. All downstream period consumers call `require_detected_period(state)` and
   use the canonical `detected_period` record; no node reads duplicate scalar
   period fields or EDGAR/report dates for period identity.
+- `persist_new_concept_candidates(cik, period, candidates)` — idempotently reuses or creates
+  save-gated `custom:` concepts in the period-specific normalized-concepts collection.
+  It trusts only a parent selected from the existing target hierarchy (or an explicit root),
+  materializes the next sibling path/order, and returns concept IDs for the corresponding
+  filing values. Candidate failures are non-fatal; there is no annual-value copy.
 - `upsert_concept_values` — accepts the canonical `DetectedPeriod`, routes
   quarterly/annual from its agent decision, and replaces the period's docs
-  **atomically** (all values upserted first with a unique per-save
-  `save_token`, then a stale sweep `delete_many`s only docs of that exact
-  fiscal period not carrying the token — a failed write never leaves the
-  period empty); persists `calculated`, `currency`, per-value `scale` +
-  `source_lines` evidence, `dimension_value` + `dimension_member`/
-  `dimension_member_label`/`dimension_axis` (from `value_metadata_by_id`),
-  and `accession_number` (traceability only — never used for checks/dedup).
+  **atomically** (all values upserted first, then a stale sweep `delete_many`s
+  only docs of that exact fiscal period whose `concept_id` was NOT written by
+  this call — a failed write never leaves the period empty; the sweep is
+  concept-id-scoped, so **no per-save marker field is stored**); persists
+  `form_type` = the REAL filed SEC form (`8-K`/`6-K`/`10-Q`/`20-F`/..., with the
+  period-family label only as a fallback when provenance is unknown),
+  `calculated`, `currency`, dimensional metadata (`dimension_value`,
+  `dimension_member`, `dimension_member_label`, `dimension_axis`), optional
+  `source_exhibit` / original-currency metadata, `scale`, `source_snippet`, and
+  `accession_number` (traceability only — never used for checks/dedup).
+  `source_lines` evidence stays in pipeline state and is NOT persisted, and no
+  duplicate `source_form_type` field is written.
   The old `delete_fiscal_period` delete-before-write helper was removed.
 
 ### Agentic long-term memory (`agent/memory.py`)
@@ -322,11 +342,11 @@ overrides the filing.  Config: `MEMORY_ENABLED` (required, no default).
 
 ```
 src/earnings_agents/
-  graph.py, hooks.py, state.py, config.py, llm.py, registry.py, progress.py, filelog.py
-  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · guidance.py · industry.py · currency.py · scale.py · memory.py · indexer.py · deaccumulate.py
+  graph.py, hooks.py, state.py, backfill.py, config.py, llm.py, registry.py, progress.py, filelog.py
+  agent/        period.py · pipeline.py · loop.py · tools.py · prompts.py · derive.py · new_concepts.py · guidance.py · industry.py · currency.py · scale.py · memory.py · indexer.py · deaccumulate.py
   nodes/        fetch.py · check.py · concepts.py · detect.py · save.py · save_guidance.py · q4.py
   integrations/ edgar.py · normalize.py · guidance.py · q4.py · mongo.py · redis.py · http.py · html.py · playwright.py
-  cli/          earnings.py · worker.py · failures.py
+  cli/          earnings.py · backfill.py · run_ui.py · worker.py · failures.py
 ```
 
 - `llm.py` — provider factory (`build_llm` → `invoke(str)->str` for the
@@ -339,9 +359,50 @@ src/earnings_agents/
   every run; Docker mounts the repo root at `/project` with `RUN_LOGS_DIR=/project/Logs`
   so a deleted `Logs/` is re-created automatically, `TZ` env passthrough)
 - `registry.py` — CIK/ticker lookup from `data/reference/sec_company_tickers.json` (24 h disk cache)
-- `integrations/edgar.py` — submissions API → 8-K Item 2.02 → filing index → EX-99.1 URLs;
-  `get_latest_earnings_url` returns `(url, supplemental, accession, exhibits)`;
-  the period agent alone reads the document for reporting-period identity; token bucket (`EDGAR_RATE_LIMIT`, default 8 req/s); retry on 429/5xx
+- `cli/run_ui.py` — shared run presentation (single implementation used by both
+  `cli/earnings.py` and `cli/backfill.py`): `RunPresenter` (stage breadcrumb +
+  terminal-width-aware description), `NODE_LABELS`/`SHORT_STAGE`, `format_step_line`
+  (the `[period] ✓` / `[agent pipe] concepts:` summaries) and `format_result_detail`
+  (`FY2026 Q2, 71 concept(s)`). `progress.py` still imports `_NODE_LABELS` /
+  `_format_step_line` from `cli/earnings.py`, which re-exports them from here.
+- `backfill.py` — historical **quarterly-only** backfill runner.
+  `build_earnings_manifest()` (in `integrations/edgar.py`) turns a company's filing
+  history into a reviewable candidate list; `run_backfill()` invokes the SAME graph
+  once per filing with `quarterly_backfill_only=True`. The period agent classifies
+  each document; annual periods are skipped at `check_period` before concept loading,
+  extraction, or save. Post-save Q4 calculation is also disabled for every backfill run.
+  **Resume needs no bookkeeping collection**: `processed_accessions(cik)` reads
+  `accession_number` from `concept_values_quarterly` / `concept_values_annual` — the saved
+  values ARE the record of which filings were processed — so `--resume` skips them and
+  `--reload` re-runs them. The runner creates no extra collection and deletes nothing:
+  re-processing a period goes through the existing atomic write-first replace. A read
+  failure is tolerated (worst case is redundant LLM work). Default order is newest-first
+  (like a live run); `--oldest-first` lets `calculate_q4` derive Q4 from stored Q1–Q3.
+- `integrations/edgar.py` — submissions API → earnings filing → filing index → EX-99.x URLs.
+  `get_latest_earnings_url(cik)` is the legacy 8-K-only wrapper (Item 2.02 first, then any
+  8-K) and returns `(url, supplemental, accession, exhibits)`. `get_latest_filing_url(cik, forms)`
+  is the generalized discovery used for 6-K and returns the same tuple plus the resolved form.
+  **6-K candidate selection is metadata-only and layered** (never reads document content):
+  1. an EX-99 description/filename that looks like an earnings release
+     (`earnings_exhibit_metadata`);
+  2. else, a **report-sized payload** (`large_6k_report_body`) — `submissions.size` from the
+     JSON we already fetch. Report-body filers (Ericsson: `d######d6k.htm`; TSM:
+     `a2q26e_withguidancexfinal.htm`) carry the statements in the 6-K BODY with opaque names,
+     so size is the only signal (§ below);
+  3. else, only with `--include-unverified`: 6-Ks with EX-99 exhibits, or a primary document,
+     that carry no earnings signal at all (low confidence, for review).
+  The latest-filing scan caps index checks (5 in `get_latest_filing_url`); the historical
+  manifest caps its exhibit verification at 60. If nothing qualifies, use a pinned
+  accession or manual URL.
+
+  **Report-body size rule** (`SIXK_REPORT_BODY_MIN_KB`, default 512 KB): a periodic report
+  carries full statements, so its payload is 50-250x a notice 6-K. Measured on Ericsson:
+  reports 1.8-5.1 MB vs buyback notices 19-49 KB. Cost of a false positive is one
+  period-agent call — the agent still classifies the period, quarterly-only mode skips
+  annuals, and non-reports fail period detection. This is what makes `--form 6-K` work for
+  Ericsson/TSM with **no accession and no URL**. `get_filing_form_type`
+  resolves the form of a pinned accession (best effort). The period agent alone reads the
+  document for reporting-period identity; token bucket (`EDGAR_RATE_LIMIT`, default 8 req/s); retry on 429/5xx.
 - `integrations/mongo.py` — raw earnings collection (`earnings_db.earnings`)
 
 ## Guardrails & invariants — do not break
@@ -365,13 +426,19 @@ src/earnings_agents/
   disclosed rows stay extractable even without history. `system:`/`calculated`
   concepts are always loaded as CALC derivation targets — rendered compute-only
   to the agent, never extracted verbatim. No history → full-universe bootstrap.
-- **Currency is agent-decided, USD-only persisted.** There is no deterministic
-  whole-document currency decision. The extraction agent inspects each
-  table/section with the `detect_currency()` tool and reports `__currency__`
-  (plus `__currency_evidence__`); a deterministic scan is only a fallback for a
-  *confirmed* foreign/mixed code when the agent reports nothing. Non-USD
-  monetary values are never saved as USD (no invented FX); confirmed foreign/
-  mixed currency blocks the save, and `unknown` is not treated as a blocker.
+- **Currency is agent-reported and USD-preferred with a native-currency
+  fallback.** There is no deterministic whole-document currency decision. The
+  extraction agent inspects each table/section with `detect_currency()` and
+  reports `__currency__` (plus `__currency_evidence__`, and a per-value
+  `__evidence__[*].currency` when the filing mixes currencies); a deterministic
+  scan is a fallback when the agent reports nothing. The pipeline then picks
+  **one confirmed ISO currency per statement** (USD wins when the filing
+  presents USD for that statement, otherwise the reported native currency) and
+  drops values that cannot be attributed to it, so a statement is never stored
+  as a currency mix. **No FX conversion exists anywhere and USD is never
+  assumed**: an unconfirmed currency value is omitted (never written as USD),
+  which is medium-severity observability rather than a run blocker. `EUR`/`TWD`/
+  `JPY` values persist under their own currency as reported.
 - **Industry context is advisory-only.** SIC data from `companies.industry` is
   injected into the extraction prompt and `get_company_info` as read-only
   context (helps recognize filing terminology); it can never add concepts
@@ -386,28 +453,55 @@ src/earnings_agents/
 - **Q4 is never extracted as quarterly.** Q4 == annual; both-column releases → the
   fiscal-year (annual) column. Enforced in the period agent prompt, the business-rules
   gate, the extraction prompt, and naturally by `quarter=null` annual upserts.
+- **No bookkeeping collections (hard invariant).** The pipeline persists ONLY to
+  `normalized_concepts_{quarterly|annual}`, `concept_values_{quarterly|annual}`, and
+  `companies`. The removed `earnings_backfill_ledger` and `quarterly_concept_bootstrap`
+  collections must **never** be recreated — no ledger, no run-state table, no per-run
+  marker. Instead:
+  - **Backfill resume** reads `accession_number` off the saved values
+    (`backfill.processed_accessions`) — the value documents ARE the record of which
+    filings were processed.
+  - **Quarterly concept bootstrap** uses the quarterly concept collection itself as its
+    state (empty for the CIK → copy all annual concepts with `$setOnInsert`; any row
+    present → no-op).
+  Enforced by `tests/test_no_bookkeeping_collections.py`: a static scan of `src/` plus a
+  guarded Mongo client that raises if any flow requests a collection outside the allowed
+  set. If new run state is ever needed, derive it from the concept/value documents rather
+  than adding a collection.
 - **Pipeline never edits extracted numbers** — identity checks are detection-only; the
-  agent fixes its own mistakes via tools, never the code
+  agent fixes its own mistakes via tools, never the code.
+- **New concept creation is filing-grounded and save-gated.** The extraction agent
+  may propose a printed numeric statement row only after `map_concept()` finds no
+  target match. The pipeline keeps it only if it remains unmapped after the
+  high-confidence semantic pass, has source-line evidence, and names an exact
+  existing parent key or explicit root. `mongodb_save` creates/reuses the
+  period-specific `custom:` concept only after the usual accuracy/currency gates;
+  candidate errors never discard other mapped values. Missing, computed, guidance,
+  or unsupported YTD cash-flow rows never create concepts.
 - **`calculated` contract** — `false` = verbatim from filing; `true` = computed by the
   agent via `compute()` (tracked in `derived_concept_ids`)
 - **Save gate** — `STRICT_ACCURACY` (default on) refuses the upsert on unresolved
-  high-severity findings; a confirmed non-USD currency additionally fails the
-  save unconditionally (hard invariant, not bypassable by relaxed accuracy).
-  The CLI's `--allow-inconsistent` flag flips `config.STRICT_ACCURACY = False`
-  at runtime and `mongodb_save_node` reads the knob lazily, so the override is
-  honored — the currency gate still blocks.
+  high-severity findings. Currency is no longer a save-blocking gate: the
+  pipeline resolves one confirmed currency per statement and the save node
+  drops any value whose currency cannot be confirmed (no FX conversion, USD
+  never assumed), persisting the native currency when that is what the filing
+  reports. The CLI's `--allow-inconsistent` flag flips
+  `config.STRICT_ACCURACY = False` at runtime and `mongodb_save_node` reads the
+  knob lazily, so the override is honored; the currency filter still applies.
 - **Missing metrics never block the save.** Whatever values WERE found are
   always persisted — absence-only findings (agent `missing_concept`) are
   excluded from the save gate, so a few
   not-found metrics can never drop the whole period. Only findings that
   corrupt the values being stored block: wrong value/scale/currency, wrong
-  segment parent, wrong-company document, truncated exhibit, non-USD currency.
+  segment parent, wrong-company document, truncated exhibit. A value whose
+  currency cannot be confirmed is dropped from that save (observability), not
+  treated as a blocking finding.
 - **Atomic replace (no delete-before-write window)** — `check_period` only
   *schedules* `_pending_replace` (informational) when the exact fiscal period
   (annual → annual collection, quarterly → quarterly collection) already
   exists. The replace itself happens inside `upsert_concept_values`: every
-  value is upserted first (unique per-save `save_token`), then a stale sweep
-  deletes only docs of that exact period not carrying the token. A failed/
+  value is upserted first, then a stale sweep deletes only docs of that exact
+  period whose `concept_id` was not written by this call. A failed/
   interrupted write never leaves the period empty — the previous run's docs
   stay until the new ones are fully written. No accession checks anywhere —
   re-runs always replace the same exact period; a quarterly Q4 record is never
@@ -470,8 +564,8 @@ src/earnings_agents/
   never save another company's numbers under the target ticker.
 - **Per-value evidence travels with every value.** The finalize contract carries
   `__evidence__` (`{lines, scale, currency}` per metric key); the pipeline
-  stores it as `value_metadata_by_id.source_lines`/`scale`/`currency`, persists
-  it for traceability.
+  keeps it in `value_metadata_by_id` for the run and persists only `scale` +
+  `source_snippet` (`source_lines` line ranges are intentionally NOT stored).
 - **Manual filing URLs (admin panel)** — the worker honors a `filing_url` in the
   queue payload (press-release HTML or **PDF shareholder letter**; passed through
   from `POST /api/sec-rss/trigger-filing` → `sec:filings:8k`). When present, the
@@ -548,6 +642,8 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
 | `RUN_LOGS_ENABLED` | `1` | Write per-run admin-panel-mirror log files (`Logs/<date-time>.log`) |
 | `RUN_LOGS_DIR` | `Logs` | Directory for the per-run log files (Docker sets `/app/Logs`) |
 | `LLM_CACHE` | `0` | Dev-only LLM response disk cache |
+| `SIXK_REPORT_BODY_MIN_KB` | `512` | A 6-K whose payload is at least this large is
+  treated as a full periodic report (candidate selection only — never extraction) |
 | `EDGAR_RATE_LIMIT` | `8` | SEC token-bucket req/s (in `edgar.py`, not config) |
 | `FETCH_EXHIBIT_MAX_CHARS` / `FETCH_TOTAL_MAX_CHARS` | 400000 / 1200000 | Per-exhibit and total text caps for multi-exhibit fetching |
 
@@ -558,14 +654,87 @@ net). The derive/semantic-mapping passes (`build_llm`) still work.
    calls. `_build_8k_state` resolves URL + accession + filing date only — no
    pre-guards or dedup; the exact-period check lives in the graph (`check_period`).
 2. **Redis worker** (`cli/worker.py`) — long-running `BLPOP` on `sec:filings:8k`.
-   Receives accession payloads from admin_backend, resolves Exhibit 99.1, runs the same
-   graph. Publishes progress to `sec:worker:events`, heartbeats, job-level re-queue
-   retries (`--max-attempts`, dead-letter `sec:filings:dlq:8k`), updates
+   Receives accession payloads from admin_backend (8-K or 6-K), resolves exhibits, runs
+   the same graph. Publishes progress to `sec:worker:events`, heartbeats, job-level
+   re-queue retries (`--max-attempts`, dead-letter `sec:filings:dlq:8k`), updates
    `stock_load_requests` status in MongoDB. Docker service `worker-8k` (src volume-
    mounted; external network `backend_true_grids_backend_network`).
+3. **Backfill CLI** (`cli/backfill.py`) — bounded historical ranges through the same
+   graph, with a reviewable manifest, value-collection resume, `--reload`, and `--dry-run`.
 
-Both paths share `_build_8k_state` in `cli/earnings.py` — URL/accession resolution and
+All paths share `_build_8k_state` in `cli/earnings.py` — URL/accession resolution and
 state construction are identical by design.
+
+### Historical backfill (Phase 5)
+
+`uv run earnings-backfill` previews and then processes a bounded historical range:
+
+- **Manifest first.** `build_earnings_manifest()` returns each candidate with
+  `confidence`/`reason`/`fiscal_year`, so a range can be reviewed (`--dry-run`,
+  optionally `--json`) before any LLM work. 8-K candidates need Item 2.02 (unless
+  `--include-unverified`); 6-K candidates need earnings-like EX-99 exhibit metadata
+  (cap: 40 index checks).
+- **`--from-year`/`--to-year` are FISCAL years** — the year of the SEC `reportDate`
+  (the period the filing reports on), falling back to the filing year only when
+  `reportDate` is empty. A fiscal-year-N report filed in N+1 is therefore still
+  selected. `--fiscal-year`/`--fiscal-quarter` narrow to an exact period. Selection
+  is never period identity: the period agent still decides the reporting period from
+  each document.
+- **Quarterly-only is opt-in outside backfill.** `earnings-backfill` always sets it;
+  `uv run earnings --quarterly-only` and a worker payload `"quarterly_only": true` set it
+  per run/job. In all three cases the period agent still decides the period — an annual
+  result is skipped at `check_period` (before concepts/extraction/save) and the post-save
+  Q4 node is bypassed. **Default is off**, so `earnings --ticker X` and normal admin jobs
+  still process annual filings and derive Q4 as before.
+- **Identical presentation.** Progress UI lives in one place — `cli/run_ui.py`
+  (`RunPresenter`, `NODE_LABELS`, `SHORT_STAGE`, `format_step_line`,
+  `format_result_detail`). The multi-ticker CLI and the backfill CLI both use it, so a
+  backfill prints the SAME Rich spinner + progress bar, the same `▶ stage` markers, the
+  same `[period] ✓` / `[agent pipe] concepts:` step summaries, the same
+  `[llm]`/`[tool]`/`[db]` lines, and the same `saved ✓ (N LLM calls) (FY… Q…, N concept(s))`
+  footer. One progress row is shown per filing (`[i/N] <accession>`). `--quiet`
+  suppresses the per-call lines; `--verbose` adds DEBUG logging. The runner
+  installs/clears the thread-local `hooks` callbacks around each graph invocation.
+- **Order.** The manifest is newest-first and a default backfill processes
+  newest → oldest, matching a live run. `--oldest-first` reverses it for chronological
+  review; neither order processes annual periods or runs Q4 derivation.
+- **Resume from the saved values (no ledger collection).** Every saved value already
+  carries `accession_number`, so `processed_accessions(cik)` reads
+  `concept_values_quarterly` + `concept_values_annual` and treats a candidate whose
+  accession is present as already processed. `--resume` (default) skips those;
+  `--reload` re-runs them; `--no-resume` ignores the check; a read failure degrades to
+  redundant work, never lost data. A filing that persisted NOTHING (all metrics missing,
+  or unconfirmed currency) leaves no record and is retried — safe, since re-running is
+  idempotent.
+- **No destructive reload.** The runner never deletes. Re-processing a period goes
+  through the existing atomic write-first replace (concept-id-scoped stale sweep), so an
+  interrupted reload leaves the previous period intact.
+- **Pinned accessions** (`--accession`) skip discovery entirely — the reliable path for
+  issuers whose 6-K exhibit names are opaque (TSM).
+
+### 6-K (foreign private issuers)
+
+Phase 4 adds **accession-pinned 6-K ingestion** on top of the existing pipeline:
+
+- `_build_8k_state(..., source_form_type=...)` records the source form (`"8-K"` default,
+  `"6-K"`) into `state.source_form_type`. It only selects which form EDGAR discovery looks
+  for; it never decides the reporting period (the period agent does) and never chooses the
+  annual-vs-quarterly collection (`detected_period.period_type` does).
+- A **pinned accession** (`--accession`, or the worker payload's `accession_number`) is
+  form-agnostic — its exhibits are resolved from the filing index with no "latest filing"
+  scan. This is the reliable 6-K path (RSS poller / admin trigger).
+- A **manual filing URL** (`--filing-url`, or the worker payload's `filing_url`) works for
+  6-K press releases and PDFs the same way it already did for 8-K.
+- **Auto-discovery** (`--form 6-K` / payload `filing_type: "6-K"`) uses the conservative
+  metadata filter above. `--form` is CLI-only convenience; the worker's dedicated queues
+  stay `sec:filings:8k`, and the worker now accepts both `8-K` and `6-K` payload forms
+  (`_SUPPORTED_FORMS`) while still skipping anything else.
+- The REAL filed form (`6-K`/`8-K`/...) is stored in the value doc's `form_type` (falling
+  back to the period-family `10-Q`/`10-K` only when provenance is unknown) and is used as
+  the guidance doc `form_type`. There is **no** separate `source_form_type` field on
+  stored values. Manual-URL runs recover the form from the accession embedded in the URL
+  when one is present (`accession_from_url`).
+
 
 ## Design decisions & known issues
 
@@ -586,5 +755,7 @@ state construction are identical by design.
   Page-number path rows are excluded at fetch time (`get_statement_concepts`).
 - **`--allow-inconsistent` is wired to the real config knob.** The CLI flag
   sets `config.STRICT_ACCURACY = False` at runtime; `mongodb_save_node` reads
-  the knob lazily from the config module, so the override is honored (the
-  USD-only currency gate is intentionally NOT bypassable).
+  the knob lazily from the config module, so the override is honored. The
+  currency rule is a per-value filter (omitted, not failed) and is intentionally
+  NOT bypassable: no value is ever written under an assumed or converted
+  currency.

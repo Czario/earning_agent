@@ -56,14 +56,19 @@ class TestAtomicUpsert(unittest.TestCase):
                     "5072e8e0c9d3f4a1b2c3d4e5": 1_000_000.0,
                 },
                 period=period,
+                value_metadata_by_id={
+                    "5072e8e0c9d3f4a1b2c3d4e5": {"currency": "USD"},
+                },
             )
         # The stale sweep must only run AFTER the write.
         self.assertEqual(col.events, ["bulk_write", "delete_many"])
-        self.assertIn("save_token", col._last_delete_filter)
-        self.assertEqual(
-            col._last_delete_filter["save_token"],
-            {"$ne": col.ops[0]._doc["$set"]["save_token"]},
-        )
+        # Sweep is scoped by the concept ids written by THIS save (no per-save
+        # marker field is stored on the document).
+        self.assertNotIn("save_token", col._last_delete_filter)
+        swept = col._last_delete_filter["concept_id"]["$nin"]
+        self.assertEqual(len(swept), 1)
+        self.assertEqual(swept[0], col.ops[0]._doc["$set"]["concept_id"])
+        self.assertNotIn("save_token", col.ops[0]._doc["$set"])
         self.assertEqual(n, 1)
 
     def test_dimensional_filter_is_unique_index_key(self):
@@ -94,6 +99,7 @@ class TestAtomicUpsert(unittest.TestCase):
                 period=period,
                 value_metadata_by_id={
                     "5072e8e0c9d3f4a1b2c3d4e5": {
+                        "currency": "USD",
                         "dimension": True,
                         "dimension_member": "us-gaap:ProductMember",
                         "dimension_axis": "us-gaap:BusinessSegmentAxis",
@@ -114,6 +120,39 @@ class TestAtomicUpsert(unittest.TestCase):
         # ...but the stored document still carries the member/axis metadata.
         self.assertEqual(op._doc["$set"]["dimension_member"], "us-gaap:ProductMember")
         self.assertEqual(op._doc["$set"]["dimension_axis"], "us-gaap:BusinessSegmentAxis")
+        self.assertEqual(op._doc["$set"]["currency"], "USD")
+
+    def test_unconfirmed_currency_value_is_never_written(self):
+        period = DetectedPeriod(
+            period_type="quarterly",
+            period_end=date(2026, 6, 30),
+            quarter=2,
+            fiscal_year=2026,
+            period_label="Three Months Ended June 30, 2026",
+        )
+        col = _FakeCollection()
+        with patch(
+            "earnings_agents.integrations.normalize._values_collection",
+            return_value="concept_values_quarterly",
+        ):
+            import earnings_agents.integrations.normalize as _norm
+            db = MagicMock()
+            db.__getitem__.return_value = col
+            client = MagicMock()
+            client.__getitem__.return_value = db
+            _norm._get_client = lambda: client  # noqa: SLF001
+            n = _norm.upsert_concept_values(
+                cik="000123",
+                company_name="Test Co",
+                concept_metrics={"5072e8e0c9d3f4a1b2c3d4e5": 5.0},
+                period=period,
+                value_metadata_by_id={
+                    "5072e8e0c9d3f4a1b2c3d4e5": {"currency": "unknown"},
+                },
+            )
+        self.assertEqual(n, 0)
+        self.assertEqual(col.ops, [])
+        self.assertEqual(col.events, [])
 
 
 if __name__ == "__main__":

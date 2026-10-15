@@ -31,6 +31,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from earnings_agents.agent.currency import is_currency_code
 from earnings_agents.agent.guidance import (
     _period_type_binary,
     period_arrived,
@@ -172,6 +173,12 @@ def _find_actual(
     return {
         "value": doc.get("value"),
         "accession_number": doc.get("accession_number"),
+        "currency": doc.get("currency"),
+        # The company's REAL period end for the covered period.  Guidance period
+        # identity is (fiscal_year, quarter) — this date is presentation, and
+        # stamping it once the period has arrived keeps the stored doc
+        # self-consistent with the reported period.
+        "period_date": (doc.get("reporting_period") or {}).get("period_date"),
     }
 
 
@@ -338,7 +345,10 @@ def score_guidance_for_cik(
     db = _get_db()
     col = _guidance_col(db)
     now = datetime.now(tz=timezone.utc)
-    summary: dict[str, Any] = {"checked": 0, "scored": 0, "unresolved": 0, "errors": 0}
+    summary: dict[str, Any] = {
+        "checked": 0, "scored": 0, "unresolved": 0, "errors": 0,
+        "currency_mismatch": 0,
+    }
 
     docs = list(col.find({"cik": cik, "is_current": True}))
     for d in docs:
@@ -355,11 +365,33 @@ def score_guidance_for_cik(
             if actual is None or actual.get("value") is None:
                 summary["unresolved"] += 1
                 continue
+            # Never compare DIFFERENT currencies: a beat/miss delta is only
+            # meaningful when guidance and actual are in the same currency.
+            # A confirmed mismatch leaves the doc unscored (result stays None);
+            # a legacy/missing currency on either side keeps the previous
+            # behavior rather than silently skipping every old record.
+            guidance_currency = str(d.get("currency") or "").strip().upper()
+            actual_currency = str(actual.get("currency") or "").strip().upper()
+            if (
+                is_currency_code(guidance_currency)
+                and is_currency_code(actual_currency)
+                and guidance_currency != actual_currency
+            ):
+                summary["currency_mismatch"] += 1
+                continue
             result = score(d, float(actual["value"]), actual.get("accession_number"))
-            col.update_one(
-                {"_id": d["_id"]},
-                {"$set": {"result": result, "updated_at": now}},
-            )
+            update: dict[str, Any] = {"result": result, "updated_at": now}
+            # The covered period has arrived: stamp the company's actual period
+            # end onto the guidance doc.  Period identity is (fiscal_year,
+            # quarter); the date is presentation, so this makes the doc show the
+            # filer's real quarter-end (e.g. 2026-06-28) instead of a
+            # calendar-derived guess (2026-06-30).
+            actual_period_date = actual.get("period_date")
+            if actual_period_date and str(period.get("period_end_date") or "") != str(
+                actual_period_date
+            ):
+                update["period.period_end_date"] = actual_period_date
+            col.update_one({"_id": d["_id"]}, {"$set": update})
             summary["scored"] += 1
         except Exception as exc:  # noqa: BLE001 — scoring never fails a run
             logger.warning("guidance scoring error for CIK %s: %s", cik, exc)

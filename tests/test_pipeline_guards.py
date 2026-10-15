@@ -10,17 +10,21 @@ from earnings_agents.agent.pipeline import (
 
 
 class TestCompletenessFindings(unittest.TestCase):
-    def test_foreign_currency_finding(self):
+    def test_foreign_currency_is_not_a_blocker(self):
+        # Phase 3: a confirmed native currency (EUR) is saved as-is — it must
+        # NOT produce a high-severity blocking finding.
         findings = _build_completeness_findings({"currency": "EUR"}, [], None)
-        self.assertTrue(any(f["type"] == "unresolved_currency" for f in findings))
+        self.assertFalse(any(f["type"] == "currency_unresolved" for f in findings))
 
-    def test_unknown_currency_finding(self):
+    def test_unknown_currency_finding_is_medium_observability(self):
         findings = _build_completeness_findings({"currency": "unknown"}, [], None)
-        self.assertTrue(any(f["type"] == "unresolved_currency" for f in findings))
+        hits = [f for f in findings if f["type"] == "currency_unresolved"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "medium")
 
     def test_no_currency_finding_for_usd(self):
         findings = _build_completeness_findings({"currency": "USD"}, [], None)
-        self.assertFalse(any(f["type"] == "unresolved_currency" for f in findings))
+        self.assertFalse(any(f["type"] == "currency_unresolved" for f in findings))
 
     def test_missing_concepts_are_medium_observability(self):
         findings = _build_completeness_findings(
@@ -39,6 +43,19 @@ class TestCompletenessFindings(unittest.TestCase):
         dm = [{"exhibit": "logo", "url": "x", "skipped": True, "reason": "non-text exhibit"}]
         findings = _build_completeness_findings({"currency": "USD"}, dm, None)
         self.assertFalse(any(f["type"] == "incomplete_document" for f in findings))
+
+
+class TestStatementCurrencyResolutionInPipeline(unittest.TestCase):
+    """Phase 3: one confirmed currency per statement, USD preferred."""
+
+    def test_usd_preferred_and_eur_dropped(self):
+        from earnings_agents.agent.currency import resolve_statement_currencies
+
+        result = resolve_statement_currencies(
+            {"a": "income", "b": "income"}, {"a": "USD", "b": "EUR"},
+        )
+        self.assertEqual(result["currency_by_concept"], {"a": "USD"})
+        self.assertEqual(result["dropped"]["income"], ["b"])
 
 
 class TestCompanyIdentity(unittest.TestCase):

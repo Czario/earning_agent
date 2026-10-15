@@ -36,6 +36,13 @@ PERIOD_SYSTEM_PROMPT = """\
 You are a period-detection agent.  Your ONLY job is to determine the CURRENT
 reporting period of an SEC earnings press release (plain text).
 
+The source may be an 8-K Exhibit 99.1 (US issuers) or a 6-K earnings release
+(foreign private issuers such as ASML/TSM).  The source form never determines
+the period: foreign issuers use varied labels ("First Quarter 2026",
+"Q1 2026", "Three months ended March 31, 2026", "net sales for the quarter
+ended ..."), and a 6-K may report any period.  Always derive the period from
+the filing text itself.
+
 The company's fiscal year-end is {fy_end} (MMDD format — e.g. 1231 = December
 31, 0630 = June 30).  Use this as context for interpreting the company's
 fiscal calendar, but do not calculate the fiscal year from the filing date.

@@ -24,6 +24,11 @@ from earnings_agents.agent.loop import _parse_llm_response
 from earnings_agents.nodes.save_guidance import save_guidance_node
 
 
+def _norm(records, period, doc_currency="USD"):
+    """Normalize with the filing currency supplied (Phase 3 requires it)."""
+    return normalize_guidance_records(records, period, doc_currency)
+
+
 # ── Fake MongoDB (mirrors tests/test_memory.py pattern) ──────────────────────
 
 def _get_path(doc, path):
@@ -153,7 +158,7 @@ def _q_period(fy=2026, quarter=2, period_type="quarterly"):
 
 class TestNormalizeForms(unittest.TestCase):
     def test_plus_minus_pct_band(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "form": "plus_minus_pct", "value": 108.0,
             "plus_minus": 2, "plus_minus_unit": "percent",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
@@ -173,7 +178,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(d["period"]["label"], "Q3 FY2026")
 
     def test_range_derives_midpoint(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "eps_diluted", "form": "range",
             "value_low": 2.0, "value_high": 2.4,
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
@@ -183,7 +188,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(recs[0]["standard_label"], "Earnings Per Share, Diluted")
 
     def test_min_max_forms(self):
-        recs, _ = normalize_guidance_records([
+        recs, _ = _norm([
             {"metric": "revenue", "form": "min", "value": 10.0, "as_printed": "at least $10B",
              "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"}},
             {"metric": "capex", "form": "max", "value": 5.0,
@@ -194,7 +199,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual((recs[1]["value_low"], recs[1]["value_high"]), (None, 5.0))
 
     def test_qualitative_kept_without_number(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "other", "form": "qualitative",
             "as_printed": "revenue expected to be flat sequentially",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
@@ -205,7 +210,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(recs[0]["form"], "qualitative")
 
     def test_percentage_growth_unit(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "form": "percentage_growth", "value": 12.0,
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
         }], _q_period())
@@ -214,25 +219,48 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(recs[0]["scale"], "as-is")
 
     def test_inverted_band_dropped(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "form": "range", "value_low": 20.0, "value_high": 10.0,
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
         }], _q_period())
         self.assertEqual(recs, [])
         self.assertTrue(any("value_low > value_high" in i for i in issues))
 
-    def test_non_usd_monetary_dropped(self):
-        recs, issues = normalize_guidance_records([{
+    def test_native_currency_monetary_guidance_is_kept(self):
+        # Phase 3: USD preferred, native currency otherwise — an explicit EUR
+        # guidance number is stored as EUR, never converted and never
+        # relabeled as USD.
+        recs, issues = _norm([{
             "metric": "revenue", "form": "point", "value": 100.0, "currency": "EUR",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
         }], _q_period())
+        self.assertEqual(issues, [])
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["currency"], "EUR")
+        self.assertEqual(recs[0]["unit"], "EUR")
+
+    def test_unknown_currency_monetary_guidance_is_dropped(self):
+        # No FX conversion and USD is never assumed: an unattributable
+        # monetary guidance number is dropped.
+        recs, issues = _norm([{
+            "metric": "revenue", "form": "point", "value": 100.0,
+            "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
+        }], _q_period(), doc_currency=None)
         self.assertEqual(recs, [])
-        self.assertTrue(any("not USD" in i for i in issues))
+        self.assertTrue(any("currency could" in i for i in issues))
+
+    def test_document_currency_used_when_record_omits_it(self):
+        recs, issues = _norm([{
+            "metric": "revenue", "form": "point", "value": 100.0,
+            "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
+        }], _q_period(), doc_currency="TWD")
+        self.assertEqual(issues, [])
+        self.assertEqual(recs[0]["currency"], "TWD")
 
 
     def test_display_string_value_parsed_to_band(self):
         # Model emitted the number as a display string instead of numbers
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "form": "range",
             "value": "$61-64 billion",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
@@ -245,7 +273,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(d["form"], "range")
 
     def test_percent_display_string_gets_percent_unit(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "tax_rate", "value": "between 15-17%",
             "period": {"fiscal_year": 2026, "period_type": "annual"},
         }], _q_period(fy=2026, quarter=2))
@@ -255,7 +283,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(d["unit"], "percent")
 
     def test_dict_form_guidance_merged(self):
-        recs, issues = normalize_guidance_records({
+        recs, issues = _norm({
             "revenue": {"form": "point", "value": 62.0,
                         "period": {"fiscal_year": 2026, "quarter": 3,
                                    "period_type": "quarterly"}},
@@ -270,7 +298,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertAlmostEqual(by_metric["capex"]["value"], 137.5)
 
     def test_period_string_label_parsed(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 62.0, "period": "Q3 2026",
         }], _q_period(fy=2026, quarter=2))
         self.assertEqual(issues, [])
@@ -280,7 +308,7 @@ class TestNormalizeForms(unittest.TestCase):
     def test_custom_metric_stored_as_is(self):
         # Unlisted metrics are NOT skipped — stored with a free-text metric
         # name and scored with the default (up) direction.
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "net_shipments", "standard_label": "Vehicle Deliveries",
             "value": 480000, "unit": "shares", "scale": "as-is",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
@@ -292,7 +320,7 @@ class TestNormalizeForms(unittest.TestCase):
         self.assertEqual(score(recs[0], 500000)["outcome"], "beat")
 
     def test_eps_guidance_as_is(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "eps_diluted", "form": "range", "value": 4.80,
             "value_low": 4.70, "value_high": 4.90, "scale": "as-is",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
@@ -321,7 +349,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
         # The live failure: "We expect third quarter 2026 total revenue to be
         # in the range of $61-64 billion." arrived as value 62.5 / scale
         # billions and was stored unscaled.
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "form": "range", "value": 62.5,
             "value_low": 61.0, "value_high": 64.0, "scale": "billions",
             "unit": "USD", "currency": "USD",
@@ -338,7 +366,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
         self.assertEqual(d["scale"], "billions")
 
     def test_point_millions_and_thousands_scaled(self):
-        recs, _ = normalize_guidance_records([
+        recs, _ = _norm([
             {"metric": "operating_income", "value": 108.0, "scale": "millions",
              "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"}},
             {"metric": "net_income", "value": 480.0, "scale": "thousands",
@@ -348,7 +376,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
         self.assertEqual(recs[1]["value"], 480_000.0)
 
     def test_plus_minus_abs_scaled_but_pct_not(self):
-        recs, _ = normalize_guidance_records([
+        recs, _ = _norm([
             {"metric": "revenue", "form": "plus_minus_abs", "value": 100.0,
              "plus_minus": 2, "plus_minus_unit": "absolute", "scale": "billions",
              "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"}},
@@ -368,7 +396,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
         self.assertAlmostEqual(pct_rec["value_high"], 102_000_000_000.0)
 
     def test_eps_and_percent_never_scaled(self):
-        recs, _ = normalize_guidance_records([
+        recs, _ = _norm([
             {"metric": "eps_diluted", "form": "range", "value": 4.80,
              "value_low": 4.70, "value_high": 4.90, "scale": "as-is",
              "standard_label": "Earnings Per Share, Diluted",
@@ -391,7 +419,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
     def test_model_mistagged_eps_with_monetary_scale_not_scaled(self):
         # Belt-and-braces: EPS guidance tagged scale "billions" by a model must
         # never become 4,850,000,000.
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "eps_diluted", "value": 4.85, "scale": "billions",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=2))
@@ -400,7 +428,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
     def test_share_count_scales_with_printed_magnitude(self):
         # "approximately 2.5 billion diluted shares" — share counts DO scale
         # when the filing prints a magnitude; they stay as-is otherwise.
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "share_count", "value": 2.5, "unit": "shares",
             "scale": "billions",
             "as_printed": "approximately 2.5 billion diluted shares",
@@ -409,7 +437,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
         self.assertEqual(recs[0]["value"], 2_500_000_000.0)
 
     def test_invalid_scale_ignored(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "value": 62.5, "scale": "zillions",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=2))
@@ -417,7 +445,7 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
         self.assertEqual(recs[0]["value"], 62.5)
 
     def test_absurd_magnitude_after_scaling_dropped(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 1e12, "scale": "billions",
             "period": {"fiscal_year": 2026, "quarter": 3, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=2))
@@ -427,14 +455,14 @@ class TestGuidanceScaleToRaw(unittest.TestCase):
 
 class TestNormalizePeriods(unittest.TestCase):
     def test_explicit_year_wins(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"fiscal_year": 2027, "quarter": 3, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=2))
         self.assertEqual(recs[0]["period"]["fiscal_year"], 2027)
 
     def test_next_quarter_default(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"quarter": 3, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=2))
@@ -442,7 +470,7 @@ class TestNormalizePeriods(unittest.TestCase):
         self.assertEqual(recs[0]["period"]["quarter"], 3)
 
     def test_q3_to_q4_same_fy(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"quarter": 4, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=3))
@@ -450,7 +478,7 @@ class TestNormalizePeriods(unittest.TestCase):
         self.assertEqual(recs[0]["period"]["quarter"], 4)
 
     def test_annual_filing_next_fy_q1(self):
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"period_type": "quarterly", "quarter": 1},
         }], _q_period(fy=2026, quarter=None, period_type="annual"))
@@ -458,7 +486,7 @@ class TestNormalizePeriods(unittest.TestCase):
         self.assertEqual(recs[0]["period"]["quarter"], 1)
 
     def test_quarter_not_after_filing_dropped(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"fiscal_year": 2026, "quarter": 2, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=2))
@@ -466,7 +494,7 @@ class TestNormalizePeriods(unittest.TestCase):
         self.assertTrue(any("not after reported Q2" in i for i in issues))
 
     def test_same_fy_quarter_from_annual_filing_dropped(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"fiscal_year": 2026, "quarter": 2, "period_type": "quarterly"},
         }], _q_period(fy=2026, quarter=None, period_type="annual"))
@@ -474,7 +502,7 @@ class TestNormalizePeriods(unittest.TestCase):
         self.assertTrue(any("not future" in i for i in issues))
 
     def test_same_fy_annual_guidance_from_annual_filing_dropped(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"fiscal_year": 2026, "period_type": "annual"},
         }], _q_period(fy=2026, quarter=None, period_type="annual"))
@@ -482,7 +510,7 @@ class TestNormalizePeriods(unittest.TestCase):
         self.assertTrue(any("(annual) not after filing" in i for i in issues))
 
     def test_same_fy_annual_guidance_from_quarterly_filing_kept(self):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 1.0,
             "period": {"fiscal_year": 2026, "period_type": "annual"},
         }], _q_period(fy=2026, quarter=3))
@@ -499,7 +527,7 @@ class TestGuidancePeriodType(unittest.TestCase):
     ``period.period_type`` extended enum, never accepted as raw input."""
 
     def _one(self, period):
-        recs, issues = normalize_guidance_records([{
+        recs, issues = _norm([{
             "metric": "revenue", "value": 62.0, "period": period,
         }], _q_period(fy=2026, quarter=2))
         self.assertEqual(issues, [])
@@ -528,7 +556,7 @@ class TestGuidancePeriodType(unittest.TestCase):
     def test_raw_top_level_input_is_ignored(self):
         """A conflicting raw top-level value never wins — period is the single
         source of truth (derivation, not passthrough)."""
-        recs, _ = normalize_guidance_records([{
+        recs, _ = _norm([{
             "metric": "revenue", "value": 62.0, "period_type": "annual",
             "period": {"fiscal_year": 2026, "quarter": 3,
                        "period_type": "quarterly"},
@@ -848,6 +876,129 @@ class TestScoreForCik(unittest.TestCase):
         self.assertEqual(summary["unresolved"], 0)
         self.assertEqual(guid._docs[0]["result"]["outcome"], "beat")
         self.assertEqual(guid._docs[0]["result"]["actual_accession_number"], "acc-actual")
+
+    def test_currency_mismatch_is_not_scored(self):
+        # Phase 3: a beat/miss delta is meaningless across currencies.  An EUR
+        # guidance value must not be scored against a USD actual.
+        from earnings_agents.integrations.guidance import score_guidance_for_cik
+        guid = _FakeCol()
+        guid._docs.append({
+            "_id": "gx", "cik": "0001045810", "metric": "revenue",
+            "standard_label": "Total Revenues", "statement_type": "income",
+            "basis": "gaap", "form": "point", "value": 108.0,
+            "value_low": 108.0, "value_high": 108.0, "currency": "EUR",
+            "period": {"fiscal_year": 2027, "quarter": 3},
+            "is_current": True, "result": None,
+        })
+        concepts = _FakeCol()
+        concepts._docs.append({
+            "_id": "cx", "cik": "0001045810", "concept": "us-gaap:Revenues",
+            "statement_type": "income",
+        })
+        values = _FakeCol()
+        values._docs.append({
+            "cik": "0001045810", "concept_id": "cx", "value": 112.3,
+            "currency": "USD",
+            "reporting_period": {"fiscal_year": 2027, "quarter": 3},
+        })
+        mapping = _FakeCol()
+        mapping._docs.append({
+            "standard_label": "Total Revenues", "statement_type": "income",
+            "concepts": ["us-gaap:Revenues"], "isActive": True,
+        })
+        db = _fake_db(guidance_values=guid, normalized_concepts_quarterly=concepts,
+                      concept_values_quarterly=values,
+                      concepts_standard_mapping=mapping)
+        with mock.patch("earnings_agents.integrations.guidance._get_db", return_value=db):
+            summary = score_guidance_for_cik(
+                "0001045810", _q_period(fy=2027, quarter=3),
+            )
+        self.assertEqual(summary["scored"], 0)
+        self.assertEqual(summary["currency_mismatch"], 1)
+        self.assertIsNone(guid._docs[0]["result"])
+
+    def test_matching_native_currency_is_scored(self):
+        from earnings_agents.integrations.guidance import score_guidance_for_cik
+        guid = _FakeCol()
+        guid._docs.append({
+            "_id": "gy", "cik": "0001045810", "metric": "revenue",
+            "standard_label": "Total Revenues", "statement_type": "income",
+            "basis": "gaap", "form": "point", "value": 108.0,
+            "value_low": 108.0, "value_high": 108.0, "currency": "TWD",
+            "period": {"fiscal_year": 2027, "quarter": 3},
+            "is_current": True, "result": None,
+        })
+        concepts = _FakeCol()
+        concepts._docs.append({
+            "_id": "cy", "cik": "0001045810", "concept": "us-gaap:Revenues",
+            "statement_type": "income",
+        })
+        values = _FakeCol()
+        values._docs.append({
+            "cik": "0001045810", "concept_id": "cy", "value": 112.3,
+            "currency": "TWD",
+            "reporting_period": {"fiscal_year": 2027, "quarter": 3},
+        })
+        mapping = _FakeCol()
+        mapping._docs.append({
+            "standard_label": "Total Revenues", "statement_type": "income",
+            "concepts": ["us-gaap:Revenues"], "isActive": True,
+        })
+        db = _fake_db(guidance_values=guid, normalized_concepts_quarterly=concepts,
+                      concept_values_quarterly=values,
+                      concepts_standard_mapping=mapping)
+        with mock.patch("earnings_agents.integrations.guidance._get_db", return_value=db):
+            summary = score_guidance_for_cik(
+                "0001045810", _q_period(fy=2027, quarter=3),
+            )
+        self.assertEqual(summary["scored"], 1)
+        self.assertEqual(guid._docs[0]["result"]["outcome"], "beat")
+
+    def test_scoring_stamps_the_real_period_end_on_the_guidance_doc(self):
+        """Period identity is (fiscal_year, quarter); the DATE is presentation.
+
+        Once the covered period has arrived, the doc adopts the filer's REAL
+        quarter-end from the stored actual, so the grid never needs a
+        calendar-derived date for a reported period.
+        """
+        from earnings_agents.integrations.guidance import score_guidance_for_cik
+
+        guid = _FakeCol()
+        guid._docs.append({
+            "_id": "gz", "cik": "0001045810", "metric": "revenue",
+            "standard_label": "Total Revenues", "statement_type": "income",
+            "basis": "gaap", "form": "point", "value": 108.0,
+            "value_low": 108.0, "value_high": 108.0, "currency": "USD",
+            "period": {"fiscal_year": 2027, "quarter": 3,
+                       "period_type": "quarterly", "period_end_date": None},
+            "is_current": True, "result": None,
+        })
+        concepts = _FakeCol()
+        concepts._docs.append({
+            "_id": "cz", "cik": "0001045810", "concept": "us-gaap:Revenues",
+            "statement_type": "income",
+        })
+        values = _FakeCol()
+        values._docs.append({
+            "cik": "0001045810", "concept_id": "cz", "value": 112.3,
+            "currency": "USD",
+            "reporting_period": {"fiscal_year": 2027, "quarter": 3,
+                                 "period_date": "2027-09-26"},
+        })
+        mapping = _FakeCol()
+        mapping._docs.append({
+            "standard_label": "Total Revenues", "statement_type": "income",
+            "concepts": ["us-gaap:Revenues"], "isActive": True,
+        })
+        db = _fake_db(guidance_values=guid, normalized_concepts_quarterly=concepts,
+                      concept_values_quarterly=values,
+                      concepts_standard_mapping=mapping)
+        with mock.patch("earnings_agents.integrations.guidance._get_db", return_value=db):
+            summary = score_guidance_for_cik(
+                "0001045810", _q_period(fy=2027, quarter=3),
+            )
+        self.assertEqual(summary["scored"], 1)
+        self.assertEqual(guid._docs[0]["period"]["period_end_date"], "2027-09-26")
 
     def test_pending_guidance_not_scored(self):
         from earnings_agents.integrations.guidance import score_guidance_for_cik

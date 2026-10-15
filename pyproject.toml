@@ -29,6 +29,7 @@ dev = ["pytest>=8.0.0"]
 earnings-run-once = "earnings_agents.cli.earnings:main"
 earnings = "earnings_agents.cli.earnings:main"
 earnings-failures = "earnings_agents.cli.failures:main"
+earnings-backfill = "earnings_agents.cli.backfill:main"
 earnings-8k-worker = "earnings_agents.cli.worker:main"
 
 [build-system]

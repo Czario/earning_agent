@@ -44,8 +44,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Dedicated queue — admin_backend publishes 8-K messages here only.
+# Dedicated queue — admin_backend publishes earnings-filing messages here.
 _DEFAULT_QUEUE = "sec:filings:8k"
+
+# Source SEC forms this worker accepts: 8-K (US issuers) and 6-K (foreign
+# private issuers such as ASML / TSM).  Any other form is skipped, never
+# re-queued.
+_SUPPORTED_FORMS: frozenset[str] = frozenset({"8-K", "6-K"})
 
 # Error substrings that make a job non-retryable: deterministic failures that
 # re-running the same filing will reproduce identically (provider billing/auth
@@ -107,7 +112,7 @@ def _process_payload(
     payload: dict[str, Any],
     default_statements: list[str] | None = None,
 ) -> bool:
-    """Process one 8-K filing message using the same pipeline as the CLI.
+    """Process one earnings filing message (8-K or 6-K) as the CLI does.
 
     Steps (identical to ``uv run earnings --ticker X``):
       1. Resolve company (cik, name) from normalize_data — same values the
@@ -176,6 +181,18 @@ def _process_payload(
     # period is determined only by the period agent after fetching the filing.
     from earnings_agents.cli.earnings import _build_initial_state
 
+    # Source form provenance: the publisher states it in the payload (the
+    # dedicated queues are per-form in production).  It only selects which form
+    # to auto-discover and is stored with the values — the period agent still
+    # decides the reporting period from the document.
+    # The publisher must state the source form; there is no default.  The
+    # queue loop already rejected messages without a supported form.
+    source_form_type = (
+        str(payload.get("filing_type") or payload.get("form_type") or "")
+        .strip()
+        .upper()
+    )
+
     state = _build_initial_state(
         {
             "ticker": ticker,
@@ -185,6 +202,9 @@ def _process_payload(
         filing_url=payload.get("filing_url") if not temporary_filing_id else None,
         local_filing_path=local_filing_path,
         accession=payload.get("accession_number") or None,
+        source_form_type=source_form_type,
+        # Optional per-job override: process reported quarterly periods only.
+        quarterly_only=bool(payload.get("quarterly_only")),
         target_statements=target_statements,
     )
 
@@ -216,7 +236,12 @@ def _process_payload(
             "directly (EDGAR lookup skipped)",
         )
 
-    logger.info("Processing 8-K for %s  url=%s", ticker, state.get("discovered_file_url"))
+    logger.info(
+        "Processing %s for %s  url=%s",
+        state.get("source_form_type") or source_form_type,
+        ticker,
+        state.get("discovered_file_url"),
+    )
 
     # ── Set up progress callbacks using the shared worker_progress module ────────
     # make_node_callback fires on both start (▶ stage) and end (step summary),
@@ -440,15 +465,20 @@ def main(argv: list[str] | None = None) -> None:
 
         form_type = (payload.get("filing_type") or payload.get("form_type") or "").upper()
 
-        if form_type != "8-K":
-            # Dedicated queue: only 8-K messages should arrive here.
-            # Log and skip anything unexpected without re-queuing.
-            logger.warning("Unexpected form_type %r on 8-K queue — skipping", form_type)
+        # The source form is mandatory — a payload without one is rejected
+        # rather than silently defaulting to 8-K.
+        if form_type not in _SUPPORTED_FORMS:
+            # Only earnings forms are processed here (8-K US issuers, 6-K
+            # foreign private issuers).  Log and skip anything unexpected
+            # without re-queuing.
+            logger.warning(
+                "Unexpected form_type %r on earnings queue — skipping", form_type
+            )
             if args.once:
                 break
             continue
 
-        # ── Process the 8-K ───────────────────────────────────────────────────
+        # ── Process the filing ────────────────────────────────────────────────
         attempts = int(payload.get("attempts") or 0)
         success = False
         _update_load_request_status(payload, "processing")

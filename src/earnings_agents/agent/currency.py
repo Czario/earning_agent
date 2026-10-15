@@ -1,22 +1,28 @@
-"""Deterministic currency detection and USD-only guardrails.
+"""Currency detection and the USD-preferred / native-currency policy.
 
-The extraction pipeline ingests many document sources — SEC 8-K HTML press
+The extraction pipeline ingests many document sources — SEC 8-K/6-K HTML press
 releases, EDGAR exhibits, IR-hosted PDFs, shareholder letters, and other
-website PDF URLs.  Regardless of source, consolidated monetary figures are
-normalized to USD before persistence.  When a document or table explicitly
-declares another currency, the pipeline must not silently treat those numbers
-as USD.  This module provides deterministic, source-agnostic currency detection
-plus a USD-only validation gate.
+website PDF URLs.  Some issuers report in USD; foreign issuers (ASML, TSM, ...)
+often report only in their own currency (EUR, TWD, JPY, ...).
 
-It deliberately performs **no foreign-exchange conversion**: the extraction
-agent must never invent an FX rate.  Foreign-currency figures are either taken
-from an explicitly company-reported USD translation (which the agent returns
-directly as a USD value) or marked unresolved and blocked at the save gate.
+Policy — **USD preferred, native currency fallback, never invented**:
+
+* Prefer the company-reported **USD** presentation when the filing provides one
+  (a USD column/table/translation).
+* Otherwise persist the filing's explicitly reported currency.
+* **Never** perform a foreign-exchange conversion and **never** assume USD: a
+  monetary value whose currency cannot be confirmed is not persisted.
+* Use **one currency per statement** so a statement's values stay comparable;
+  a statement is never stored as a mix of currencies.
+
+This module provides deterministic, source-agnostic currency detection plus the
+statement-level currency resolution used by the extraction pipeline, the save
+gate, Q4 derivation, and guidance persistence.
 """
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 # (pattern, iso_code, human name).  Word-bounded so "CAD" does not match
 # "arcade".  Multi-word forms precede their single-token abbreviations.
@@ -26,18 +32,60 @@ _CURRENCY_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     (re.compile(r"\b(?:pounds?\s+sterling|British pounds?|GBP)\b", re.I), "GBP", "pounds sterling"),
     (re.compile(r"\b(?:Canadian dollars?|CAD)\b", re.I), "CAD", "Canadian dollars"),
     (re.compile(r"\b(?:Australian dollars?|AUD)\b", re.I), "AUD", "Australian dollars"),
+    (re.compile(r"\b(?:New Zealand dollars?|NZD)\b", re.I), "NZD", "New Zealand dollars"),
     (re.compile(r"\b(?:Swiss francs?|CHF)\b", re.I), "CHF", "Swiss francs"),
     (re.compile(r"\b(?:Japanese yen|JPY)\b", re.I), "JPY", "Japanese yen"),
+    (re.compile(r"\b(?:New Taiwan dollars?|Taiwan dollars?|NT\$|TWD)\b", re.I), "TWD", "New Taiwan dollars"),
+    (re.compile(r"\b(?:Hong Kong dollars?|HKD)\b", re.I), "HKD", "Hong Kong dollars"),
+    (re.compile(r"\b(?:Singapore dollars?|SGD)\b", re.I), "SGD", "Singapore dollars"),
+    (re.compile(r"\b(?:Korean won|KRW)\b", re.I), "KRW", "Korean won"),
     (re.compile(r"\b(?:Indian rupees?|INR)\b", re.I), "INR", "Indian rupees"),
     (re.compile(r"\b(?:Chinese yuan|renminbi|RMB|CNY)\b", re.I), "CNY", "Chinese yuan"),
+    (re.compile(r"\b(?:Brazilian reais|Brazilian real|BRL)\b", re.I), "BRL", "Brazilian reais"),
+    (re.compile(r"\b(?:Mexican pesos?|MXN)\b", re.I), "MXN", "Mexican pesos"),
+    (re.compile(r"\b(?:Swedish kron(?:a|or)|SEK)\b", re.I), "SEK", "Swedish kronor"),
+    (re.compile(r"\b(?:Norwegian kron(?:e|er)|NOK)\b", re.I), "NOK", "Norwegian kroner"),
+    (re.compile(r"\b(?:Danish kron(?:e|er)|DKK)\b", re.I), "DKK", "Danish kroner"),
+    (re.compile(r"\b(?:South African rand|ZAR)\b", re.I), "ZAR", "South African rand"),
+    (re.compile(r"\b(?:Polish zlot(?:y|ych)|PLN)\b", re.I), "PLN", "Polish zloty"),
+    (re.compile(r"\b(?:Israeli new shekels?|ILS)\b", re.I), "ILS", "Israeli new shekels"),
+    (re.compile(r"\b(?:Turkish lira|TRY)\b", re.I), "TRY", "Turkish lira"),
 ]
 
 _SYMBOL_AMOUNT_RX: dict[str, re.Pattern[str]] = {
-    "USD": re.compile(r"\$\s*\d"),
+    # Negative lookbehind keeps "NT$ 5" (New Taiwan dollars) from also being
+    # counted as a bare "$" USD amount.
+    "USD": re.compile(r"(?<![A-Za-z])\$\s*\d"),
     "EUR": re.compile(r"€\s*\d"),
     "GBP": re.compile(r"£\s*\d"),
     "JPY": re.compile(r"¥\s*\d"),
+    "TWD": re.compile(r"NT\$\s*\d"),
 }
+
+# A confirmed currency is a 3-letter ISO 4217 code that actually denotes a
+# currency.  The special/non-currency ISO codes (no currency, testing, metals)
+# and the pipeline's own sentinels are rejected.
+_ISO_CODE_RX = re.compile(r"^[A-Z]{3}$")
+_NON_CURRENCY_CODES = frozenset({
+    "XXX", "XTS", "XAU", "XAG", "XPT", "XPD", "XBA", "XBB", "XBC", "XBD",
+    "UNK", "MIX",
+})
+
+
+def is_currency_code(currency: str | None) -> bool:
+    """True when *currency* is a confirmed ISO currency code.
+
+    ``None``, ``""``, ``"unknown"``, ``"mixed"``, and the special non-currency
+    ISO codes are never confirmed — so they can never be persisted as USD or as
+    a real currency.
+    """
+    code = str(currency or "").strip().upper()
+    return bool(_ISO_CODE_RX.match(code)) and code not in _NON_CURRENCY_CODES
+
+
+def is_usd_safe(currency: str | None) -> bool:
+    """Return True when *currency* is explicitly USD (legacy helper)."""
+    return str(currency or "").strip().upper() == "USD"
 
 
 def detect_currency(text: str) -> dict[str, Any]:
@@ -46,13 +94,14 @@ def detect_currency(text: str) -> dict[str, Any]:
     Returns ``{"currency", "confidence", "detected_codes", "evidence",
     "requires_review"}``.
 
-    * ``currency`` is a single ISO code when exactly one currency is detected,
-      ``"USD"`` when USD is present, ``"mixed"`` when multiple foreign codes
-      are present, or ``"unknown"`` when nothing is declared.
+    * ``currency`` is ``"USD"`` when USD is declared (USD is preferred), a
+      single foreign ISO code when exactly one foreign currency is declared,
+      ``"mixed"`` when several codes are present, or ``"unknown"`` when nothing
+      is declared.
     * ``confidence`` is ``"high"`` for an explicit declaration and ``"low"``
-      when only a ``$`` amount symbol is present.
-    * ``requires_review`` is True when the result cannot safely be persisted
-      as USD (no declaration, foreign-only, or mixed foreign).
+      when only an amount symbol (e.g. ``$``) is present.
+    * ``requires_review`` is True when the document does not resolve to a
+      single confirmed currency.
     """
     explicit_codes: dict[str, str] = {}  # code -> first evidence snippet
     for pattern, code, _name in _CURRENCY_PATTERNS:
@@ -75,7 +124,7 @@ def detect_currency(text: str) -> dict[str, Any]:
     elif len(explicit_codes) == 1:
         currency = next(iter(explicit_codes))
         confidence = "high"
-        requires_review = True  # foreign-only: not USD, must be blocked/resolved
+        requires_review = False  # a single explicit native currency is usable
     elif len(explicit_codes) > 1:
         currency = "mixed"
         confidence = "high"
@@ -103,10 +152,11 @@ def detect_currency(text: str) -> dict[str, Any]:
 
 
 def usd_metadata(text: str) -> dict[str, Any]:
-    """Return the canonical currency metadata record for state.
+    """Return the canonical document-level currency metadata record for state.
 
-    Thin wrapper around :func:`detect_currency` that names fields the pipeline
-    stores on ``state["currency_metadata"]``.
+    Thin wrapper around :func:`detect_currency` that names the fields the
+    pipeline stores on ``state["currency_metadata"]``.  (Name kept for
+    compatibility; the value is no longer USD-only.)
     """
     detected = detect_currency(text)
     return {
@@ -118,28 +168,98 @@ def usd_metadata(text: str) -> dict[str, Any]:
     }
 
 
-def is_usd_safe(currency: str | None) -> bool:
-    """Return True when *currency* can be persisted as USD.
+# ── Statement-level currency resolution (USD preferred) ──────────────────────
 
-    Only an explicit or symbol-implied ``USD`` is safe.  ``unknown``,
-    foreign codes, and ``mixed`` are never safe without resolution.
+def choose_statement_currency(candidate_codes: Iterable[str | None]) -> tuple[str | None, str]:
+    """Choose ONE confirmed currency for a statement's values.
+
+    USD wins when the filing presents USD for that statement; otherwise the
+    single reported currency is used.  Returns ``(currency, reason)`` where
+    ``currency`` is ``None`` when nothing can be confirmed.
     """
-    return currency == "USD"
+    confirmed = [str(c).strip().upper() for c in candidate_codes if is_currency_code(c)]
+    if not confirmed:
+        return None, "no confirmed currency for this statement"
+    unique = sorted(set(confirmed))
+    if "USD" in unique:
+        return "USD", "USD presentation preferred"
+    if len(unique) == 1:
+        return unique[0], "single reported currency"
+    return None, f"mixed statement currencies ({', '.join(unique)}) — no conversion performed"
+
+
+def resolve_statement_currencies(
+    per_concept_statement: dict[str, str],
+    per_concept_candidate: dict[str, str | None],
+) -> dict[str, Any]:
+    """Resolve one currency per statement and classify each concept value.
+
+    *per_concept_statement* maps ``concept_id → statement_type`` and
+    *per_concept_candidate* maps ``concept_id → candidate currency`` (the
+    per-value evidence currency, or the document-level fallback) — both
+    already uppercased.
+
+    Returns ``{"chosen_by_statement", "reasons", "currency_by_concept",
+    "dropped"}``.  ``currency_by_concept`` contains only values that match the
+    statement's chosen currency; ``dropped`` groups the omitted concept ids by
+    statement.
+    """
+    grouped: dict[str, list[tuple[str, str | None]]] = {}
+    for cid, stmt in per_concept_statement.items():
+        grouped.setdefault((stmt or "income").strip().lower(), []).append(
+            (cid, per_concept_candidate.get(cid))
+        )
+
+    chosen: dict[str, str | None] = {}
+    reasons: dict[str, str] = {}
+    for stmt, items in grouped.items():
+        code, reason = choose_statement_currency([c for _, c in items])
+        chosen[stmt] = code
+        reasons[stmt] = reason
+
+    currency_by_concept: dict[str, str] = {}
+    dropped: dict[str, list[str]] = {}
+    for stmt, items in grouped.items():
+        code = chosen[stmt]
+        for cid, candidate in items:
+            candidate_code = str(candidate or "").strip().upper()
+            if code and candidate_code == code:
+                currency_by_concept[cid] = code
+            else:
+                dropped.setdefault(stmt, []).append(cid)
+
+    return {
+        "chosen_by_statement": chosen,
+        "reasons": reasons,
+        "currency_by_concept": currency_by_concept,
+        "dropped": dropped,
+    }
+
+
+def document_currency(chosen_by_statement: dict[str, str | None]) -> str:
+    """Collapse per-statement currencies into a document-level label."""
+    codes = sorted({c for c in (chosen_by_statement or {}).values() if is_currency_code(c)})
+    if not codes:
+        return "unknown"
+    if len(codes) == 1:
+        return codes[0]
+    return "mixed"
 
 
 def validate_currency_metadata(metadata: dict[str, Any] | None) -> tuple[bool, str | None]:
-    """Validate a currency metadata record against the USD-only invariant.
+    """Validate a document-level currency record.
 
-    Returns ``(ok, error_message)``.  ``error_message`` is None when the record
-    is safe to persist as USD.
+    Returns ``(ok, error_message)``.  ``ok`` is True when the record names a
+    single confirmed currency (USD or a foreign ISO code) — the only states in
+    which monetary values may be persisted.
     """
     if not metadata:
         return False, "missing currency metadata"
     currency = metadata.get("currency")
-    if currency == "USD":
+    if is_currency_code(currency):
         return True, None
-    if currency in (None, "unknown"):
+    if currency in (None, "unknown", ""):
         return False, "currency could not be determined — refusing to assume USD"
     if currency == "mixed":
-        return False, "multiple currencies detected — refusing to assume USD"
-    return False, f"non-USD currency {currency!r} — refusing to save as USD without conversion"
+        return False, "multiple currencies detected — refusing to save unlabeled values"
+    return False, f"currency {currency!r} is not a confirmed ISO code"

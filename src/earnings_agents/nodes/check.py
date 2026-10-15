@@ -40,6 +40,22 @@ def check_period_node(state: EarningsAgentState) -> EarningsAgentState:
     except Exception as exc:
         return {**state, "status": "failed", "error": f"check_period: {exc}"}
 
+    # QUARTERLY-ONLY mode (backfill / --quarterly-only / worker flag): period
+    # classification still comes exclusively from the period agent, but an
+    # annual filing is stopped here — before concept loading, extraction, save.
+    if state.get("quarterly_only") and period.period_type != "quarterly":
+        reason = (
+            f"quarterly-only mode: {format_period_label(period)} "
+            "is annual; annual filings are not processed by earnings-backfill"
+        )
+        report_call(f"  [backfill]  skipped — {reason}")
+        return {
+            **state,
+            "status": "skipped",
+            "error": reason,
+            "_pending_replace": None,
+        }
+
     if not cik or not period.fiscal_year:
         return {
             **state,

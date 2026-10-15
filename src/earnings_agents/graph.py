@@ -54,16 +54,17 @@ def _route_after(next_node: str):
 
 
 def _route_after_save(state: EarningsAgentState) -> str:
-    """Run the post-save nodes only after a successful save.
-
-    The guidance save runs first (persists guidance_values + scores actuals),
-    then the Q4 derivation.  Each node no-ops when irrelevant (no guidance
-    records / quarterly period / disabled config) — this route only avoids
-    invoking them when the income-statement save itself failed.
-    """
+    """Run the post-save nodes only after a successful save."""
     if state.get("status") == "saved":
         return "save_guidance"
     return "__end__"
+
+
+def _route_after_guidance(state: EarningsAgentState) -> str:
+    """Quarterly-only runs never run post-save Q4 derivation."""
+    if state.get("quarterly_only"):
+        return "__end__"
+    return "calculate_q4"
 
 
 def build_graph():
@@ -99,7 +100,11 @@ def build_graph():
         {"save_guidance": "save_guidance", "__end__": END},
     )
 
-    graph.add_edge("save_guidance", "calculate_q4")
+    graph.add_conditional_edges(
+        "save_guidance",
+        _route_after_guidance,
+        {"calculate_q4": "calculate_q4", "__end__": END},
+    )
     graph.add_edge("calculate_q4", END)
 
     return graph.compile()

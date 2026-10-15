@@ -1,149 +1,130 @@
-# SEC 8-K Earnings Agent Pipeline
+One filing: 8-K or 6-K
 
-Agent-based pipeline that fetches SEC 8-K filings and press releases (HTML and PDF exhibits), extracts financial statements into MongoDB `normalize_data`, and derives period and Q4 metrics.
+ ### Existing US issuer flow — 8-K is the default
 
----
+ ```bash
+   uv run earnings --ticker MSFT
+   uv run earnings --ticker MSFT -s income
+   uv run earnings --ticker MSFT --dry-run
+ ```
 
-## Quick Start
+ ### Foreign issuer: 6-K auto-discovery
 
-```bash
-# Install dependencies
-uv sync
-uv sync --extra dev
+ ```bash
+   uv run earnings --ticker ASML --form 6-K --dry-run
+   uv run earnings --ticker ASML --form 6-K
+ ```
 
-# Run extraction for a ticker (extracts ALL 3 statements by default)
-uv run earnings --ticker HIMS
+ ASML’s descriptive exhibit filenames let the conservative discovery filter identify earnings releases. TSM
+ auto-discovery may find no candidate because its earnings exhibit names are opaque; use a pinned accession
+ instead.
 
-# Run dry run (connectivity & filing check, no LLM execution)
-uv run earnings --ticker HIMS --dry-run
+ ### Pin the exact filing — recommended for TSM
 
-# Run with verbose debug logging
-uv run earnings --ticker HIMS -v
-```
+ These were the filings used in our read-only Phase 4 validation; choose the accession you actually want to
+ process:
 
----
+ ```bash
+   uv run earnings --ticker ASML --form 6-K \
+     --accession 0001628280-26-048235 --dry-run
 
-## Financial Statement Selection (`--statements` / `-s`)
+   uv run earnings --ticker ASML --form 6-K \
+     --accession 0001628280-26-048235
 
-The pipeline supports extracting three financial statements:
-- **`income`** — Income Statement / Condensed Consolidated Statements of Operations (Duration/Flow)
-- **`balancesheet`** — Balance Sheet / Condensed Consolidated Balance Sheets (Point-in-Time)
-- **`cashflow`** — Statement of Cash Flows (Duration/Flow & Point-in-Time ending balances)
+   uv run earnings --ticker TSM --form 6-K \
+     --accession 0001046179-26-000451 --dry-run
 
-### Default Behavior (When Flag is Omitted)
+   uv run earnings --ticker TSM --form 6-K \
+     --accession 0001046179-26-000451
+ ```
 
-> **When you do NOT pass the `--statements` / `-s` flag, the pipeline automatically extracts and saves ALL THREE statements:**
->
-> `["income", "balancesheet", "cashflow"]`
+ A pinned accession resolves that filing’s exhibits directly; it does not scan for the latest filing. For a
+ one-off URL:
 
-```bash
-# Extracts Income Statement, Balance Sheet, and Cash Flow Statement by default:
-uv run earnings --ticker MSFT
-uv run earnings --cik 0000789019
-```
+ ```bash
+   uv run earnings --ticker ASML --form 6-K \
+     --filing-url 'https://example.com/earnings-release.html' --dry-run
+ ```
 
----
+ ### Other useful options
 
-### How to Pass Specific Statements
+ ```bash
+   # Process selected financial statements only
+   uv run earnings --ticker ASML --form 6-K -s income
 
-You can pass a comma-separated list of statement identifiers using either `--statements` or `-s`.
+   # Use a CIK instead of a ticker
+   uv run earnings --cik 0000937966 --form 6-K --dry-run
 
-#### 1. Single Statement
-To restrict extraction to only one statement:
+   # DEBUG logging
+   uv run earnings --ticker ASML --form 6-K -v
+ ```
 
-```bash
-# Extract only the Income Statement:
-uv run earnings --ticker MSFT --statements income
-# or using short flag:
-uv run earnings --ticker MSFT -s income
+ If quarterly concepts don’t yet exist for the company, the first quarterly run bootstraps them from annual
+ concepts. No annual values are copied; the values still come from the quarterly filing.
 
-# Extract only the Balance Sheet:
-uv run earnings --ticker MSFT -s balancesheet
+ Historical backfill
 
-# Extract only the Cash Flow Statement:
-uv run earnings --ticker MSFT -s cashflow
-```
+ ### Preview the candidate manifest first
 
-#### 2. Subset of Statements
-To extract any two statements, separate them with a comma:
+ ```bash
+   # ASML: historical 6-K candidates, no LLM calls or database writes
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --from-year 2025 --to-year 2026 --dry-run
 
-```bash
-# Extract Income Statement and Balance Sheet:
-uv run earnings --ticker MSFT --statements "income,balancesheet"
+   # Same preview as JSON
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --from-year 2025 --to-year 2026 --dry-run --json
 
-# Extract Income Statement and Cash Flow:
-uv run earnings --ticker MSFT -s "income,cashflow"
-```
+   # TSM: review lower-confidence 6-K candidates too
+   uv run earnings-backfill --ticker TSM --form 6-K \
+     --from-year 2025 --to-year 2026 --include-unverified --dry-run --json
+ ```
 
-#### 3. Explicitly Specify All Statements
-```bash
-uv run earnings --ticker MSFT --statements "income,balancesheet,cashflow"
-```
+ The default manifest is conservative. For TSM, review the manifest and then run selected filings by pinned
+ accession; don’t automatically process every unverified 6-K.
 
-*Note: Statement names are case-insensitive and whitespace-tolerant (e.g., `-s "Income , BalanceSheet"` is valid).*
+ ### Run a historical range
 
----
+ After reviewing the dry run:
 
-### Safe Stale Sweep & Data Isolation
+ ```bash
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --from-year 2025 --to-year 2026
 
-When running with a subset of statements (e.g. `--statements income`):
-- The agent only targets concepts belonging to the specified statement(s).
-- **Existing database records for omitted statements are protected:** The atomic stale sweep only deletes stale documents for the targeted statement types. If a balance sheet was previously saved for that period, running `--statements income` will **never** delete or overwrite the existing balance sheet data.
+   # 8-K historical range
+   uv run earnings-backfill --ticker MSFT --from-year 2024 --to-year 2025
 
----
+   # Multiple forms (repeat --form)
+   uv run earnings-backfill --ticker MSFT \
+     --form 8-K --form 6-K --from-year 2025 --to-year 2026
+ ```
 
-### Worker & Background Processing
+ Backfills run oldest first within the selected candidates. This lets Q1–Q3 actuals be present before an
+ annual filing triggers Q4 calculation.
 
-#### Redis Worker CLI
-The Redis worker (`earnings-8k-worker`) also supports the `--statements` / `-s` flag to set the default statements for incoming jobs:
+ ### Target a period or control reruns
 
-```bash
-uv run earnings-8k-worker --statements "income,balancesheet,cashflow"
-```
+ ```bash
+   # Approximate selection from SEC reportDate; the period agent still decides period identity
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --fiscal-year 2026 --fiscal-quarter 2 --dry-run
 
-#### Job Queue Payload
-When jobs are enqueued via Redis (`sec:filings:8k`), the job payload can specify the statements:
+   # Only the newest matching candidate
+   uv run earnings-backfill --ticker ASML --form 6-K --latest --dry-run
 
-```json
-{
-  "ticker": "MSFT",
-  "accession_number": "0000789019-26-000012",
-  "statements": ["income", "balancesheet"]
-}
-```
-If the payload omits `statements`, it automatically falls back to the worker's `--statements` flag or `TARGET_STATEMENTS` in configuration (all three statements).
+   # Limit candidates
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --from-year 2025 --limit 5 --dry-run
 
----
+   # Pin one or more accessions; use --form 6-K for these examples
+   uv run earnings-backfill --ticker TSM --form 6-K \
+     --accession 0001046179-26-000451 --dry-run
 
-### Environment Variable Configuration
+   # Re-run accessions already marked completed in the backfill ledger
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --from-year 2025 --reload
 
-You can also set the default statements globally in your `.env` file:
-
-```dotenv
-# Comma-separated list of statements (default: income,balancesheet,cashflow)
-TARGET_STATEMENTS=income,balancesheet,cashflow
-
-# De-accumulate year-to-date cash-flow statements into quarterly values
-# (Q2 = 6m - Q1, Q3 = 9m - (Q1+Q2)). Default on.
-DEACCUMULATE_YTD_CASHFLOW=1
-```
-
-Optional: route the document **section indexer** (used to locate the income
-statement when the prescan can't) to a fast provider, independent of the main
-agent-loop provider:
-
-```dotenv
-# Falls back to LLM_PROVIDER when the routed provider's key is missing.
-INDEX_LLM_PROVIDER=gemini
-INDEX_LLM_MODEL=gemini-2.5-flash
-```
-
----
-
-## Testing
-
-Run the full test suite (250 tests):
-
-```bash
-uv run pytest tests/ -q
-```
+   # Ignore the resume ledger
+   uv run earnings-backfill --ticker ASML --form 6-K \
+     --from-year 2025 --no-resume
+ ```

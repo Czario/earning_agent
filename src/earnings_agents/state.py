@@ -40,6 +40,11 @@ class EarningsAgentState(TypedDict):
     recent_concept_ids: NotRequired[Optional[list[str]]]
     calculated_concepts: NotRequired[Optional[list]]  # system:/calculated concept dicts for derivation
     concept_metrics: NotRequired[Optional[dict]]    # concept_id → float for normalize_data upsert
+    # Agent-proposed new printed rows that remain unmapped after existing and
+    # semantic concept mapping; concept documents are created only after the
+    # save gate passes.
+    new_concept_candidates: NotRequired[Optional[list[dict]]]
+    new_concept_issues: NotRequired[Optional[list[str]]]
     derived_concept_ids: NotRequired[Optional[list[str]]]  # concept_ids filled by Tier-3 derivation
     fiscal_year_end_month: NotRequired[Optional[int]]
     fiscal_year_end_code: NotRequired[Optional[str]]  # raw MMDD string, e.g. "0130" or "1231"
@@ -103,6 +108,18 @@ class EarningsAgentState(TypedDict):
     # Set from the EDGAR submissions API (CLI path) or Redis payload (worker).
     # Stored with every concept value for exact-filing dedup in the skip guard.
     accession_number: NotRequired[Optional[str]]
+    # Source SEC form the document came from: "8-K" (US issuers, Item 2.02) or
+    # "6-K" (foreign private issuers).  Provenance only — it never decides the
+    # reporting period (the period agent does) and never selects the annual vs
+    # quarterly collection (``detected_period.period_type`` does).  Persisted
+    # additively on saved values and on guidance docs.
+    source_form_type: NotRequired[Optional[str]]
+    # QUARTERLY-ONLY mode (opt-in): the period agent still identifies the
+    # period, but an annual result is skipped before concept loading /
+    # extraction / save, and post-save Q4 derivation never runs.
+    # Set by `earnings-backfill`, `earnings --quarterly-only`, and the
+    # worker payload's `quarterly_only` flag.  Default: off.
+    quarterly_only: NotRequired[bool]
     # ── Forward-looking guidance (guidance_values) ─────────────────────────
     # Normalized guidance records extracted by the agent's PHASE 3 step from
     # finalize_extraction's "__guidance__" list.  Each record is a

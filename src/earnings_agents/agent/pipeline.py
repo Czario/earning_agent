@@ -27,7 +27,12 @@ from earnings_agents.agent.derive import (
     prescan_document,
     SCALE_MULTIPLIERS,
 )
-from earnings_agents.agent.currency import usd_metadata, is_usd_safe
+from earnings_agents.agent.currency import (
+    usd_metadata,
+    is_currency_code,
+    resolve_statement_currencies,
+    document_currency,
+)
 from earnings_agents.agent.indexer import build_section_index, format_section_index
 from earnings_agents.agent.prompts import (
     PIPELINE_SYSTEM_PROMPT,
@@ -135,14 +140,18 @@ def _build_completeness_findings(
     """
     findings: list[dict] = []
 
+    # Currency is resolved PER VALUE by the pipeline (USD preferred, native
+    # fallback) and unconfirmed values are omitted — never a whole-run blocker.
+    # The medium-severity note below is observability only.
     currency = (currency_meta or {}).get("currency")
-    if currency != "USD":
+    if not is_currency_code(currency):
         findings.append({
-            "type": "unresolved_currency",
-            "severity": "high",
+            "type": "currency_unresolved",
+            "severity": "medium",
             "message": (
-                f"Document currency is {currency}, not USD — "
-                "refusing to save non-USD monetary values"
+                f"Document currency is {currency or 'unknown'} — monetary values "
+                "without a confirmed currency were omitted (no currency "
+                "conversion is performed and USD is never assumed)"
             ),
             "evidence": {"currency_metadata": currency_meta},
         })
@@ -466,6 +475,7 @@ def _run_extraction_pass(
     # The section map built by the period pass (find_sections) rides in state;
     # find_sections in THIS loop returns it instantly and the initial message
     # points the agent straight at the income-statement range.
+    new_concept_proposals: list[dict] = []
     tools = build_pi_tools(
         plain_text, cik=state.get("cik"),
         company_name=state["company_name"],
@@ -477,6 +487,8 @@ def _run_extraction_pass(
         fiscal_year=getattr(period, "fiscal_year", None),
         quarter=getattr(period, "quarter", None),
         period=period,
+        new_concept_candidates=new_concept_proposals,
+        allowed_statements=target_statements,
     )
     for t in memory_tools:
         tools.append(t)
@@ -788,8 +800,9 @@ def _run_extraction_pass(
         agent_cashflow_basis = None
 
     # Currency authority = the tool-calling agent's report.  A deterministic
-    # whole-document scan is only a fallback for confirmed foreign/mixed codes
-    # when the agent did not report anything; it never blocks "unknown".
+    # whole-document scan is only a fallback when the agent reports nothing.
+    # The per-value statement resolution below decides what is actually saved;
+    # this record is the document-level default (USD or the native currency).
     scan = usd_metadata(plain_text)
     if agent_currency:
         currency_meta = {
@@ -797,10 +810,10 @@ def _run_extraction_pass(
             "confidence": "agent",
             "detected_codes": [agent_currency],
             "evidence": agent_currency_evidence,
-            "requires_review": not is_usd_safe(agent_currency),
+            "requires_review": not is_currency_code(agent_currency),
         }
-    elif scan.get("currency") not in (None, "USD"):
-        currency_meta = scan  # confirmed foreign/mixed — will block at save
+    elif scan.get("currency"):
+        currency_meta = scan  # agent silent — use the deterministic document scan
     else:
         currency_meta = {
             "currency": "unknown",
@@ -869,6 +882,32 @@ def _run_extraction_pass(
     mapped_keys.update(semantic_mapped_keys)
     _reverse_map.update(semantic_reverse)
 
+    # A new concept may be created only for an agent-proposed printed row that
+    # remains unmapped after both exact and high-confidence semantic matching.
+    # Candidate values remain outside concept_metrics until the save node has
+    # passed the normal accuracy/currency gates and materialized the concept.
+    from earnings_agents.agent.new_concepts import prepare_new_concept_candidates
+    prepared_new_concepts, new_concept_issues = prepare_new_concept_candidates(
+        new_concept_proposals,
+        metrics=metrics,
+        target_concepts=target_concepts,
+        mapped_keys=mapped_keys,
+        derived_keys=derived_keys,
+        evidence_by_key=agent_evidence,
+        document_line_count=len(plain_text.split("\n")),
+        target_statements=target_statements,
+    )
+    if prepared_new_concepts:
+        report_call(
+            f"  [pipeline]  {len(prepared_new_concepts)} new concept candidate(s) "
+            "remain unmapped; defer concept creation to the gated save"
+        )
+    if new_concept_issues:
+        report_call(
+            f"  [pipeline]  ⚠ {len(new_concept_issues)} new concept proposal(s) "
+            "rejected or unresolved"
+        )
+
     # ── Derived (computed) concepts ────────────────────────────────────
     # CALC (system:/calculated) concepts are never verbatim in the filing, so
     # their presence in the mapped results means the agent computed them via
@@ -915,6 +954,28 @@ def _run_extraction_pass(
     if effective_cf_basis not in ("ytd_6m", "ytd_9m") and doc_basis in ("ytd_6m", "ytd_9m"):
         effective_cf_basis = doc_basis
         basis_source = "document"
+
+    # The de-accumulation tool is intentionally keyed to persisted concepts so
+    # it can load exact prior-quarter values. Until that tool supports a new
+    # concept ID, never save newly discovered cash-flow rows from a YTD-only
+    # Q2/Q3 table as if they were quarter values.
+    if effective_cf_basis in ("ytd_6m", "ytd_9m") and period.quarter in (2, 3):
+        kept_new_concepts: list[dict] = []
+        for candidate in prepared_new_concepts:
+            if candidate.get("statement_type") == "cashflow":
+                new_concept_issues.append(
+                    f"{candidate.get('label')}: new cash-flow concept omitted because "
+                    f"the filing is {effective_cf_basis} and prior-quarter de-accumulation "
+                    "is not yet supported for unpersisted concepts"
+                )
+            else:
+                kept_new_concepts.append(candidate)
+        prepared_new_concepts = kept_new_concepts
+        if new_concept_issues:
+            report_call(
+                "  [pipeline]  ⚠ new cash-flow concepts from a YTD statement "
+                "will not be saved as quarterly values"
+            )
 
     cf_deaccum_findings: list[dict] = []
     if (
@@ -1005,6 +1066,110 @@ def _run_extraction_pass(
                 f"(omitted from quarterly save, run continues)"
             )
 
+    # ── 5b. Currency policy — USD preferred, native currency fallback ────
+    # The extraction agent reports the currency of each table it read
+    # (__currency__ document-level, __evidence__[*].currency per value).  The
+    # pipeline never converts currency: it selects ONE confirmed currency per
+    # statement (USD wins when the filing presents USD for that statement),
+    # keeps only the values that match it, and drops the rest with
+    # observability.  A local-currency figure is therefore never mislabeled as
+    # USD, and a statement is never stored as a mix of currencies.
+    evidence_by_concept: dict[str, dict] = {}
+    for cid, metric_key in _reverse_map.items():
+        ev = agent_evidence.get(metric_key)
+        if isinstance(ev, dict):
+            evidence_by_concept[cid] = ev
+
+    doc_currency_candidate = str(currency_meta.get("currency") or "").strip().upper()
+    per_concept_statement = {
+        cid: (concept_by_id.get(cid, {}).get("statement_type") or "income")
+        for cid in concept_metrics
+    }
+    per_concept_currency = {
+        cid: (
+            str((evidence_by_concept.get(cid) or {}).get("currency") or "").strip().upper()
+            or doc_currency_candidate
+        )
+        for cid in concept_metrics
+    }
+    currency_resolution = resolve_statement_currencies(
+        per_concept_statement, per_concept_currency,
+    )
+    currency_by_concept = currency_resolution["currency_by_concept"]
+    currency_findings: list[dict] = []
+    for stmt, dropped_ids in currency_resolution["dropped"].items():
+        labels = [
+            (
+                concept_by_id.get(cid, {}).get("label")
+                or concept_by_id.get(cid, {}).get("concept")
+                or cid
+            )
+            for cid in dropped_ids
+        ]
+        candidates_seen = sorted({
+            (per_concept_currency.get(cid) or "unknown") for cid in dropped_ids
+        })
+        for cid in dropped_ids:
+            concept_metrics.pop(cid, None)
+            derived_ids.discard(cid)
+        currency_findings.append({
+            "type": "currency_unresolved",
+            "severity": "medium",
+            "message": (
+                f"{stmt}: {len(dropped_ids)} value(s) omitted — "
+                f"{currency_resolution['reasons'].get(stmt) or 'currency unresolved'}"
+            ),
+            "evidence": {
+                "statement_type": stmt,
+                "candidate_currencies": candidates_seen[:10],
+                "labels": labels[:10],
+            },
+        })
+    if currency_resolution["dropped"]:
+        report_call(
+            "  [pipeline]  ⚠ currency: "
+            + "; ".join(
+                f"{stmt} kept {currency_resolution['chosen_by_statement'].get(stmt) or 'none'}, "
+                f"dropped {len(ids)}"
+                for stmt, ids in currency_resolution["dropped"].items()
+            )
+        )
+    chosen_currency = document_currency(currency_resolution["chosen_by_statement"])
+    currency_meta = {
+        **currency_meta,
+        "currency": chosen_currency,
+        "per_statement": currency_resolution["chosen_by_statement"],
+    }
+
+    # New-concept candidates follow the same statement currency as the values
+    # already extracted for that statement; an unattributable candidate is not
+    # created (it would otherwise persist a currency-less number).
+    kept_new_concepts: list[dict] = []
+    for candidate in prepared_new_concepts:
+        stmt = str(candidate.get("statement_type") or "income").strip().lower()
+        candidate_currency = (
+            str(candidate.get("currency") or "").strip().upper()
+            or doc_currency_candidate
+        )
+        statement_currency = currency_resolution["chosen_by_statement"].get(stmt)
+        if statement_currency:
+            if candidate_currency == statement_currency:
+                candidate["currency"] = statement_currency
+                kept_new_concepts.append(candidate)
+            else:
+                new_concept_issues.append(
+                    f"{candidate.get('label')}: currency {candidate_currency or 'unknown'} "
+                    f"does not match the {stmt} statement currency {statement_currency}"
+                )
+        elif is_currency_code(candidate_currency):
+            candidate["currency"] = candidate_currency
+            kept_new_concepts.append(candidate)
+        else:
+            new_concept_issues.append(
+                f"{candidate.get('label')}: currency unknown — new concept not created"
+            )
+    prepared_new_concepts = kept_new_concepts
+
     # ── 6. Return state ──────────────────────────────────────────────────
     raw_text = plain_text[:EXTRACTION_MAX_CHARS]
 
@@ -1030,22 +1195,13 @@ def _run_extraction_pass(
 
     # Per-concept metadata for persistence (dimension identity, currency,
     # scale/evidence, calculated status) + structured findings for the gate.
-    currency_value = currency_meta.get("currency") or "unknown"
-    # Resolve evidence keyed by the agent's metric key (bracketed taxonomy key
-    # or label) onto concept ids via the mapping reverse-map.
-    evidence_by_concept: dict[str, dict] = {}
-    for cid, metric_key in _reverse_map.items():
-        ev = agent_evidence.get(metric_key)
-        if isinstance(ev, dict):
-            evidence_by_concept[cid] = ev
     value_metadata_by_id: dict[str, dict] = {}
     for cid in concept_metrics:
         c = concept_by_id.get(cid, {})
         ev = evidence_by_concept.get(cid, {})
-        # Per-value currency: agent-declared per-value evidence wins; otherwise
-        # the document-level currency decision applies.
-        ev_currency = str(ev.get("currency") or "").strip().upper()
-        value_currency = ev_currency or currency_value
+        # Currency was resolved per statement above; only matching values
+        # survive, so every stored value carries its confirmed ISO code.
+        value_currency = currency_by_concept.get(cid) or ""
         value_metadata_by_id[cid] = {
             "statement_type": c.get("statement_type") or "income",
             "dimension": bool(c.get("dimension")),
@@ -1054,7 +1210,7 @@ def _run_extraction_pass(
             "dimension_member_label": c.get("dimension_member_label") or "",
             "dimension_axis": c.get("dimension_axis") or "",
             "calculated": cid in derived_ids or bool(c.get("calculated")),
-            "currency": "USD" if is_usd_safe(value_currency) else value_currency,
+            "currency": value_currency,
             "status": "derived" if cid in derived_ids else "mapped",
         }
         if isinstance(ev.get("lines"), list) and len(ev["lines"]) == 2:
@@ -1065,13 +1221,12 @@ def _run_extraction_pass(
             value_metadata_by_id[cid]["scale"] = str(ev["scale"]).strip().lower()
         if ev.get("evidence"):
             value_metadata_by_id[cid]["source_snippet"] = str(ev["evidence"])[:500]
-        if not is_usd_safe(value_currency) and value_currency not in ("", "unknown"):
-            value_metadata_by_id[cid]["requires_review"] = True
     findings = _build_completeness_findings(
         currency_meta, state.get("document_map"), agent_missing
     )
     findings.extend(ambiguity_findings)
     findings.extend(cf_deaccum_findings)
+    findings.extend(currency_findings)
 
     # Deterministic company-identity cross-check: the agent reports the
     # company name it actually read (__company_name__); compare (normalized)
@@ -1113,6 +1268,8 @@ def _run_extraction_pass(
         "raw_text": raw_text,
         "metrics": metrics,
         "concept_metrics": concept_metrics,
+        "new_concept_candidates": prepared_new_concepts,
+        "new_concept_issues": new_concept_issues,
         "guidance_records": guidance_records,
         "derived_concept_ids": list(derived_ids),
         "mapped_metric_keys": list(mapped_keys),

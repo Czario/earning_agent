@@ -59,9 +59,12 @@ def save_guidance_node(state: EarningsAgentState) -> EarningsAgentState:
         return {**state, "guidance_save": summary}
 
     accession = state.get("accession_number")
-    # This pipeline processes 8-K Exhibit 99.1 press releases (the worker
-    # queue is sec:filings:8k); a manual URL run also carries the 8-K text.
-    form_type = str(state.get("form_type") or "8-K")
+    # Source SEC form provenance: 8-K (US issuers) or 6-K (foreign private
+    # issuers).  A manual URL run may have no form — keep "8-K" as the
+    # historical default so existing guidance docs are unchanged.
+    form_type = str(
+        state.get("source_form_type") or state.get("form_type") or "8-K"
+    )
 
     from earnings_agents.integrations.guidance import (
         upsert_guidance_records,

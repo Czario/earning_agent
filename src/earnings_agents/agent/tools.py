@@ -48,6 +48,8 @@ def build_pi_tools(
     include_cashflow_tools: bool = True,
     period: Any | None = None,
     prior_values: dict[str, float] | None = None,
+    new_concept_candidates: list[dict] | None = None,
+    allowed_statements: list[str] | None = None,
 ) -> list:
     """Build the pi-style tool set for raw document navigation.
 
@@ -96,6 +98,13 @@ def build_pi_tools(
     total_lines = len(lines)
     total_chars = len(document_text)
     document_map = document_map or []
+    new_concept_enabled = new_concept_candidates is not None
+    candidate_sink = new_concept_candidates if new_concept_enabled else []
+    allowed_statement_set = {
+        str(item).strip().lower()
+        for item in (allowed_statements or [c.get("statement_type") for c in (target_concepts or [])])
+        if item
+    }
 
     if prior_values is None and cik and target_concepts and period is not None:
         try:
@@ -781,6 +790,81 @@ def build_pi_tools(
             f"(concept_id={c.get('_id')})"
         )
 
+    # ── New filing concepts: agent proposal only; persistence is deferred to save ──
+    @_lc_tool
+    def propose_new_concept(
+        metric_key: str,
+        metric_label: str,
+        statement_type: str,
+        parent_key: str,
+        dimension_concept: bool = False,
+        dimension_axis: str = "",
+        dimension_member_label: str = "",
+    ) -> str:
+        """Propose a genuinely new printed statement row for concept creation.
+
+        Call only after map_concept() finds no existing target concept for a
+        numeric financial-statement row. This tool records a proposal; it does
+        not write to MongoDB. The pipeline maps against existing concepts first
+        and the save node creates a company concept only if the value remains
+        unmapped and passes the normal save gates.
+
+        Args:
+            metric_key: Exact key you will use for this row's numeric value in
+                finalize_extraction and in __evidence__.
+            metric_label: The row/member label exactly as printed in the filing.
+            statement_type: income, balancesheet, or cashflow.
+            parent_key: The exact bracketed target concept key of the existing
+                parent line, or the literal ROOT for a genuine statement root.
+            dimension_concept: True only for a newly disclosed dimensional
+                member (segment/geography/product) under an existing parent line.
+            dimension_axis: Axis label/tag when the filing states it; otherwise
+                leave blank (never invent an axis).
+            dimension_member_label: The member label for a dimensional row;
+                defaults to metric_label when blank.
+        """
+        key = str(metric_key or "").strip()
+        label = str(metric_label or "").strip()
+        statement = str(statement_type or "").strip().lower()
+        parent = str(parent_key or "").strip()
+        if not key or key.startswith("__") or not label:
+            return "Rejected: provide a numeric metric_key and printed metric_label."
+        if statement not in allowed_statement_set:
+            return (
+                f"Rejected: statement_type {statement!r} is not among the statements "
+                f"targeted for this filing ({', '.join(sorted(allowed_statement_set))})."
+            )
+        if parent.upper() != "ROOT":
+            parent_norm = parent.strip().strip("[]").lower()
+            parent_keys = {
+                str(c.get("taxonomy_key") or c.get("concept") or "").strip().lower()
+                for c in (target_concepts or [])
+                if str(c.get("statement_type") or "income").strip().lower() == statement
+            }
+            if parent_norm not in parent_keys:
+                return (
+                    "Rejected: parent_key must be ROOT or an exact key from the "
+                    "target concept list for this statement."
+                )
+        elif dimension_concept:
+            return "Rejected: a dimensional member must have an existing parent concept."
+
+        if any(c.get("metric_key") == key for c in candidate_sink):
+            return f"Recorded already: {key!r} is a new-concept candidate."
+        candidate_sink.append({
+            "metric_key": key,
+            "label": label,
+            "statement_type": statement,
+            "parent_key": "ROOT" if parent.upper() == "ROOT" else parent.strip().strip("[]"),
+            "dimension_concept": bool(dimension_concept),
+            "dimension_axis": str(dimension_axis or "").strip(),
+            "dimension_member_label": str(dimension_member_label or label).strip(),
+        })
+        return (
+            f"Candidate recorded for {key!r}. Include its numeric value under that "
+            "exact key in finalize_extraction and provide __evidence__ lines."
+        )
+
     # ── 11. Deterministic arithmetic for derived concepts ──────────────
     @_lc_tool
     def compute(expression: str) -> str:
@@ -927,6 +1011,8 @@ def build_pi_tools(
         map_concept,
         compute,
     ]
+    if new_concept_enabled:
+        tools.append(propose_new_concept)
     if include_cashflow_tools:
         tools.extend([detect_cashflow_period_basis, deaccumulate_cashflow])
     if include_find_sections:

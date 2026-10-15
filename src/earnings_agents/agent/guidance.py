@@ -42,7 +42,7 @@ import re
 from typing import Any
 
 from earnings_agents.agent.loop import _coerce_number
-from earnings_agents.agent.currency import is_usd_safe
+from earnings_agents.agent.currency import is_currency_code
 from earnings_agents.agent.derive import SCALE_MULTIPLIERS
 from earnings_agents.agent.period import DetectedPeriod
 from earnings_agents.config import GUIDANCE_MAX_RECORDS
@@ -486,30 +486,44 @@ def normalize_guidance_records(
             issues.append(f"record {i + 1} ({metric}): value_low > value_high — dropped")
             continue
 
+        # Currency: the record's own currency wins; otherwise the filing's
+        # resolved currency (doc_currency).  Never assumed, never converted.
+        currency = (_clean_str(raw.get("currency"), 10) or "").upper() or None
+        if not is_currency_code(currency):
+            fallback = (doc_currency or "").strip().upper()
+            currency = fallback if is_currency_code(fallback) else None
+
         if form == "percentage_growth":
             unit = "percent"
             scale = "as-is"
         else:
             unit = _clean_str(raw.get("unit"), 20)
+            if not is_currency_code(currency) and is_currency_code(unit):
+                # "unit": "USD" is an explicit currency declaration.
+                currency = str(unit).strip().upper()
             scale = _clean_str(raw.get("scale"), 20)
             if scale and scale not in SCALE_WHITELIST:
                 scale = None
         if pct_hint and form not in ("percentage_growth",):
             unit = "percent"  # "between 15-17%" parsed from a display string
-        if unit is None and value is not None and form not in ("percentage_growth",):
-            unit = "USD"  # monetary default — matches the backend default
-        currency = (_clean_str(raw.get("currency"), 10) or "").upper() or None
-        if not currency:
-            currency = (doc_currency or "").upper() or "USD"
 
-        # per-record currency gate (belt-and-braces; doc-level gate already ran)
-        monetary = form not in ("percentage_growth",)
-        if monetary and value is not None and not is_usd_safe(currency):
+        # Per-record currency rule (USD preferred, native fallback): a
+        # MONETARY guidance number without a confirmed currency is dropped —
+        # guidance is never converted and never assumed to be USD.  Percent,
+        # ratio, and qualitative records are currency-free and unaffected.
+        monetary = (
+            value is not None
+            and form != "percentage_growth"
+            and (unit or "").strip().lower() != "percent"
+        )
+        if monetary and not is_currency_code(currency):
             issues.append(
-                f"record {i + 1} ({metric}): currency {currency} not USD — "
-                "non-USD monetary guidance not saved"
+                f"record {i + 1} ({metric}): monetary guidance currency could "
+                "not be confirmed — not saved (no currency conversion)"
             )
             continue
+        if unit is None and monetary:
+            unit = currency
 
         # ── Magnitude scaling → store RAW units (with zeros) ─────────────────
         # Monetary guidance values land in `guidance_values` in the same raw
@@ -573,7 +587,7 @@ def normalize_guidance_records(
             "plus_minus_unit": pm_unit,
             "unit": unit,
             "scale": scale,
-            "currency": currency or "USD",
+            "currency": currency,
             "as_printed": _clean_str(raw.get("as_printed"), 500),
             "condition": _clean_str(raw.get("condition"), 300),
             "event_type": event_type,

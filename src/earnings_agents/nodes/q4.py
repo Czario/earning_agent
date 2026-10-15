@@ -32,6 +32,12 @@ def calculate_q4_node(state: EarningsAgentState) -> EarningsAgentState:
     from earnings_agents.hooks import report_call
     from earnings_agents.integrations.q4 import calculate_q4_for_period
 
+    if state.get("quarterly_only"):
+        # Quarterly-only runs persist reported quarterly periods only; never
+        # synthesize Q4 from annual actuals in this mode.
+        report_call("  [q4]  disabled — quarterly-only mode")
+        return state
+
     if not _config.CALCULATE_Q4_AFTER_ANNUAL:
         report_call("  [q4]  skipped — CALCULATE_Q4_AFTER_ANNUAL is disabled")
         return state

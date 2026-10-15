@@ -84,7 +84,10 @@ class TestBuild8kStatePinnedAccession(unittest.TestCase):
     def test_unresolvable_pinned_accession_falls_back_to_latest(
         self, mock_exhibits, mock_latest
     ):
-        """Pinned accession with no documents → logged fallback to latest 8-K."""
+        """Pinned accession with no documents → logged fallback to latest 8-K.
+
+        Explicit 8-K discovery keeps using ``get_latest_earnings_url``.
+        """
         mock_exhibits.return_value = []
         mock_latest.return_value = (
             "https://www.sec.gov/Archives/edgar/data/46619/000004661926000018/a07312026ex991earningsrele.htm",
@@ -96,6 +99,7 @@ class TestBuild8kStatePinnedAccession(unittest.TestCase):
         state = _build_8k_state(
             "HEI", "HEICO CORP", "0000046619",
             accession="0000046619-26-000099",  # stale / removed accession
+            source_form_type="8-K",
             printer=_NOPRINT,
         )
 
@@ -107,10 +111,11 @@ class TestBuild8kStatePinnedAccession(unittest.TestCase):
     @patch("earnings_agents.cli.earnings.get_latest_earnings_url")
     @patch("earnings_agents.cli.earnings.get_exhibits_for_accession")
     def test_no_accession_keeps_latest_scan(self, mock_exhibits, mock_latest):
-        """CLI / manual-trigger path (no accession) → unchanged latest scan."""
+        """Explicit 8-K with no accession → unchanged latest-8-K scan."""
         mock_latest.return_value = ("url", [], "ACC-1", [])
         state = _build_8k_state(
             "HEI", "HEICO CORP", "0000046619",
+            source_form_type="8-K",
             printer=_NOPRINT,
         )
         mock_exhibits.assert_not_called()

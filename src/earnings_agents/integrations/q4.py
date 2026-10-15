@@ -41,17 +41,17 @@ from typing import Any, Optional
 from bson import ObjectId
 from pymongo import MongoClient
 
+from earnings_agents.agent.currency import is_currency_code
 from earnings_agents.agent.deaccumulate import (
     is_beginning_cash_concept,
     is_ending_cash_concept,
 )
 from earnings_agents.agent.period import DetectedPeriod
 from earnings_agents.config import MONGODB_URI
-from earnings_agents.integrations.normalize import _clean_label
+from earnings_agents.integrations.normalize import _NORMALIZE_DB, _clean_label
 
 logger = logging.getLogger(__name__)
 
-_NORMALIZE_DB = "normalize_data"
 _client: Optional[MongoClient] = None  # type: ignore[type-arg]
 
 
@@ -291,11 +291,17 @@ def _q4_exists(
     )
 
 
+def _row_currency(row: dict[str, Any] | None) -> str | None:
+    """Return the row's confirmed ISO currency code, or None when unconfirmed."""
+    code = str((row or {}).get("currency") or "").strip().upper()
+    return code if is_currency_code(code) else None
+
+
 def _find_q3_ending_cash(
     db: Any,
     cik: str,
     fiscal_year: int,
-) -> float | None:
+) -> tuple[float, str | None] | None:
     """Find the Q3 ending cash balance for *cik* and *fiscal_year*.
 
     Looks for us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents
@@ -328,7 +334,7 @@ def _find_q3_ending_cash(
             }
         )
         if row and isinstance(row.get("value"), (int, float)):
-            return float(row["value"])
+            return float(row["value"]), _row_currency(row)
     return None
 
 
@@ -343,6 +349,7 @@ def _build_q4_doc(
     q_rows: dict[int, dict[str, Any]],
     is_point_in_time: bool,
     fallback_end: Any,
+    currency: str,
     note: str | None = None,
 ) -> dict[str, Any]:
     """Build the Q4 concept-value doc matching the pipeline's save schema.
@@ -399,10 +406,17 @@ def _build_q4_doc(
         "created_at": now,
         "dimension_value": bool(annual_value_row.get("dimension_value")),
         "calculated": True,
-        "currency": annual_value_row.get("currency") or "USD",
+        "currency": currency,
+        # A derived Q4 is not a filing extract: it is computed into the
+        # quarterly collection, so it keeps the period-family label.  The
+        # annual filing it came from is recorded as provenance instead.
+        "form_type": "10-Q",
     }
     if annual_value_row.get("accession_number"):
         doc["accession_number"] = annual_value_row["accession_number"]
+    # The derived Q4 lives in the quarterly collection, so `form_type` keeps the
+    # period-family label; the accession carried over above already traces it to
+    # the annual filing it was derived from.
     # Dimension metadata is copied from the annual value record (same filing).
     for key in ("dimension_member", "dimension_member_label", "dimension_axis"):
         if annual_value_row.get(key):
@@ -512,7 +526,27 @@ def calculate_q4_for_period(
             _bump_skip(summary, "Q4 already exists")
             continue
 
+        # Currency safety: Q4 arithmetic never mixes currencies.  The annual
+        # row must carry a confirmed code, and every quarterly input used in
+        # the subtraction must carry the SAME code (a differing or missing
+        # code means the stored period is not comparable — skip the concept,
+        # never convert and never fabricate a Q4).
+        annual_currency = _row_currency(annual_value_row)
+        if annual_currency is None:
+            summary["skipped"] += 1
+            _bump_skip(summary, "annual value currency not confirmed")
+            continue
+
         q_rows = _load_q_values(db, q_oid, cik, fiscal_year, stmt)
+        mismatched = [
+            q for q, row in q_rows.items()
+            if _row_currency(row) not in (None, annual_currency)
+        ]
+        if mismatched:
+            summary["skipped"] += 1
+            _bump_skip(summary, "currency mismatch across quarters")
+            continue
+
         annual_value = annual_value_row["value"]
         concept_name = annual_concept.get("concept") or ""
         tkey = annual_concept.get("taxonomy_key") or ""
@@ -525,10 +559,15 @@ def calculate_q4_for_period(
         note = None
         if is_beg_cash:
             # Rule 1: beginning cash takes Q3 ending cash (never Annual - (Q1+Q2+Q3))
-            q3_cash = _find_q3_ending_cash(db, cik, fiscal_year)
-            if q3_cash is None:
+            q3_cash_row = _find_q3_ending_cash(db, cik, fiscal_year)
+            if q3_cash_row is None:
                 summary["skipped"] += 1
                 _bump_skip(summary, "missing Q3 ending cash")
+                continue
+            q3_cash, q3_cash_currency = q3_cash_row
+            if q3_cash_currency not in (None, annual_currency):
+                summary["skipped"] += 1
+                _bump_skip(summary, "Q3 ending cash currency mismatch")
                 continue
             q4_value = q3_cash
             is_point_in_time = True
@@ -567,6 +606,7 @@ def calculate_q4_for_period(
                 q_rows=q_rows,
                 is_point_in_time=is_point_in_time,
                 fallback_end=period.period_end,
+                currency=annual_currency,
                 note=note,
             )
             if recalculate:

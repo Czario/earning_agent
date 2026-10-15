@@ -31,9 +31,11 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from earnings_agents.config import NORMALIZE_DB_NAME
+
 logger = logging.getLogger(__name__)
 
-_MEMORY_DB = "normalize_data"
+_MEMORY_DB = NORMALIZE_DB_NAME
 _COMPANY_COL = "agent_memory_company"
 _MAX_LEARNINGS = 30
 

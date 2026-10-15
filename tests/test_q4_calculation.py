@@ -401,6 +401,69 @@ class TestMissingValuesPolicy(Q4EngineTestBase):
         self.assertEqual(result["skipped_reasons"].get("no annual value"), 1)
 
 
+class TestQ4CurrencySafety(Q4EngineTestBase):
+    """Phase 3: Q4 arithmetic never mixes currencies and never fabricates one."""
+
+    def test_flow_matching_currencies_calculates(self):
+        a_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        q_oid = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        self._seed(
+            annual_concepts=[_concept(a_oid, "us-gaap:Revenues", "Revenue", "001")],
+            quarterly_concepts=[_concept(q_oid, "us-gaap:Revenues", "Revenue", "001")],
+            annual_values=[_value(a_oid, "000123", 2026, None, 500.0, (2026, 12, 31), currency="EUR")],
+            quarterly_values=[
+                _value(q_oid, "000123", 2026, 1, 100.0, (2026, 3, 31), currency="EUR"),
+                _value(q_oid, "000123", 2026, 2, 110.0, (2026, 6, 30), currency="EUR"),
+                _value(q_oid, "000123", 2026, 3, 120.0, (2026, 9, 30), currency="EUR"),
+            ],
+        )
+        result = calculate_q4_for_period("000123", _period(), [a_oid])
+        self.assertEqual(result["calculated"], 1)
+        inserted = self.db["concept_values_quarterly"].inserted[0]
+        self.assertEqual(inserted["value"], 170.0)
+        self.assertEqual(inserted["currency"], "EUR")
+
+    def test_mismatched_quarter_currency_skips_concept(self):
+        a_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        q_oid = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        self._seed(
+            annual_concepts=[_concept(a_oid, "us-gaap:Revenues", "Revenue", "001")],
+            quarterly_concepts=[_concept(q_oid, "us-gaap:Revenues", "Revenue", "001")],
+            annual_values=[_value(a_oid, "000123", 2026, None, 500.0, (2026, 12, 31), currency="EUR")],
+            quarterly_values=[
+                _value(q_oid, "000123", 2026, 1, 100.0, (2026, 3, 31), currency="USD"),
+                _value(q_oid, "000123", 2026, 2, 110.0, (2026, 6, 30), currency="EUR"),
+                _value(q_oid, "000123", 2026, 3, 120.0, (2026, 9, 30), currency="EUR"),
+            ],
+        )
+        result = calculate_q4_for_period("000123", _period(), [a_oid])
+        self.assertEqual(result["calculated"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(
+            result["skipped_reasons"].get("currency mismatch across quarters"), 1
+        )
+        self.assertEqual(self.db["concept_values_quarterly"].inserted, [])
+
+    def test_annual_currency_missing_skips_concept(self):
+        a_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
+        q_oid = "bbbbbbbbbbbbbbbbbbbbbbbb"
+        self._seed(
+            annual_concepts=[_concept(a_oid, "us-gaap:Revenues", "Revenue", "001")],
+            quarterly_concepts=[_concept(q_oid, "us-gaap:Revenues", "Revenue", "001")],
+            annual_values=[_value(a_oid, "000123", 2026, None, 500.0, (2026, 12, 31), currency=None)],
+            quarterly_values=[
+                _value(q_oid, "000123", 2026, 1, 100.0, (2026, 3, 31)),
+                _value(q_oid, "000123", 2026, 2, 110.0, (2026, 6, 30)),
+                _value(q_oid, "000123", 2026, 3, 120.0, (2026, 9, 30)),
+            ],
+        )
+        result = calculate_q4_for_period("000123", _period(), [a_oid])
+        self.assertEqual(result["calculated"], 0)
+        self.assertEqual(
+            result["skipped_reasons"].get("annual value currency not confirmed"), 1
+        )
+
+
 class TestConceptMatching(Q4EngineTestBase):
     def test_matches_by_exact_concept_name(self):
         a_oid = "aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -705,6 +768,16 @@ class TestNodeGuards(unittest.TestCase):
             out = calculate_q4_node(self._state(cik=None))
         mock_calc.assert_not_called()
 
+    def test_quarterly_backfill_mode_never_invokes_q4_calculation(self):
+        # An annual period that reaches this node unexpectedly still must not
+        # create Q4 during earnings-backfill mode.
+        with patch(
+            "earnings_agents.integrations.q4.calculate_q4_for_period"
+        ) as mock_calc:
+            out = calculate_q4_node(self._state(quarterly_only=True))
+        mock_calc.assert_not_called()
+        self.assertEqual(out["status"], "saved")
+
     def test_annual_saved_runs_and_records_summary(self):
         summary = {
             "status": "completed",
@@ -771,14 +844,19 @@ class TestGraphRouting(unittest.TestCase):
         self.assertIn("mongodb_save", nodes)
 
     def test_graph_edges_save_guidance_before_calculate_q4(self):
-        from earnings_agents.graph import build_graph
+        from earnings_agents.graph import build_graph, _route_after_guidance
         compiled = build_graph()
         g = compiled.get_graph()
-        # mongodb_save conditionally routes to save_guidance; save_guidance
-        # has a straight edge into calculate_q4.
+        # Guidance still runs post-save; the route skips Q4 only for historical
+        # quarterly-only backfills.
         edges = [(e.source, e.target) for e in g.edges]
         self.assertIn(("save_guidance", "calculate_q4"), edges)
         self.assertIn(("calculate_q4", "__end__"), edges)
+        self.assertEqual(_route_after_guidance({"status": "saved"}), "calculate_q4")
+        self.assertEqual(
+            _route_after_guidance({"status": "saved", "quarterly_only": True}),
+            "__end__",
+        )
 
 
 if __name__ == "__main__":

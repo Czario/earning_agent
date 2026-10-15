@@ -173,18 +173,18 @@ class TestPhase4CalculateQ4MultiStatement(unittest.TestCase):
             {"_id": self.cid_cf_q, "concept": "us-gaap:CashAndCashEquivalents", "label": "Cash at End of Period", "statement_type": "cashflow", "path": "001", "cik": self.cik},
         ]
 
-        # Annual saved values
+        # Annual saved values (every value carries its confirmed currency)
         self.annual_values = [
-            {"concept_id": self.cid_is_a, "cik": self.cik, "statement_type": "income", "value": 1000.0, "reporting_period": {"fiscal_year": self.fy}},
-            {"concept_id": self.cid_bs_a, "cik": self.cik, "statement_type": "balancesheet", "value": 5000.0, "reporting_period": {"fiscal_year": self.fy}},
-            {"concept_id": self.cid_cf_a, "cik": self.cik, "statement_type": "cashflow", "value": 1500.0, "reporting_period": {"fiscal_year": self.fy}},
+            {"concept_id": self.cid_is_a, "cik": self.cik, "statement_type": "income", "value": 1000.0, "currency": "USD", "reporting_period": {"fiscal_year": self.fy}},
+            {"concept_id": self.cid_bs_a, "cik": self.cik, "statement_type": "balancesheet", "value": 5000.0, "currency": "USD", "reporting_period": {"fiscal_year": self.fy}},
+            {"concept_id": self.cid_cf_a, "cik": self.cik, "statement_type": "cashflow", "value": 1500.0, "currency": "USD", "reporting_period": {"fiscal_year": self.fy}},
         ]
 
         # Quarterly values (only for Income Statement flow differencing: Q1=200, Q2=250, Q3=300 -> Q4 expected 250)
         self.quarterly_values = [
-            {"concept_id": self.cid_is_q, "cik": self.cik, "statement_type": "income", "value": 200.0, "reporting_period": {"fiscal_year": self.fy, "quarter": 1}},
-            {"concept_id": self.cid_is_q, "cik": self.cik, "statement_type": "income", "value": 250.0, "reporting_period": {"fiscal_year": self.fy, "quarter": 2}},
-            {"concept_id": self.cid_is_q, "cik": self.cik, "statement_type": "income", "value": 300.0, "reporting_period": {"fiscal_year": self.fy, "quarter": 3}},
+            {"concept_id": self.cid_is_q, "cik": self.cik, "statement_type": "income", "value": 200.0, "currency": "USD", "reporting_period": {"fiscal_year": self.fy, "quarter": 1}},
+            {"concept_id": self.cid_is_q, "cik": self.cik, "statement_type": "income", "value": 250.0, "currency": "USD", "reporting_period": {"fiscal_year": self.fy, "quarter": 2}},
+            {"concept_id": self.cid_is_q, "cik": self.cik, "statement_type": "income", "value": 300.0, "currency": "USD", "reporting_period": {"fiscal_year": self.fy, "quarter": 3}},
             # Notice: No Q1-Q3 values for Balance Sheet or Ending Cash, because they are point-in-time!
         ]
 

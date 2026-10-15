@@ -72,6 +72,7 @@ class TestPhase1MultiStatement(unittest.TestCase):
                 cik="000123",
                 company_name="Test Co",
                 concept_metrics={"5072e8e0c9d3f4a1b2c3d4e5": 100.0},
+                value_metadata_by_id={"5072e8e0c9d3f4a1b2c3d4e5": {"currency": "USD"}},
                 period=period,
                 target_statements=["income"],
             )
@@ -83,6 +84,7 @@ class TestPhase1MultiStatement(unittest.TestCase):
                 cik="000123",
                 company_name="Test Co",
                 concept_metrics={"5072e8e0c9d3f4a1b2c3d4e5": 100.0},
+                value_metadata_by_id={"5072e8e0c9d3f4a1b2c3d4e5": {"currency": "USD"}},
                 period=period,
                 target_statements=["income", "balancesheet"],
             )
@@ -96,6 +98,7 @@ class TestPhase1MultiStatement(unittest.TestCase):
                 cik="000123",
                 company_name="Test Co",
                 concept_metrics={"5072e8e0c9d3f4a1b2c3d4e5": 100.0},
+                value_metadata_by_id={"5072e8e0c9d3f4a1b2c3d4e5": {"currency": "USD"}},
                 period=period,
                 target_statements=None,
                 statement_type="income",
@@ -133,6 +136,7 @@ class TestPhase1MultiStatement(unittest.TestCase):
                 value_metadata_by_id={
                     cid_bs: {
                         "statement_type": "balancesheet",
+                        "currency": "USD",
                     }
                 },
                 target_statements=["income", "balancesheet"],

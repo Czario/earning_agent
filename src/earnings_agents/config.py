@@ -44,6 +44,9 @@ GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_REQUEST_TIMEOUT: float = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "120"))
 MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
+# SEC-normalized concepts/values normally live in this DB.  Override only for
+# isolated staging/pilot runs; production default remains normalize_data.
+NORMALIZE_DB_NAME: str = os.getenv("NORMALIZE_DB_NAME", "normalize_data")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
 
 # Redis queue settings (used by the 8-K worker).

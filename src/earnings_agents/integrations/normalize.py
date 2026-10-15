@@ -7,6 +7,7 @@ an atexit handler for clean shutdown.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -14,14 +15,14 @@ from typing import Any, Optional
 
 from bson import ObjectId
 from pymongo import MongoClient, UpdateOne
-from uuid import uuid4
 
+from earnings_agents.agent.currency import is_currency_code
 from earnings_agents.agent.period import DetectedPeriod, format_period_label
-from earnings_agents.config import MONGODB_URI
+from earnings_agents.config import MONGODB_URI, NORMALIZE_DB_NAME
 
 logger = logging.getLogger(__name__)
 
-_NORMALIZE_DB = "normalize_data"
+_NORMALIZE_DB = NORMALIZE_DB_NAME
 _client: Optional[MongoClient] = None  # type: ignore[type-arg]
 
 
@@ -69,6 +70,38 @@ def get_company_by_ticker(ticker: str) -> dict[str, Any] | None:
 
 # ── Collection routing — single source of truth ─────────────────────────────
 
+# SEC form identifiers we accept as provenance: "8-K", "6-K", "10-Q", "20-F",
+# "8-K/A", "40-F", "S-1", ...  Deliberately permissive (any short dashed
+# alphanumeric token) but strict enough to reject junk/labels.
+# Fields an older version of this writer stored but the current contract does
+# not: they must never linger on a value document.  `save_token` was the
+# per-save marker (now replaced by a concept-id-scoped stale sweep),
+# `source_lines` is evidence kept in pipeline state only, and
+# `source_form_type` is folded into `form_type` (the real filed SEC form), and
+# `extraction_status` was per-row bookkeeping nothing reads.
+_RETIRED_VALUE_FIELDS = (
+    "save_token", "source_lines", "source_form_type", "extraction_status",
+)
+
+_SEC_FORM_RX = re.compile(r"^[A-Z0-9]{1,5}(?:-[A-Z0-9]{1,3})?(?:/A)?$")
+
+
+def normalize_form_type(form_type: str | None) -> str | None:
+    """Return a normalized SEC form identifier, or None when not usable.
+
+    Accepts the real filed forms (``8-K``, ``6-K``, ``10-Q``, ``20-F``,
+    ``8-K/A``, ...) so a value records the form it actually came from.  The
+    synthetic period-family labels (``10-Q``/``10-K``) are also valid inputs,
+    which is what callers fall back to when provenance is unknown.
+    """
+    code = str(form_type or "").strip().upper()
+    # A real SEC form identifier always carries a number ("8-K", "10-Q",
+    # "20-F", "S-1"); this rejects sentinels like "MIXED"/"UNKNOWN".
+    if not code or not _SEC_FORM_RX.match(code) or not any(c.isdigit() for c in code):
+        return None
+    return code
+
+
 def _concepts_collection(period: DetectedPeriod) -> str:
     """Return the normalized-concepts collection for the agent period."""
     if period.period_type == "annual":
@@ -85,6 +118,287 @@ def _values_collection(period: DetectedPeriod) -> str:
     if period.period_type == "quarterly":
         return "concept_values_quarterly"
     raise ValueError(f"Unsupported period_type: {period.period_type!r}")
+
+
+def bootstrap_quarterly_concepts_from_annual(cik: str) -> int:
+    """Seed an empty company's quarterly concept collection from annual rows.
+
+    Company-level and all-or-nothing: when the company has ANY row in
+    ``normalized_concepts_quarterly`` the quarterly universe is already in use
+    and nothing is copied.  Only when that collection is empty for the company
+    are all annual concept rows copied — with their existing ``_id`` and
+    metadata, changing only ``form_type`` to the quarterly ``10-Q``.  No annual
+    VALUES are copied.
+
+    No bookkeeping collection is used: the quarterly concept collection itself
+    is the state.  ``$setOnInsert`` makes a retry harmless (an already-copied
+    row is never rewritten), and keeping the annual ``_id`` keeps copied
+    ``parent_concept_id`` / dimensional ``concept_id`` references valid.
+
+    Returns the number of annual concept rows included in the bulk operation
+    (zero when no bootstrap was needed or no annual rows exist).
+    """
+    db = _get_client()[_NORMALIZE_DB]
+    quarterly = db["normalized_concepts_quarterly"]
+    annual = db["normalized_concepts_annual"]
+
+    if quarterly.find_one({"cik": cik}, {"_id": 1}) is not None:
+        return 0
+
+    annual_docs = list(annual.find({"cik": cik}))
+    if not annual_docs:
+        logger.info(
+            "quarterly concept bootstrap: no annual concept rows for CIK %s", cik
+        )
+        return 0
+
+    ops: list[UpdateOne] = []
+    for source_doc in annual_docs:
+        quarterly_doc = dict(source_doc)
+        concept_id = quarterly_doc.pop("_id", None)
+        if concept_id is None:
+            # MongoDB documents normally always have _id; do not synthesize a
+            # new identity because parent/dimensional references may depend on it.
+            raise ValueError(
+                f"Annual concept row for CIK {cik} has no _id; cannot clone safely"
+            )
+        quarterly_doc["form_type"] = "10-Q"
+        ops.append(
+            UpdateOne(
+                {"_id": concept_id, "cik": cik},
+                {"$setOnInsert": quarterly_doc},
+                upsert=True,
+            )
+        )
+
+    quarterly.bulk_write(ops, ordered=False)
+
+    from earnings_agents.hooks import report_call
+    report_call(
+        f"  [db]  bootstrapped {len(ops)} quarterly concept(s) from annual "
+        f"concepts for CIK {cik}"
+    )
+    logger.info(
+        "quarterly concept bootstrap: copied %d annual concept row(s) for CIK %s",
+        len(ops), cik,
+    )
+    return len(ops)
+
+
+def _concept_order_rank(value: str) -> int:
+    """Convert a Gotham-style alpha order key (a..z, aa...) to a rank."""
+    text = str(value or "").strip().lower()
+    if not text or any(ch < "a" or ch > "z" for ch in text):
+        return 0
+    rank = 0
+    for ch in text:
+        rank = rank * 26 + (ord(ch) - ord("a") + 1)
+    return rank
+
+
+def _concept_order_key(rank: int) -> str:
+    """Convert a positive sibling rank to a stable alpha order key."""
+    rank = max(1, int(rank))
+    chars: list[str] = []
+    while rank:
+        rank, remainder = divmod(rank - 1, 26)
+        chars.append(chr(ord("a") + remainder))
+    return "".join(reversed(chars))
+
+
+def _new_concept_name(label: str, statement_type: str, parent: str | None,
+                      dimension_concept: bool, dimension_axis: str) -> str:
+    """Build a stable internal custom key; the filing label remains the display label."""
+    words = re.findall(r"[A-Za-z0-9]+", label)
+    slug = "".join(word[:1].upper() + word[1:] for word in words)
+    if not slug or not slug[0].isalpha():
+        raise ValueError(f"cannot create a stable custom concept key from label {label!r}")
+    identity = "|".join((
+        statement_type.lower(), label.casefold(), parent or "ROOT",
+        "dimension" if dimension_concept else "line_item", dimension_axis.casefold(),
+    ))
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    member_suffix = "Member" if dimension_concept else ""
+    return f"custom:{slug}{member_suffix}_{suffix}"
+
+
+def persist_new_concept_candidates(
+    cik: str,
+    period: DetectedPeriod,
+    candidates: list[dict],
+) -> tuple[dict[str, dict], list[str]]:
+    """Create/reuse validated company concepts for unmapped filing values.
+
+    Concept names are stable company-specific ``custom:`` keys generated from
+    the source label and parent identity. Parent placement is agent-selected;
+    this function only materializes the next available child/root path and
+    order key, mirroring Gotham's agent-proposed hierarchy + deterministic
+    materialization split. New concepts are never created for candidates with
+    an unresolved parent path.
+
+    Returns ``(by_metric_key, issues)``. Individual concept failures are
+    non-fatal so valid previously mapped metrics can still be saved.
+    """
+    if not candidates:
+        return {}, []
+    collection_name = _concepts_collection(period)
+    collection = _get_client()[_NORMALIZE_DB][collection_name]
+    by_metric_key: dict[str, dict] = {}
+    issues: list[str] = []
+
+    for candidate in candidates:
+        metric_key = str(candidate.get("metric_key") or "").strip()
+        label = str(candidate.get("label") or "").strip()
+        statement_type = str(candidate.get("statement_type") or "").strip().lower()
+        parent_concept = candidate.get("parent_concept")
+        parent_id_raw = candidate.get("parent_concept_id")
+        dimension_concept = bool(candidate.get("dimension_concept"))
+        dimension_axis = str(candidate.get("dimension_axis") or "").strip()
+        if not metric_key or not label or not statement_type:
+            issues.append("new concept skipped: missing metric key, label, or statement")
+            continue
+
+        try:
+            parent_id = ObjectId(str(parent_id_raw)) if parent_id_raw else None
+        except Exception:  # noqa: BLE001
+            issues.append(f"{label}: parent concept ID is invalid")
+            continue
+
+        parent_doc: dict | None = None
+        if parent_id is not None:
+            parent_doc = collection.find_one({
+                "_id": parent_id,
+                "cik": cik,
+                "statement_type": statement_type,
+            })
+            if not parent_doc or not parent_doc.get("path"):
+                issues.append(f"{label}: parent concept is not stored in the target period hierarchy")
+                continue
+        elif dimension_concept:
+            issues.append(f"{label}: dimensional concept has no parent")
+            continue
+
+        parent_name = str(parent_doc.get("concept")) if parent_doc else None
+        try:
+            concept_name = _new_concept_name(
+                label, statement_type, parent_name, dimension_concept, dimension_axis,
+            )
+        except ValueError as exc:
+            issues.append(f"{label}: {exc}")
+            continue
+
+        identity_query: dict[str, Any] = {
+            "cik": cik,
+            "statement_type": statement_type,
+            "concept": concept_name,
+            "dimension_concept": dimension_concept,
+            "parent_concept": parent_name,
+        }
+        existing = collection.find_one(identity_query)
+        if existing:
+            by_metric_key[metric_key] = {
+                "concept_id": str(existing["_id"]),
+                "concept": existing,
+                "created": False,
+            }
+            continue
+
+        # Read all rows in this company+statement so new paths are allocated
+        # against the complete stored hierarchy, not just the prompt's recent
+        # concept subset.
+        rows = list(collection.find(
+            {"cik": cik, "statement_type": statement_type},
+            {"path": 1, "order_key": 1, "parent_concept": 1,
+             "parent_concept_id": 1, "_id": 1},
+        ))
+        parent_path = str(parent_doc.get("path")) if parent_doc else None
+        if parent_path:
+            direct_prefix = parent_path + "."
+            parent_depth = len(parent_path.split("."))
+            siblings = [
+                row for row in rows
+                if isinstance(row.get("path"), str)
+                and row["path"].startswith(direct_prefix)
+                and len(row["path"].split(".")) == parent_depth + 1
+            ]
+        else:
+            siblings = [
+                row for row in rows
+                if isinstance(row.get("path"), str)
+                and len(row["path"].split(".")) == 1
+            ]
+
+        numeric_slots: list[int] = []
+        for sibling in siblings:
+            try:
+                slot = int(str(sibling["path"]).split(".")[-1])
+            except (KeyError, ValueError):
+                continue
+            if slot not in (404, 555):
+                numeric_slots.append(slot)
+        next_slot = max(numeric_slots, default=0) + 1
+        segment = f"{next_slot:03d}"
+        path = f"{parent_path}.{segment}" if parent_path else segment
+        next_order = max((_concept_order_rank(row.get("order_key")) for row in siblings), default=0) + 1
+        order_key = _concept_order_key(next_order)
+
+        identity = "|".join((cik, statement_type, concept_name, parent_name or "ROOT"))
+        concept_id = ObjectId(hashlib.sha256(identity.encode("utf-8")).digest()[:12])
+        doc: dict[str, Any] = {
+            "_id": concept_id,
+            "cik": cik,
+            "statement_type": statement_type,
+            "concept": concept_name,
+            "form_type": "10-K" if period.period_type == "annual" else "10-Q",
+            "label": label,
+            "canonical_concept": concept_name,
+            "path": path,
+            "order_key": order_key,
+            "abstract": False,
+            "hide": False,
+            "dimension": False,
+            "dimension_concept": dimension_concept,
+        }
+        if parent_doc:
+            doc.update({
+                "parent_concept": parent_name,
+                "parent_concept_id": parent_id,
+                "parent_path": parent_path,
+            })
+        if dimension_concept:
+            doc["concept_id"] = parent_id
+            doc["dimension_member"] = concept_name
+            doc["dimension_member_label"] = str(
+                candidate.get("dimension_member_label") or label
+            ).strip()
+            if dimension_axis:
+                doc["dimension_axis"] = dimension_axis
+
+        try:
+            # A deterministic ID plus $setOnInsert makes retries/concurrent
+            # reprocessing idempotent and never rewrites an existing concept.
+            insert_doc = {k: v for k, v in doc.items() if k != "_id"}
+            collection.update_one(
+                {"_id": concept_id},
+                {"$setOnInsert": insert_doc},
+                upsert=True,
+            )
+            persisted = collection.find_one({"_id": concept_id, "cik": cik})
+            if not persisted:
+                issues.append(f"{label}: concept row was not materialized")
+                continue
+            by_metric_key[metric_key] = {
+                "concept_id": str(concept_id),
+                "concept": persisted,
+                "created": True,
+            }
+            rows.append({"_id": concept_id, "path": path, "order_key": order_key})
+            siblings.append({"_id": concept_id, "path": path, "order_key": order_key})
+        except Exception as exc:  # noqa: BLE001 — one new row must not lose saved rows
+            logger.warning("new concept persistence failed for %s: %s", label, exc)
+            issues.append(f"{label}: concept persistence failed ({exc})")
+
+    return by_metric_key, issues
 
 
 # ── Concept lookup ───────────────────────────────────────────────────────────
@@ -313,6 +627,9 @@ def get_statement_concepts(
             "statement_type": 1,
             "dimension": 1,
             "dimension_concept": 1,
+            "dimension_member": 1,
+            "dimension_member_label": 1,
+            "dimension_axis": 1,
             "calculated": 1,
         },
     # path alone is not unique (sibling rows can share a path, disambiguated
@@ -337,7 +654,8 @@ def get_statement_concepts(
                 cik, concept, raw_label,
             )
             continue
-        member_tag = _extract_member_tag(raw_label)
+        member_tag = d.get("dimension_member") or _extract_member_tag(raw_label)
+        member = d.get("dimension_member_label") or member
         path = d.get("path", "") or ""
         if _is_polluted_path(path):
             logger.info(
@@ -351,7 +669,10 @@ def get_statement_concepts(
         key = (st, head.lower())
         base_counts[key] = base_counts.get(key, 0) + 1
         label_groups.setdefault(key, []).append(path)
-        tkey = (f"{concept}|{member_tag}" if member_tag else concept).lower()
+        tkey = (
+            f"{concept}|{member_tag}"
+            if member_tag and member_tag != concept else concept
+        ).lower()
         base_key_counts[(st, tkey)] = base_key_counts.get((st, tkey), 0) + 1
         stmt_types_per_key.setdefault(tkey, set()).add(st)
         # The first sorted row at a path is used only as the fallback parent
@@ -389,7 +710,10 @@ def get_statement_concepts(
         # Taxonomy key must be unique per row or the LLM's JSON keys collide
         # (e.g. us-gaap:ServiceMember under both Revenue and Cost of Revenue,
         # or us-gaap:NetIncomeLoss across income and cashflow).
-        taxonomy_key = f"{concept}|{member_tag}" if member_tag else concept
+        taxonomy_key = (
+            f"{concept}|{member_tag}"
+            if member_tag and member_tag != concept else concept
+        )
         tkey = taxonomy_key.lower()
         has_cross_stmt = len(stmt_types_per_key.get(tkey, set())) > 1
         has_intra_stmt = base_key_counts.get((st, tkey), 0) > 1
@@ -426,7 +750,7 @@ def get_statement_concepts(
                 "calculated": bool(d.get("calculated")),
                 "dimension_member": member_tag or "",
                 "dimension_member_label": member or "",
-                "dimension_axis": member_tag or "",
+                "dimension_axis": d.get("dimension_axis") or member_tag or "",
             }
         )
     return out
@@ -671,6 +995,7 @@ def upsert_concept_values(
     derived_concept_ids: set[str] | None = None,
     value_metadata_by_id: dict[str, dict] | None = None,
     accession_number: str | None = None,
+    source_form_type: str | None = None,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
@@ -686,8 +1011,7 @@ def upsert_concept_values(
     re-runs of the same earnings release.
 
     **Atomicity**: the period is replaced write-first, clean-stale-after.
-    All values are upserted (with a unique per-save ``save_token``) BEFORE any
-    stale document is deleted, so a failed/interrupted write never leaves the
+    All values are upserted BEFORE any stale document is deleted, so a failed/interrupted write never leaves the
     period empty or partially overwritten — the previous run's documents stay
     in place until the new ones are fully written, and the stale sweep only
     removes documents that do not carry the current save token.
@@ -702,7 +1026,13 @@ def upsert_concept_values(
     # only persists the canonical result; it never parses or infers a period.
     period_type = period.period_type
     collection_name = _values_collection(period)
-    form_type = "10-K" if period_type == "annual" else "10-Q"
+    # The SOURCE SEC form actually filed (6-K / 8-K / 10-Q / 20-F ...) is the
+    # real provenance of a value.  The period-family label (10-Q/10-K) is only
+    # a fallback for when the source form could not be determined — it must not
+    # be stored as if it were the filed form.
+    form_type = normalize_form_type(source_form_type) or (
+        "10-K" if period_type == "annual" else "10-Q"
+    )
     fiscal_year = period.fiscal_year
     quarter = period.quarter
     end_date = period.period_end
@@ -713,13 +1043,13 @@ def upsert_concept_values(
                             tzinfo=timezone.utc)
     period_date_str = end_date.strftime("%Y-%m-%d")
     now = datetime.now(tz=timezone.utc)
-    # Unique per-save token: every document written by this call carries it, so
-    # the post-write stale sweep can identify exactly what belongs to this save.
-    save_token = f"{uuid4().hex}-{int(now.timestamp())}"
-
 
     db = _get_client()[_NORMALIZE_DB]
     collection = db[collection_name]
+    # Concept ids upserted by THIS call.  The post-write stale sweep deletes
+    # only docs whose concept_id is not in here, which gives the same
+    # write-first atomic replace as a per-save marker field without storing one.
+    written_ids: list[ObjectId] = []
 
     ops: list[UpdateOne] = []
     for concept_id_str, value in concept_metrics.items():
@@ -732,6 +1062,16 @@ def upsert_concept_values(
             continue
 
         meta: dict[str, Any] = (value_metadata_by_id or {}).get(concept_id_str) or {}
+        # No FX conversion exists anywhere in this pipeline, and USD is never
+        # assumed: a value whose currency cannot be confirmed is not written.
+        value_currency = str(meta.get("currency") or "").strip().upper()
+        if not is_currency_code(value_currency):
+            logger.warning(
+                "upsert_concept_values: skipping concept %s — currency %r is "
+                "not a confirmed ISO code",
+                concept_id_str, meta.get("currency"),
+            )
+            continue
         dimension_value = bool(meta.get("dimension") or meta.get("dimension_concept"))
 
         period_doc: dict[str, Any] = {
@@ -759,8 +1099,7 @@ def upsert_concept_values(
             "created_at": now,
             "dimension_value": dimension_value,
             "calculated": bool(meta.get("calculated")) or concept_id_str in (derived_concept_ids or set()),
-            "currency": meta.get("currency") or "USD",
-            "save_token": save_token,
+            "currency": value_currency,
         }
         if dimension_value:
             if meta.get("dimension_member"):
@@ -775,8 +1114,10 @@ def upsert_concept_values(
             doc["original_scale"] = meta.get("original_scale")
         if meta.get("source_exhibit"):
             doc["source_exhibit"] = meta["source_exhibit"]
-        if meta.get("status"):
-            doc["extraction_status"] = meta["status"]
+        if meta.get("scale"):
+            doc["scale"] = str(meta["scale"]).strip().lower()
+        if meta.get("source_snippet"):
+            doc["source_snippet"] = str(meta["source_snippet"])[:500]
         if accession_number:
             doc["accession_number"] = accession_number
         filter_doc: dict[str, Any] = {
@@ -786,6 +1127,7 @@ def upsert_concept_values(
         }
         if period_type == "quarterly":
             filter_doc["reporting_period.quarter"] = quarter
+        written_ids.append(concept_oid)
         # This filter is EXACTLY the collection's unique index key
         # (cik, concept_id, fiscal_year, quarter).  ``concept_id`` is the
         # concept row's unique ObjectId, so ``dimension_member`` /
@@ -796,10 +1138,16 @@ def upsert_concept_values(
         # written as ``""`` into the filter), producing E11000 duplicate-key
         # collisions on re-runs of the same period.
 
+        # `$set` never removes fields, so explicitly drop retired fields from
+        # the document shape instead of leaving them behind on a row that
+        # already exists.  Keeps the written contract exact on every run.
         ops.append(
             UpdateOne(
                 filter_doc,
-                {"$set": doc},
+                {
+                    "$set": doc,
+                    "$unset": {field: "" for field in _RETIRED_VALUE_FIELDS},
+                },
                 upsert=True,
             )
         )
@@ -820,7 +1168,8 @@ def upsert_concept_values(
     _stale_filt: dict[str, Any] = {
         "cik": cik,
         "reporting_period.fiscal_year": fiscal_year,
-        "save_token": {"$ne": save_token},
+        # Everything this save did NOT touch for this period is stale.
+        "concept_id": {"$nin": written_ids},
     }
     if target_statements:
         _stale_filt["statement_type"] = {"$in": list(target_statements)}
