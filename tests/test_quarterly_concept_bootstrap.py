@@ -17,6 +17,7 @@ class _Collection:
         self.docs = list(docs or [])
         self.find_queries = []
         self.bulk_calls = 0
+        self.insert_many_calls = 0
 
     def find_one(self, query, projection=None):  # noqa: ARG002
         return next((doc for doc in self.docs if self._matches(doc, query)), None)
@@ -25,6 +26,16 @@ class _Collection:
         self.find_queries.append(query)
         return [doc for doc in self.docs if self._matches(doc, query)]
 
+    def insert_many(self, documents, ordered=False):  # noqa: ARG002
+        """Mimic PyMongo: mint a fresh unique _id for every document."""
+        self.insert_many_calls += 1
+        inserted_ids = []
+        for doc in documents:
+            doc["_id"] = ObjectId()
+            self.docs.append(doc)
+            inserted_ids.append(doc["_id"])
+        return type("R", (), {"inserted_ids": inserted_ids})()
+
     def bulk_write(self, ops, ordered=False):  # noqa: ARG002
         self.bulk_calls += 1
         for op in ops:
@@ -32,6 +43,8 @@ class _Collection:
             existing = next((doc for doc in self.docs if self._matches(doc, filt)), None)
             if existing is None and op._upsert:
                 self.docs.append({**filt, **op._doc.get("$setOnInsert", {})})
+            elif existing is not None:
+                existing.update(op._doc.get("$set", {}))
 
     @staticmethod
     def _matches(doc, query):
@@ -124,7 +137,7 @@ class TestQuarterlyConceptBootstrap(unittest.TestCase):
         ):
             return bootstrap_quarterly_concepts_from_annual(cik)
 
-    def test_empty_quarterly_collection_copies_all_annual_rows_and_only_changes_form_type(self):
+    def test_empty_quarterly_collection_copies_all_annual_rows_with_fresh_ids(self):
         cik = "000123"
         annual_docs = _annual_rows(cik)
         annual = _Collection(annual_docs)
@@ -136,16 +149,57 @@ class TestQuarterlyConceptBootstrap(unittest.TestCase):
         }, cik)
 
         self.assertEqual(copied, len(annual_docs))
-        self.assertEqual(quarterly.bulk_calls, 1)
         self.assertEqual(len(quarterly.docs), len(annual_docs))
-        by_id = {doc["_id"]: doc for doc in quarterly.docs}
-        for annual_doc in annual_docs:
-            quarterly_doc = by_id[annual_doc["_id"]]
-            expected = {**annual_doc, "form_type": "10-Q"}
-            self.assertEqual(quarterly_doc, expected)
-        # References stay valid because IDs are preserved in the same collection copy.
-        child = next(d for d in quarterly.docs if d["concept"] == "us-gaap:CostOfRevenue")
-        self.assertIn(child["parent_concept_id"], by_id)
+
+        annual_ids = {doc["_id"] for doc in annual_docs}
+        quarterly_ids = {doc["_id"] for doc in quarterly.docs}
+        # MongoDB mints the quarterly identities: no id is ever shared between
+        # the two collections, and every quarterly id is unique.
+        self.assertTrue(quarterly_ids.isdisjoint(annual_ids))
+        self.assertEqual(len(quarterly_ids), len(quarterly.docs))
+
+        # Only form_type changes; all other metadata is carried over verbatim.
+        for quarterly_doc in quarterly.docs:
+            self.assertEqual(quarterly_doc["form_type"], "10-Q")
+        annual_by_id = {doc["_id"]: doc for doc in annual_docs}
+        quarterly_by_old_id = {
+            source_id: doc
+            for source_id, doc in zip(
+                [doc["_id"] for doc in annual_docs], quarterly.docs
+            )
+        }
+        for source_id, source_doc in annual_by_id.items():
+            clone = quarterly_by_old_id[source_id]
+            expected = {**source_doc, "form_type": "10-Q"}
+            expected.pop("_id")
+            clone_without_id = {k: v for k, v in clone.items() if k != "_id"}
+            # References are remapped in place, so drop them from the verbatim check.
+            for ref_field in ("parent_concept_id", "concept_id"):
+                clone_without_id.pop(ref_field, None)
+                expected.pop(ref_field, None)
+            self.assertEqual(clone_without_id, expected)
+
+    def test_internal_references_point_at_the_quarterly_copies(self):
+        cik = "000123"
+        annual_docs = _annual_rows(cik)
+        quarterly = _Collection()
+
+        self._run({
+            "normalized_concepts_annual": _Collection(annual_docs),
+            "normalized_concepts_quarterly": quarterly,
+        }, cik)
+
+        annual_parent_id = annual_docs[0]["_id"]
+        by_concept = {doc["concept"]: doc for doc in quarterly.docs}
+        quarterly_parent_id = by_concept["us-gaap:Revenues"]["_id"]
+
+        child = by_concept["us-gaap:CostOfRevenue"]
+        self.assertEqual(child["parent_concept_id"], quarterly_parent_id)
+        self.assertNotEqual(child["parent_concept_id"], annual_parent_id)
+
+        dimensional = by_concept["asml:NXEMember"]
+        self.assertEqual(dimensional["concept_id"], quarterly_parent_id)
+        self.assertNotEqual(dimensional["concept_id"], annual_parent_id)
 
     def test_any_existing_quarterly_concept_prevents_company_bootstrap(self):
         cik = "000123"
@@ -180,14 +234,13 @@ class TestQuarterlyConceptBootstrap(unittest.TestCase):
         copied = self._run(collections, cik)
         self.assertEqual(copied, len(annual_docs))
 
-        # Second run sees quarterly rows → skips entirely (no bulk write).
+        # Second run sees quarterly rows → skips entirely (no insert).
         quarterly = collections["normalized_concepts_quarterly"]
         copied_again = self._run(collections, cik)
         self.assertEqual(copied_again, 0)
-        self.assertEqual(quarterly.bulk_calls, 1)
+        self.assertEqual(quarterly.insert_many_calls, 1)
 
-    def test_duplicate_ids_are_never_overwritten(self):
-        """$setOnInsert means a re-copy never rewrites an existing row."""
+    def test_rerun_never_duplicates_rows(self):
         cik = "000123"
         annual_docs = _annual_rows(cik)
         quarterly = _Collection()
@@ -196,12 +249,12 @@ class TestQuarterlyConceptBootstrap(unittest.TestCase):
             "normalized_concepts_quarterly": quarterly,
         }
         self._run(collections, cik)
-        # Simulate a later quarterly edit, then force a re-copy by clearing the
-        # company's rows except one (which suppresses the bootstrap anyway).
-        first = dict(quarterly.docs[0])
-        quarterly.docs = quarterly.docs[:1]
+        total = len(quarterly.docs)
+        self.assertEqual(total, len(annual_docs))
+        # A forced second run is short-circuited by the company-level guard, so
+        # no document is copied twice.
         self.assertEqual(self._run(collections, cik), 0)
-        self.assertEqual(quarterly.docs[0], first)
+        self.assertEqual(len(quarterly.docs), total)
 
     def test_no_annual_rows_leaves_quarterly_untouched(self):
         quarterly = _Collection()

@@ -66,8 +66,16 @@ class _GuardedCollection:
     def update_one(self, query, update, upsert=False):  # noqa: ARG002
         return type("R", (), {"upserted_id": None, "modified_count": 0})()
 
+    def insert_many(self, documents, ordered=False):  # noqa: ARG002
+        inserted_ids = []
+        for doc in documents:
+            doc["_id"] = ObjectId()
+            self.docs.append(doc)
+            inserted_ids.append(doc["_id"])
+        return type("R", (), {"inserted_ids": inserted_ids})()
+
     def bulk_write(self, ops, ordered=False):  # noqa: ARG002
-        return type("R", (), {"upserted_count": len(ops)})()
+        return type("R", (), {"upserted_count": len(ops), "inserted_ids": []})()
 
     def delete_many(self, filt):  # noqa: ARG002
         return type("R", (), {"deleted_count": 0})()

@@ -126,17 +126,22 @@ def bootstrap_quarterly_concepts_from_annual(cik: str) -> int:
     Company-level and all-or-nothing: when the company has ANY row in
     ``normalized_concepts_quarterly`` the quarterly universe is already in use
     and nothing is copied.  Only when that collection is empty for the company
-    are all annual concept rows copied — with their existing ``_id`` and
-    metadata, changing only ``form_type`` to the quarterly ``10-Q``.  No annual
-    VALUES are copied.
+    are all annual concept rows cloned — WITHOUT their annual ``_id``, so
+    MongoDB assigns a fresh, unique ``_id`` in the quarterly collection.  The
+    two hierarchies must never share document identities.  Only ``form_type``
+    is changed (to the quarterly ``10-Q``).  No annual VALUES are copied.
+
+    Intra-hierarchy references (``parent_concept_id`` and the dimensional
+    ``concept_id``) are re-pointed at the NEW quarterly rows so a copied child
+    never links back into ``normalized_concepts_annual``.  A reference that did
+    not resolve to a copied annual row is left as-is.
 
     No bookkeeping collection is used: the quarterly concept collection itself
-    is the state.  ``$setOnInsert`` makes a retry harmless (an already-copied
-    row is never rewritten), and keeping the annual ``_id`` keeps copied
-    ``parent_concept_id`` / dimensional ``concept_id`` references valid.
+    is the state.  The company-level emptiness check makes a retry a no-op, so
+    an already-bootstrapped company is never copied twice.
 
-    Returns the number of annual concept rows included in the bulk operation
-    (zero when no bootstrap was needed or no annual rows exist).
+    Returns the number of annual concept rows copied (zero when no bootstrap
+    was needed or no annual rows exist).
     """
     db = _get_client()[_NORMALIZE_DB]
     quarterly = db["normalized_concepts_quarterly"]
@@ -152,37 +157,52 @@ def bootstrap_quarterly_concepts_from_annual(cik: str) -> int:
         )
         return 0
 
-    ops: list[UpdateOne] = []
+    # Clone every annual row WITHOUT its `_id`: MongoDB assigns a new unique
+    # quarterly `_id`, so annual and quarterly never share document ids.
+    source_ids: list[Any] = []
+    docs_to_insert: list[dict[str, Any]] = []
     for source_doc in annual_docs:
         quarterly_doc = dict(source_doc)
-        concept_id = quarterly_doc.pop("_id", None)
-        if concept_id is None:
-            # MongoDB documents normally always have _id; do not synthesize a
-            # new identity because parent/dimensional references may depend on it.
+        source_id = quarterly_doc.pop("_id", None)
+        if source_id is None:
             raise ValueError(
                 f"Annual concept row for CIK {cik} has no _id; cannot clone safely"
             )
         quarterly_doc["form_type"] = "10-Q"
-        ops.append(
-            UpdateOne(
-                {"_id": concept_id, "cik": cik},
-                {"$setOnInsert": quarterly_doc},
-                upsert=True,
-            )
-        )
+        source_ids.append(source_id)
+        docs_to_insert.append(quarterly_doc)
 
-    quarterly.bulk_write(ops, ordered=False)
+    insert_result = quarterly.insert_many(docs_to_insert, ordered=False)
+    new_ids = list(insert_result.inserted_ids)
+
+    # Re-link intra-hierarchy references to the NEW quarterly identities so a
+    # copied child/parent/dimensional link never points back at annual rows.
+    annual_to_quarterly_id = dict(zip(source_ids, new_ids))
+    ref_updates: list[UpdateOne] = []
+    for new_id, quarterly_doc in zip(new_ids, docs_to_insert):
+        set_fields: dict[str, Any] = {}
+        for ref_field in ("parent_concept_id", "concept_id"):
+            referenced = quarterly_doc.get(ref_field)
+            if referenced is None:
+                continue
+            remapped = annual_to_quarterly_id.get(referenced)
+            if remapped is not None:
+                set_fields[ref_field] = remapped
+        if set_fields:
+            ref_updates.append(UpdateOne({"_id": new_id}, {"$set": set_fields}))
+    if ref_updates:
+        quarterly.bulk_write(ref_updates, ordered=False)
 
     from earnings_agents.hooks import report_call
     report_call(
-        f"  [db]  bootstrapped {len(ops)} quarterly concept(s) from annual "
+        f"  [db]  bootstrapped {len(new_ids)} quarterly concept(s) from annual "
         f"concepts for CIK {cik}"
     )
     logger.info(
         "quarterly concept bootstrap: copied %d annual concept row(s) for CIK %s",
-        len(ops), cik,
+        len(new_ids), cik,
     )
-    return len(ops)
+    return len(new_ids)
 
 
 def _concept_order_rank(value: str) -> int:
