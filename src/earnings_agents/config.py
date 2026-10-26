@@ -56,7 +56,7 @@ REDIS_QUEUE_NAME: str = os.getenv("REDIS_QUEUE_NAME", "sec:filings")
 # Seconds before HTTP requests time out
 HTTP_TIMEOUT: int = 30
 
-EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "400000"))
+EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "3000000"))
 
 # Target financial statements to extract (comma-separated, e.g. "income,balancesheet,cashflow").
 # Defaults to extracting income statement, balance sheet, and cash flow statement.
@@ -82,8 +82,8 @@ DEACCUMULATE_YTD_CASHFLOW: bool = os.getenv(
 # release, presentation, supplemental information); the income statement often
 # lives in a supplemental exhibit (e.g. BofA's 99.3).  fetch_filing concatenates
 # all text exhibits; these caps bound per-exhibit and total size.
-FETCH_EXHIBIT_MAX_CHARS: int = int(os.getenv("FETCH_EXHIBIT_MAX_CHARS", "400000"))
-FETCH_TOTAL_MAX_CHARS: int = int(os.getenv("FETCH_TOTAL_MAX_CHARS", "1200000"))
+FETCH_EXHIBIT_MAX_CHARS: int = int(os.getenv("FETCH_EXHIBIT_MAX_CHARS", "3000000"))
+FETCH_TOTAL_MAX_CHARS: int = int(os.getenv("FETCH_TOTAL_MAX_CHARS", "4000000"))
 
 # When True (default), refuse to upsert a document that has unresolved
 # high-severity findings. When False, the document is saved regardless.

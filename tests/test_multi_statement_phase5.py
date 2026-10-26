@@ -298,6 +298,115 @@ Note 1. Basis of Presentation...
         self.assertIn("STATEMENTS OF CASH FLOWS", fs_full)
         self.assertNotIn("Note 1. Basis of Presentation", fs_full)
 
+    def test_skips_toc_index_and_prospectus_summary_for_full_f_pages(self):
+        from earnings_agents.agent.derive import extract_financial_statements_section, extract_is_section
+
+        large_filing = """
+INDEX TO CONSOLIDATED FINANCIAL STATEMENTS
+Report of Independent Registered Public Accounting Firm F-2
+Consolidated Balance Sheets F-3
+Consolidated Statements of Operations F-4
+Consolidated Statements of Cash Flows F-5
+Notes to Consolidated Financial Statements F-6
+
+PROSPECTUS SUMMARY
+Summary Consolidated Statements of Operations Data
+Revenue $ 100
+Net loss $ (10)
+
+MANAGEMENT'S DISCUSSION AND ANALYSIS
+Our Consolidated Statements of Operations are presented in millions and reflect strong growth.
+
+REPORT OF INDEPENDENT REGISTERED PUBLIC ACCOUNTING FIRM
+Opinion on the Financial Statements...
+
+CONSOLIDATED BALANCE SHEETS
+Cash and cash equivalents $ 50,000
+Total assets $ 250,000
+Total liabilities $ 100,000
+Total stockholders' equity $ 150,000
+
+CONSOLIDATED STATEMENTS OF OPERATIONS
+Revenue $ 100,000
+Cost of revenue $ 40,000
+Gross profit $ 60,000
+Net loss $ (10,000)
+
+CONSOLIDATED STATEMENTS OF CASH FLOWS
+Net cash provided by operating activities $ 30,000
+
+NOTES TO CONSOLIDATED FINANCIAL STATEMENTS
+Note 1. Organization and Description of Business
+        """
+        fs_full = extract_financial_statements_section(large_filing)
+        self.assertIsNotNone(fs_full)
+        self.assertIn("Total assets $ 250,000", fs_full)
+        self.assertIn("Revenue $ 100,000", fs_full)
+        self.assertIn("Net cash provided by operating activities $ 30,000", fs_full)
+        self.assertNotIn("PROSPECTUS SUMMARY", fs_full)
+        self.assertNotIn("Note 1. Organization", fs_full)
+
+        is_only = extract_is_section(large_filing)
+        self.assertIsNotNone(is_only)
+        self.assertIn("Revenue $ 100,000", is_only)
+        self.assertNotIn("PROSPECTUS SUMMARY", is_only)
+
+
+class TestLargePdfFetchAndHybridExtraction(unittest.TestCase):
+    def test_large_pdf_over_400k_chars_not_truncated(self):
+        from tempfile import NamedTemporaryFile
+        from unittest.mock import patch
+        from earnings_agents.nodes.fetch import fetch_filing_node
+
+        # Simulate a 318-page PDF yielding ~1.2M characters of plain text
+        large_pdf_text = ("───── PDF page 1 of 318 ─────\nRevenue $1,000\n" * 30_000)
+        self.assertGreater(len(large_pdf_text), 1_000_000)
+
+        with NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(b"%PDF-1.7 fake pdf bytes")
+            tmp.flush()
+            state = {
+                "ticker": "ANTP",
+                "discovered_file_url": f"file://{tmp.name}",
+                "local_filing_path": tmp.name,
+            }
+            with patch("earnings_agents.nodes.fetch._pdf_to_plain_text", return_value=large_pdf_text):
+                out = fetch_filing_node(state)
+
+        self.assertEqual(out["status"], "fetched")
+        self.assertEqual(out["file_type"], "pdf")
+        doc_map = out["document_map"]
+        self.assertEqual(len(doc_map), 1)
+        self.assertFalse(doc_map[0]["truncated"])
+
+    def test_page_needs_layout_extraction_heuristics(self):
+        from earnings_agents.nodes.fetch import _page_needs_layout_extraction
+
+        # First 5 pages always use layout extraction
+        self.assertTrue(_page_needs_layout_extraction("Pure prose cover page", 1))
+        self.assertTrue(_page_needs_layout_extraction("Pure prose page", 5))
+        # Pure narrative prose page after page 5 skips heavy layout extraction
+        self.assertFalse(
+            _page_needs_layout_extraction(
+                "Risk Factors: We operate in a highly competitive industry and may face legal challenges.",
+                50,
+            )
+        )
+        # Financial statement keyword triggers layout extraction
+        self.assertTrue(
+            _page_needs_layout_extraction(
+                "CONSOLIDATED STATEMENTS OF OPERATIONS (Unaudited)",
+                180,
+            )
+        )
+        # Numeric table density triggers layout extraction
+        self.assertTrue(
+            _page_needs_layout_extraction(
+                "North America $1,200 $950 26.3%\nEurope $800 $600 33.3%\nTotal $2,000 $1,550",
+                120,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

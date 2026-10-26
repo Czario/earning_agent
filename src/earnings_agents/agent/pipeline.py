@@ -276,6 +276,7 @@ def _run_extraction_pass(
                 le = doc.get("line_end")
                 if ls and le:
                     exhibit_full = "\n".join(lines[ls - 1 : le])
+                    _MAX_FULL_EXHIBIT_INJECT_CHARS = 60_000
                     if is_multi_statement:
                         fs_section = extract_financial_statements_section(exhibit_full)
                         if fs_section:
@@ -284,11 +285,16 @@ def _run_extraction_pass(
                                 f"  [prescan]  financial statements section extracted — {len(fs_section):,} chars "
                                 f"(from {len(exhibit_full):,} exhibit)"
                             )
-                        else:
+                        elif len(exhibit_full) <= _MAX_FULL_EXHIBIT_INJECT_CHARS:
                             is_exhibit_text = exhibit_full
                             report_call(
                                 f"  [prescan]  financial statements section not isolated — using full exhibit "
                                 f"({len(exhibit_full):,} chars)"
+                            )
+                        else:
+                            report_call(
+                                f"  [prescan]  financial statements section not isolated in large exhibit "
+                                f"({len(exhibit_full):,} chars) — agent will navigate via tools"
                             )
                     else:
                         is_section = extract_is_section(exhibit_full)
@@ -298,11 +304,16 @@ def _run_extraction_pass(
                                 f"  [prescan]  IS section extracted — {len(is_section):,} chars "
                                 f"(from {len(exhibit_full):,} exhibit)"
                             )
-                        else:
+                        elif len(exhibit_full) <= _MAX_FULL_EXHIBIT_INJECT_CHARS:
                             is_exhibit_text = exhibit_full
                             report_call(
                                 f"  [prescan]  IS section not found — using full exhibit "
                                 f"({len(exhibit_full):,} chars)"
+                            )
+                        else:
+                            report_call(
+                                f"  [prescan]  IS section not found in large exhibit "
+                                f"({len(exhibit_full):,} chars) — agent will navigate via tools"
                             )
                     is_exhibit_label = exhibit
                     break

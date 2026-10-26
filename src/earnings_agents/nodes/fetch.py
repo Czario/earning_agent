@@ -80,8 +80,59 @@ def _html_to_plain_text(html: str) -> str:
     return text.strip()
 
 
+# Large PDFs (e.g. 100-350 page prospectuses, S-1s, 10-Ks, 20-Fs) spend 80%+
+# of their pages on narrative prose (Risk Factors, Business, Governance).
+# Above this page threshold, we pre-screen pages in C via pypdfium2 (<1ms/page)
+# and run pdfplumber's full horizontal layout parser on header/table/financial
+# pages while keeping fast text on pure narrative prose pages.
+_LARGE_PDF_PAGE_THRESHOLD = 40
+
+_PDF_LAYOUT_KEYWORDS_RX = re.compile(
+    r"statements?\s+of\s+operations"
+    r"|income\s+statements?"
+    r"|statements?\s+of\s+earnings"
+    r"|statements?\s+of\s+income"
+    r"|balance\s+sheets?"
+    r"|financial\s+position"
+    r"|cash\s+flows?"
+    r"|comprehensive\s+(?:income|loss)"
+    r"|(?:stockholders|shareholders)['’]?\s+equity"
+    r"|in\s+(?:thousands|millions|billions)"
+    r"|(?:three|six|nine|twelve)\s+months\s+ended"
+    r"|(?:quarter|year)\s+ended"
+    r"|disaggregat"
+    r"|segment"
+    r"|guidance|outlook"
+    r"|revenue\s+by",
+    re.I,
+)
+
+# Formatted numeric tokens common in financial/summary tables:
+# comma-grouped numbers (1,234), decimals (12.3), currency ($100),
+# parenthesized negatives ((1,234) or (45)), or percentages (12%).
+_PDF_TABLE_NUMBER_RX = re.compile(
+    r"(?:[\$€£¥]\s*\d[\d,.]*|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d+\.\d+\b|\(\s*\d[\d,.]*\s*\)|\b\d+(?:\.\d+)?%)"
+)
+
+
+def _page_needs_layout_extraction(fast_text: str, page_no: int) -> bool:
+    """Return True when a PDF page should use pdfplumber's horizontal layout
+    extractor rather than raw stream text.
+    """
+    if page_no <= 5:
+        return True
+    if not fast_text:
+        return False
+    if _PDF_LAYOUT_KEYWORDS_RX.search(fast_text):
+        return True
+    if len(_PDF_TABLE_NUMBER_RX.findall(fast_text)) >= 6:
+        return True
+    return False
+
+
 def _pdf_to_plain_text(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes using pdfplumber.
+    """Extract text from PDF bytes using pdfplumber (with a pypdfium2 fast-path
+    for pure prose pages in large multi-hundred-page filings).
 
     Each page is prefixed with a ``PDF page n of m`` separator so the agents
     can locate content by page and multi-page letters navigate exactly like
@@ -95,9 +146,46 @@ def _pdf_to_plain_text(pdf_bytes: bytes) -> str:
     parts: list[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         n_pages = len(pdf.pages)
-        for i, page in enumerate(pdf.pages, 1):
-            page_text = page.extract_text() or ""
-            parts.append(f"\n───── PDF page {i} of {n_pages} ─────\n{page_text}")
+        pdfium_doc = None
+        if n_pages > _LARGE_PDF_PAGE_THRESHOLD:
+            try:
+                import pypdfium2 as pdfium
+                pdfium_doc = pdfium.PdfDocument(pdf_bytes)
+                if len(pdfium_doc) != n_pages:
+                    pdfium_doc.close()
+                    pdfium_doc = None
+            except Exception:
+                pdfium_doc = None
+
+        try:
+            for i, page in enumerate(pdf.pages, 1):
+                page_text: str | None = None
+                if pdfium_doc is not None:
+                    try:
+                        pdfium_page = pdfium_doc[i - 1]
+                        textpage = pdfium_page.get_textpage()
+                        fast_text = textpage.get_text_range() or ""
+                        textpage.close()
+                        pdfium_page.close()
+                        if not _page_needs_layout_extraction(fast_text, i):
+                            page_text = fast_text.replace("\r\n", "\n").replace("\r", "\n")
+                    except Exception:
+                        page_text = None
+
+                if page_text is None:
+                    page_text = page.extract_text() or ""
+                    flush = getattr(page, "flush_cache", None)
+                    if callable(flush):
+                        flush()
+
+                parts.append(f"\n───── PDF page {i} of {n_pages} ─────\n{page_text}")
+        finally:
+            if pdfium_doc is not None:
+                try:
+                    pdfium_doc.close()
+                except Exception:
+                    pass
+
     # Collapse runs of spaces/tabs on each line (same as the HTML path).
     text = re.sub(r"[^\S\n]+", " ", "\n".join(parts))
     return text.strip()

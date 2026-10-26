@@ -273,6 +273,114 @@ _IS_STOP_PATTERNS = [
 ]
 
 
+_TOC_TRAILING_PAGE_RX = re.compile(
+    r"(?:\.{2,}\s*[A-Za-z]?-?\d+|\b[FS]-\d+|\s+\d{1,3})\s*$",
+    re.I,
+)
+_SUMMARY_HEADER_RX = re.compile(
+    r"\b(?:summary|selected|index|table\s+of\s+contents)\b|\bstatements?\s+of\s+\w+\s+data\b",
+    re.I,
+)
+_FIN_NUMBER_LINE_RX = re.compile(
+    r"(?:[\$€£¥]\s*\d|\b\d{1,3}(?:,\d{3})+\b|\(\s*\d{1,3}(?:,\d{3})+\s*\))"
+)
+
+
+def _is_valid_section_header_line(stripped: str) -> bool:
+    """Return True if *stripped* looks like an actual section/table heading
+    rather than a long prose sentence or a Table-of-Contents entry with a
+    trailing page number (e.g. ``Consolidated Balance Sheets ... F-3``).
+    """
+    if not stripped or len(stripped) > 120:
+        return False
+    if _TOC_TRAILING_PAGE_RX.search(stripped):
+        return False
+    return True
+
+
+def _count_financial_number_lines(block_lines: list[str]) -> int:
+    """Count lines in *block_lines* that contain formatted financial numbers."""
+    return sum(1 for ln in block_lines if _FIN_NUMBER_LINE_RX.search(ln))
+
+
+def _find_best_statement_section(
+    lines: list[str],
+    start_patterns: list[re.Pattern],
+    stop_patterns: list[re.Pattern],
+    default_window_lines: int | None = None,
+) -> tuple[int, int] | None:
+    """Locate the best ``(start_line_idx, stop_line_idx)`` for a statement section.
+
+    In large filings (prospectuses, S-1s, 10-Ks), statement titles often appear
+    first in an Index to Financial Statements (with no numbers) or a Prospectus
+    Summary table ("Summary Consolidated Statements of Operations Data") before
+    the actual full financial statements later in the filing.  This scanner
+    skips TOC/index entries and prefers the first full (non-summary) statement
+    section containing numeric rows, falling back to summary/first matches when
+    that is all the document contains.
+    """
+    first_any: tuple[int, int] | None = None
+    first_with_numbers: tuple[int, int] | None = None
+    idx = 0
+    n_lines = len(lines)
+
+    while idx < n_lines:
+        start_idx: int | None = None
+        start_line_str = ""
+        for i in range(idx, n_lines):
+            stripped = lines[i].strip()
+            if not _is_valid_section_header_line(stripped):
+                continue
+            if any(p.search(stripped) for p in start_patterns):
+                start_idx = i
+                start_line_str = stripped
+                break
+
+        if start_idx is None:
+            break
+
+        stop_idx: int | None = None
+        for j in range(start_idx + 1, n_lines):
+            stripped = lines[j].strip()
+            if not _is_valid_section_header_line(stripped):
+                continue
+            if any(p.search(stripped) for p in stop_patterns):
+                stop_idx = j
+                break
+
+        if stop_idx is None:
+            stop_idx = (
+                min(start_idx + default_window_lines, n_lines)
+                if default_window_lines is not None
+                else n_lines
+            )
+
+        candidate = (start_idx, stop_idx)
+        if first_any is None:
+            first_any = candidate
+
+        # Check a bounded window after start_idx for formatted financial numbers
+        # so an Index block (0 numbers) is distinguished from a real table.
+        probe_end = min(stop_idx, start_idx + 120)
+        num_lines = _count_financial_number_lines(lines[start_idx + 1 : probe_end])
+        is_summary = bool(_SUMMARY_HEADER_RX.search(start_line_str))
+
+        if num_lines >= 2:
+            if not is_summary:
+                return candidate
+            if first_with_numbers is None:
+                first_with_numbers = candidate
+
+        # Advance past this header (or past a tiny empty index block) to look
+        # for the primary non-summary financial statements later in the filing.
+        if num_lines < 2 and (stop_idx - start_idx) <= 25:
+            idx = stop_idx + 1
+        else:
+            idx = start_idx + 1
+
+    return first_with_numbers or first_any
+
+
 def extract_is_section(exhibit_text: str, max_chars: int = 15_000) -> str | None:
     """Extract just the income-statement section from exhibit text.
 
@@ -285,40 +393,13 @@ def extract_is_section(exhibit_text: str, max_chars: int = 15_000) -> str | None
     the full exhibit text).
     """
     lines = exhibit_text.split("\n")
-    is_start: int | None = None
-    is_stop: int | None = None
+    bounds = _find_best_statement_section(
+        lines, _IS_START_PATTERNS, _IS_STOP_PATTERNS, default_window_lines=300
+    )
+    if bounds is None:
+        return None
 
-    # Find the IS header
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        for pattern in _IS_START_PATTERNS:
-            if pattern.search(stripped):
-                is_start = i
-                break
-        if is_start is not None:
-            break
-
-    if is_start is None:
-        return None  # no IS header found — caller falls back to full text
-
-    # Find the next major section after the IS header
-    for i in range(is_start + 1, len(lines)):
-        stripped = lines[i].strip()
-        if not stripped:
-            continue
-        for pattern in _IS_STOP_PATTERNS:
-            if pattern.search(stripped):
-                is_stop = i
-                break
-        if is_stop is not None:
-            break
-
-    # If no stop pattern found, go 300 lines past the IS start (heuristic)
-    if is_stop is None:
-        is_stop = min(is_start + 300, len(lines))
-
+    is_start, is_stop = bounds
     section = "\n".join(lines[is_start:is_stop])
     if len(section) > max_chars:
         section = section[:max_chars] + "\n... (section continues)"
@@ -353,37 +434,13 @@ def extract_financial_statements_section(exhibit_text: str, max_chars: int = 35_
     statement tables (before footnotes/notes to financial statements or auditor reports).
     """
     lines = exhibit_text.split("\n")
-    fs_start: int | None = None
-    fs_stop: int | None = None
-
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        for pattern in _FS_START_PATTERNS:
-            if pattern.search(stripped):
-                fs_start = i
-                break
-        if fs_start is not None:
-            break
-
-    if fs_start is None:
+    bounds = _find_best_statement_section(
+        lines, _FS_START_PATTERNS, _FS_STOP_PATTERNS, default_window_lines=None
+    )
+    if bounds is None:
         return None
 
-    for i in range(fs_start + 1, len(lines)):
-        stripped = lines[i].strip()
-        if not stripped:
-            continue
-        for pattern in _FS_STOP_PATTERNS:
-            if pattern.search(stripped):
-                fs_stop = i
-                break
-        if fs_stop is not None:
-            break
-
-    if fs_stop is None:
-        fs_stop = len(lines)
-
+    fs_start, fs_stop = bounds
     section = "\n".join(lines[fs_start:fs_stop])
     if len(section) > max_chars:
         section = section[:max_chars] + "\n... (section continues)"
