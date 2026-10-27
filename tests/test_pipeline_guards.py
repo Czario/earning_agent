@@ -6,6 +6,7 @@ import unittest
 from earnings_agents.agent.pipeline import (
     _build_completeness_findings,
     check_company_identity,
+    check_ticker_identity,
 )
 
 
@@ -69,6 +70,34 @@ class TestCompanyIdentity(unittest.TestCase):
 
     def test_abbreviation_variant_matches(self):
         self.assertTrue(check_company_identity("NVIDIA Corporation", "NVIDIA Corp"))
+        self.assertTrue(check_company_identity("ABC CO", "ABC Company"))
+        self.assertTrue(check_company_identity("ABC CORP", "ABC Company"))
+        self.assertTrue(
+            check_company_identity(
+                "IBM CORP", "International Business Machines Corporation"
+            )
+        )
+
+    def test_semantic_llm_company_identity_resolves_holding_vs_brand(self):
+        from unittest.mock import MagicMock, patch
+
+        fake_llm = MagicMock()
+        fake_llm.invoke.return_value = '{"same_company": true, "confidence": "high"}'
+        with patch("earnings_agents.llm.build_llm", return_value=fake_llm):
+            self.assertTrue(
+                check_company_identity(
+                    "Alphabet Inc.", "Google", ticker="GOOGL", use_llm=True
+                )
+            )
+
+        fake_llm_mismatch = MagicMock()
+        fake_llm_mismatch.invoke.return_value = '{"same_company": false, "confidence": "high"}'
+        with patch("earnings_agents.llm.build_llm", return_value=fake_llm_mismatch):
+            self.assertFalse(
+                check_company_identity(
+                    "Oracle Corporation", "Netflix, Inc.", ticker="ORCL", use_llm=True
+                )
+            )
 
     def test_wrong_company_fails(self):
         self.assertFalse(check_company_identity("Oracle Corporation", "Netflix, Inc."))
@@ -76,6 +105,14 @@ class TestCompanyIdentity(unittest.TestCase):
     def test_missing_name_is_not_a_mismatch(self):
         self.assertTrue(check_company_identity("", "Netflix, Inc."))
         self.assertTrue(check_company_identity("Oracle Corporation", ""))
+
+    def test_ticker_identity_only_considers_ticker(self):
+        self.assertTrue(check_ticker_identity("AAPL", "AAPL"))
+        self.assertTrue(check_ticker_identity("AAPL", "NASDAQ: AAPL"))
+        self.assertTrue(check_ticker_identity("BRK.A", "BRK.B"))
+        self.assertTrue(check_ticker_identity("AAPL", ""))
+        self.assertFalse(check_ticker_identity("ORCL", "NFLX"))
+        self.assertFalse(check_ticker_identity("ORCL", "NASDAQ: NFLX"))
 
 
 if __name__ == "__main__":

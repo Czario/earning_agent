@@ -41,17 +41,109 @@ _LABEL_AS_IS_PATTERNS = re.compile(
     r"per\s+(?:ordinary\s+|basic\s+|diluted\s+|common\s+)?(?:share|ads)\b"
     r"|per-share|\beps\b|earnings\s+per"
     r"|%|percent|\bpct\b|basis\s+points|percentage\s+points"
-    r"|margin|yield|growth\b|ratio|ratios\b|\brate\b"
+    r"|\bmargin\b(?!\s+(?:deposit|loan|borrowing|receivable|payable|account|call|requirement|collateral|debt|interest|revenue|income|cost|expense))"
+    r"|\byield\b|\bgrowth\b|\bratios?\b"
+    r"|(?<!exchange\s)(?<!variable\s)(?<!fixed\s)(?<!floating\s)\brate\b(?!\s+(?:changes?\b|impact\b|effect\b|fluctuation|translation|revaluation|swap|contract|derivative|agreement|cap\b|collar|lock|floor|debt|note|loan|borrow|hedg|loss|gain|adjust|regulat))"
     r"|\bshares?\s+(?:outstanding|used|weighted|issued)\b"
     r"|number\s+of\s+shares|weighted.{0,20}average.{0,15}shares"
-    r"|employee|headcount"
-    r"|production|deliveries\b|delivered"
-    r"|(?:super)?charger.{0,12}(?:station|connector)"
-    r"|\bstations?\b|\bconnectors?\b"
+    r"|\bemployees?\b(?!\s*(?:benefit|compensat|severanc|stock|share|option|plan|related|liabilit|payable|receivable|loan|advance|cost|expense|payroll|tax|retire|pension|trust|withhold|contrib|award|grant|bonus|salari|wage|insur|health|medical|welfare|defer|accru|leas|terminat))"
+    r"|\bheadcount\b"
+    r"|\b(?:vehicle\s+|auto(?:motive)?\s+|total\s+)?(?:production|deliveries)\b"
+    r"|(?:super)?charger.{0,12}(?:station|connector)s?"
     r"|\bdays.{0,5}supply\b|\blease count\b"
     r"|\bactive\b.{0,20}\bsubscriptions?\b|\bfsd subscriptions?\b",
     re.IGNORECASE,
 )
+
+# Standard XBRL monetary concepts or monetary statement captions whose presentation
+# or segment labels may incidentally contain words like "margin" (e.g. "Gross margin"
+# for us-gaap:GrossProfit), "shares issued/outstanding" (e.g. Balance Sheet Common
+# Stock par-value captions), "rate" (e.g. exchange-rate effect on cash), "growth"
+# (e.g. "Growth Markets" segment revenue), or "production" (e.g. "Cost of production").
+_MONETARY_CONCEPT_NAME_RX = re.compile(
+    r"(?:^|:)(?:"
+    r"GrossProfit"
+    r"|OperatingIncomeLoss"
+    r"|Revenues?"
+    r"|RevenueFromContractWithCustomer[A-Za-z]*"
+    r"|SalesRevenue[A-Za-z]*"
+    r"|CostOf(?:GoodsAndServicesSold|GoodsSold|Revenue|Sales|Services)[A-Za-z]*"
+    r"|SellingGeneralAndAdministrativeExpense"
+    r"|GeneralAndAdministrativeExpense"
+    r"|ResearchAndDevelopmentExpense"
+    r"|OperatingExpenses?"
+    r"|CostsAndExpenses"
+    r"|IncomeLossFrom(?:Continuing|Discontinued)Operations[A-Za-z]*"
+    r"|NetIncomeLoss[A-Za-z]*"
+    r"|ProfitLoss"
+    r"|CommonStockValue[A-Za-z]*"
+    r"|CommonStocksIncludingAdditionalPaidInCapital"
+    r"|PreferredStockValue[A-Za-z]*"
+    r"|TreasuryStock(?:Value|CommonValue|PreferredValue)"
+    r"|AdditionalPaidInCapital[A-Za-z]*"
+    r"|RetainedEarnings[A-Za-z]*"
+    r"|StockholdersEquity[A-Za-z]*"
+    r"|Assets(?:Current|Noncurrent)?"
+    r"|Liabilities(?:Current|Noncurrent|AndStockholdersEquity)?"
+    r"|EffectOfExchangeRateOnCash[A-Za-z]*"
+    r"|EmployeeBenefitsAndShareBasedCompensation[A-Za-z]*"
+    r"|EmployeeRelatedLiabilities[A-Za-z]*"
+    r"|ShareBasedCompensation[A-Za-z]*"
+    r"|AllocatedShareBasedCompensationExpense"
+    r"|ProceedsFrom[A-Za-z]*"
+    r"|Payments(?:To|For)[A-Za-z]*"
+    r"|NetCashProvidedByUsedIn[A-Za-z]*"
+    r"|CashAndCashEquivalents[A-Za-z]*"
+    r"|CashCashEquivalents[A-Za-z]*"
+    r")$",
+    re.IGNORECASE,
+)
+
+# Labels that are monetary Balance Sheet / Cash Flow / Income Statement captions
+# even when they mention "shares issued/outstanding" or operational nouns.
+_MONETARY_LABEL_GUARD_RX = re.compile(
+    r"\bpar\s+value\b"
+    r"|\bat\s+cost\b"
+    r"|\b(?:common|preferred|treasury|capital)\s+stock\b(?!\s+(?:shares|dividends?\s+per\s+share))"
+    r"|\bpaid[-\s]+in\s+capital\b"
+    r"|\b(?:proceeds\s+from|payments?\s+(?:for|to)|repurchases?\s+of|issuance\s+of|redemption\s+of)\b"
+    r"|\b(?:cost\s+of|expense|revenue|sales|amortization|depreciation|impairment|liabilit(?:y|ies)|receivable|payable|borrowing|debt)\b",
+    re.IGNORECASE,
+)
+
+# True per-share / percentage / share-count signals that always stay as-is even if
+# combined with words like "revenue" or "income" (e.g. "Revenue growth %",
+# "Earnings per share", "Gross profit margin %").
+_STRONG_AS_IS_LABEL_RX = re.compile(
+    r"per\s+(?:ordinary\s+|basic\s+|diluted\s+|common\s+)?(?:share|ads)\b"
+    r"|per-share|\beps\b|earnings\s+per"
+    r"|%|percent|\bpct\b|basis\s+points|percentage\s+points",
+    re.IGNORECASE,
+)
+
+
+def _is_monetary_concept(c: dict) -> bool:
+    """True when *c* is a monetary dollar/currency row that must scale with the statement."""
+    raw_concept = (c.get("concept") or c.get("taxonomy_key") or "").split("|")[0].strip()
+    label = (c.get("label") or "").strip()
+    if _STRONG_AS_IS_LABEL_RX.search(label):
+        return False
+    if raw_concept and _MONETARY_CONCEPT_NAME_RX.search(raw_concept):
+        # Dimensional segment rows under a monetary concept (e.g. "Growth Markets"
+        # or "U.S. Operations" under us-gaap:Revenues) are monetary breakdowns unless
+        # their label explicitly declares a percentage/per-share metric.
+        # Non-dimensional rows with an explicit "margin" or "ratio" label on a
+        # custom/generic concept stay as-is, except us-gaap:GrossProfit which is
+        # always the dollar gross-profit line even when labeled "Gross margin".
+        if re.search(r"(?:^|:)GrossProfit$", raw_concept, re.I):
+            return True
+        if not re.search(r"\b(?:margin|ratios?)\b", label, re.I):
+            return True
+    if _MONETARY_LABEL_GUARD_RX.search(label) and not re.search(
+        r"\b(?:margin|ratios?|yield|growth|rate)\b", label, re.I
+    ):
+        return True
+    return False
 
 
 def build_no_scale_keys(target_concepts: list[dict]) -> set[str]:
@@ -69,6 +161,8 @@ def build_no_scale_keys(target_concepts: list[dict]) -> set[str]:
     for c in target_concepts:
         label = (c.get("label") or "").strip()
         if not label or not _LABEL_AS_IS_PATTERNS.search(label):
+            continue
+        if _is_monetary_concept(c):
             continue
         key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
         if key:

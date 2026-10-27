@@ -94,33 +94,146 @@ def classify_missing_labels(
 
 # ── Completeness findings (agent-driven) ─────────────────────────────────────
 
-def check_company_identity(expected_name: str, reported_name: str) -> bool:
-    """Deterministic company-identity cross-check.
+_CORPORATE_SUFFIX_TOKENS = frozenset({
+    "the", "co", "company", "companies", "corp", "corporation",
+    "inc", "incorporated", "ltd", "limited", "llc", "plc", "lp",
+    "holdings", "holding", "group",
+    "nv", "sa", "ag", "se", "ab", "asa", "kk", "de",
+})
 
-    Compares the company name the extraction agent read from the document
-    (``__company_name__``) against the expected ticker's company name using
-    normalized token overlap.  Tokens shorter than 4 characters (``The``,
-    ``Co``, ``Inc``, ``Ltd``) are dropped so suffix/abbreviation variants
-    ("Inc." vs "Incorporated", "Holdings Inc" vs "Holdings Limited") cannot
-    force a false mismatch; a *disjoint* token set means the document is for a
-    different company (wrong-document upload — e.g. a Netflix shareholder
-    letter fed with ticker ORCL).
 
-    Returns True when the names plausibly match, or when either side is
-    missing/empty (the check is advisory and must never fail a run on its own
-    absence).
+def check_ticker_identity(expected_ticker: str, reported_ticker: str) -> bool:
+    """Deterministic ticker-only cross-check.
+
+    Compares the ticker symbol reported from the filing (``__ticker__``)
+    against the expected target ticker, ignoring exchange prefixes (e.g.
+    ``"NASDAQ: AAPL"`` -> ``"AAPL"``) and share-class punctuation.
+    Returns True when either side is empty or when the tickers match.
     """
-    expected_tokens = {
-        w for w in (expected_name or "").strip().lower().replace(",", " ").split()
-        if len(w) >= 4
-    }
-    reported_tokens = {
-        w for w in (reported_name or "").strip().lower().replace(",", " ").split()
-        if len(w) >= 4
-    }
-    if not expected_tokens or not reported_tokens:
+    def _norm_ticker(raw: str) -> str:
+        t = (raw or "").strip().upper()
+        if ":" in t:
+            t = t.split(":")[-1].strip()
+        t = t.strip("()[] ")
+        return t
+
+    exp = _norm_ticker(expected_ticker)
+    rep = _norm_ticker(reported_ticker)
+    if not exp or not rep:
+        return True
+    if exp == rep:
+        return True
+    exp_base = exp.split(".")[0].split("-")[0]
+    rep_base = rep.split(".")[0].split("-")[0]
+    return bool(exp_base and exp_base == rep_base)
+
+
+def _semantically_verify_same_company(
+    expected_name: str,
+    reported_name: str,
+    ticker: str = "",
+) -> bool:
+    """Ask the LLM whether two company names refer to the same company/group.
+
+    Used when fast normalized token matching sees no obvious token overlap
+    (e.g. holding company vs brand name such as 'Alphabet Inc.' vs 'Google',
+    or acronym vs full legal name).  Conservative against false failures:
+    returns False ONLY when the LLM confirms with high confidence that the two
+    names are completely different, unrelated companies.
+    """
+    import json as _json
+    import re as _re
+
+    prompt = (
+        "You are a corporate-entity resolver. Determine whether the two company "
+        "names below refer to the SAME company (including abbreviations, legal "
+        "suffixes like 'CO'/'Company'/'Corp'/'Inc', holding company vs operating "
+        "brand like 'Alphabet' vs 'Google', or rebrands like 'Block' vs 'Square') "
+        "or to two COMPLETELY DIFFERENT, unrelated companies (like 'Oracle' vs 'Netflix').\n\n"
+        f"Expected company: {expected_name!r}"
+        + (f" (ticker: {ticker})" if ticker else "")
+        + f"\nDocument-reported company: {reported_name!r}\n\n"
+        'Return strict JSON only: {"same_company": true|false, "confidence": "high"|"low"}'
+    )
+    try:
+        from earnings_agents.hooks import report_call
+        report_call("  [llm]  semantic company identity check → calling llm")
+        from earnings_agents.llm import build_llm
+        response = build_llm(format_json=True, max_retries=0).invoke(prompt)
+        if not isinstance(response, str):
+            response = str(getattr(response, "content", response))
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = _re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned).strip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            data = _json.loads(cleaned[start : end + 1])
+            if (
+                isinstance(data, dict)
+                and data.get("same_company") is False
+                and str(data.get("confidence") or "").strip().lower() == "high"
+            ):
+                return False
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Semantic company check fallback (treating as match): %s", exc)
+    return True
+
+
+def check_company_identity(
+    expected_name: str,
+    reported_name: str,
+    *,
+    ticker: str = "",
+    use_llm: bool = False,
+) -> bool:
+    """Company-identity cross-check combining normalized token/acronym matching
+    with optional LLM semantic resolution.
+
+    1. Strips corporate suffixes ('Co', 'Company', 'Corp', 'Corporation', 'Inc',
+       'Holdings', etc.) and keeps 2+ char company tokens so 'ABC CO' matches
+       'ABC Company' and initialisms like 'IBM' match 'International Business Machines'.
+    2. When ``use_llm=True`` and surface tokens do not overlap (e.g. 'Alphabet Inc.'
+       vs 'Google'), delegates to :func:`_semantically_verify_same_company` so
+       the pipeline understands company identity semantically rather than failing
+       on string differences.
+    """
+    import re as _re
+
+    def _tokens(name: str) -> list[str]:
+        words = _re.findall(r"[a-z0-9]+", (name or "").lower())
+        return [
+            w for w in words
+            if len(w) >= 2 and w not in _CORPORATE_SUFFIX_TOKENS
+        ]
+
+    expected_list = _tokens(expected_name)
+    reported_list = _tokens(reported_name)
+    if not expected_list or not reported_list:
         return True  # nothing to compare — not a mismatch
-    return not expected_tokens.isdisjoint(reported_tokens)
+
+    expected_tokens = set(expected_list)
+    reported_tokens = set(reported_list)
+    if not expected_tokens.isdisjoint(reported_tokens):
+        return True
+
+    # Acronym / initialism check (e.g. "IBM" vs "International Business Machines")
+    exp_initials = "".join(w[0] for w in expected_list if w)
+    rep_initials = "".join(w[0] for w in reported_list if w)
+    if (len(exp_initials) >= 2 and exp_initials in reported_tokens) or (
+        len(rep_initials) >= 2 and rep_initials in expected_tokens
+    ):
+        return True
+
+    # Ticker token check
+    norm_ticker = (ticker or "").strip().lower().split(".")[0].split("-")[0]
+    if norm_ticker and (norm_ticker in reported_tokens or norm_ticker in expected_tokens):
+        return True
+
+    if use_llm:
+        return _semantically_verify_same_company(expected_name, reported_name, ticker=ticker)
+
+    return False
 
 
 def _build_completeness_findings(
@@ -584,7 +697,7 @@ def _run_extraction_pass(
             initial_msg = (
                 f"This is a {len(plain_text):,}-character earnings document "
                 f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
-                f"COMPANY: {state['company_name']} ({ticker})\n\n"
+                f"TICKER: {ticker}\n\n"
                 f"FINANCIAL STATEMENTS ({is_exhibit_label}) — LINES {is_line_start}-{is_line_end}:\n"
                 f"The financial statements text is provided below ({is_section_size:,} chars):\n\n"
                 f"--- BEGIN {is_exhibit_label} ---\n"
@@ -610,7 +723,7 @@ def _run_extraction_pass(
                 f"and any statement table that is missing from the text above.\n"
                 f"  5. Extract any remaining concepts you find.\n\n"
                 f"  6. Call finalize_extraction().\n\n"
-                f"DO NOT call get_company_info() — you already have the company name above.\n\n"
+                f"DO NOT call get_company_info() — you already have the ticker above.\n\n"
                 f"MEMORY: record remember_* facts in the SAME step you observe them "
                 f"(interleaved with extraction), then call finalize_extraction() "
                 f"right after your last extraction — do NOT add a separate "
@@ -621,7 +734,7 @@ def _run_extraction_pass(
             initial_msg = (
                 f"This is a {len(plain_text):,}-character earnings document "
                 f"with {n_lines:,} lines across {len(state.get('document_map') or []):,} exhibit(s).\n\n"
-                f"COMPANY: {state['company_name']} ({ticker})\n\n"
+                f"TICKER: {ticker}\n\n"
                 f"INCOME STATEMENT ({is_exhibit_label}) — LINES {is_line_start}-{is_line_end}:\n"
                 f"The income statement text is provided below ({is_section_size:,} chars).\n\n"
                 f"--- BEGIN {is_exhibit_label} ---\n"
@@ -720,6 +833,7 @@ def _run_extraction_pass(
                 f"flow rows not de-accumulated will be omitted from the quarterly save."
             )
 
+    no_scale_keys = build_no_scale_keys(target_concepts)
     final_result = run_agent_loop(
         system_prompt=system_prompt,
         initial_message=initial_msg,
@@ -729,7 +843,7 @@ def _run_extraction_pass(
         # Per-share/percentage/share-count concepts must never be scaled even
         # when their member-tagged keys carry no "per share" text (the as-is
         # signal lives in the concept LABEL — see build_no_scale_keys).
-        no_scale_keys=build_no_scale_keys(target_concepts),
+        no_scale_keys=no_scale_keys,
     )
 
     if final_result is None:
@@ -1204,17 +1318,49 @@ def _run_extraction_pass(
             "evidence": {"paths": sorted(ambiguous_paths)[:20]},
         })
 
+    # Resolve dominant scale per statement and across all statements so values
+    # lacking an explicit per-value scale in __evidence__ inherit the fallback
+    # scale followed by the statement / filing.
+    stmt_scale_counts: dict[str, dict[str, int]] = {}
+    all_scale_counts: dict[str, int] = {}
+    for cid in concept_metrics:
+        c = concept_by_id.get(cid, {})
+        stmt = c.get("statement_type") or "income"
+        ev = evidence_by_concept.get(cid, {})
+        s = str(ev.get("scale") or "").strip().lower()
+        if s in SCALE_MULTIPLIERS:
+            stmt_scale_counts.setdefault(stmt, {})[s] = (
+                stmt_scale_counts.get(stmt, {}).get(s, 0) + 1
+            )
+            all_scale_counts[s] = all_scale_counts.get(s, 0) + 1
+    for ev in agent_evidence.values():
+        if isinstance(ev, dict):
+            s = str(ev.get("scale") or "").strip().lower()
+            if s in SCALE_MULTIPLIERS and s not in all_scale_counts:
+                all_scale_counts[s] = all_scale_counts.get(s, 0) + 1
+    statement_fallback_scales: dict[str, str] = {
+        stmt: max(counts, key=lambda k: counts[k])
+        for stmt, counts in stmt_scale_counts.items()
+        if counts
+    }
+    global_fallback_scale = (
+        max(all_scale_counts, key=lambda k: all_scale_counts[k])
+        if all_scale_counts
+        else (doc_scale if doc_scale in SCALE_MULTIPLIERS else "")
+    )
+
     # Per-concept metadata for persistence (dimension identity, currency,
     # scale/evidence, calculated status) + structured findings for the gate.
     value_metadata_by_id: dict[str, dict] = {}
     for cid in concept_metrics:
         c = concept_by_id.get(cid, {})
         ev = evidence_by_concept.get(cid, {})
+        stmt = c.get("statement_type") or "income"
         # Currency was resolved per statement above; only matching values
         # survive, so every stored value carries its confirmed ISO code.
         value_currency = currency_by_concept.get(cid) or ""
         value_metadata_by_id[cid] = {
-            "statement_type": c.get("statement_type") or "income",
+            "statement_type": stmt,
             "dimension": bool(c.get("dimension")),
             "dimension_concept": bool(c.get("dimension_concept")),
             "dimension_member": c.get("dimension_member") or "",
@@ -1228,8 +1374,19 @@ def _run_extraction_pass(
             value_metadata_by_id[cid]["source_lines"] = [
                 int(ev["lines"][0]), int(ev["lines"][1]),
             ]
-        if ev.get("scale"):
-            value_metadata_by_id[cid]["scale"] = str(ev["scale"]).strip().lower()
+        raw_ev_scale = str(ev.get("scale") or "").strip().lower()
+        tkey = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+        is_no_scale_concept = bool(tkey and (tkey in no_scale_keys or f"[{tkey}]" in no_scale_keys))
+        if raw_ev_scale in SCALE_MULTIPLIERS:
+            value_metadata_by_id[cid]["scale"] = raw_ev_scale
+        elif not is_no_scale_concept:
+            fallback_scale = statement_fallback_scales.get(stmt) or global_fallback_scale
+            if fallback_scale:
+                value_metadata_by_id[cid]["scale"] = fallback_scale
+            elif raw_ev_scale:
+                value_metadata_by_id[cid]["scale"] = raw_ev_scale
+        elif raw_ev_scale:
+            value_metadata_by_id[cid]["scale"] = raw_ev_scale
         if ev.get("evidence"):
             value_metadata_by_id[cid]["source_snippet"] = str(ev["evidence"])[:500]
     findings = _build_completeness_findings(
@@ -1239,14 +1396,34 @@ def _run_extraction_pass(
     findings.extend(cf_deaccum_findings)
     findings.extend(currency_findings)
 
-    # Deterministic company-identity cross-check: the agent reports the
-    # company name it actually read (__company_name__); compare (normalized)
-    # against the expected name.  A mismatch is high severity — it can only be
-    # a wrong-document upload (manual URL/PDF path) or an extraction mistake.
+    # Semantic company-identity cross-check: first checks normalized corporate
+    # tokens/acronyms ("ABC CO" == "ABC Company", "IBM" == "International
+    # Business Machines"), and if surface tokens differ, asks the LLM
+    # semantically before ever failing a run.
     reported_name = str(metrics.pop("__company_name__", "") or "").strip()
     expected_name = str(state.get("company_name") or "").strip()
+    reported_ticker = str(metrics.pop("__ticker__", "") or "").strip()
+    if reported_ticker and ticker and not check_ticker_identity(
+        ticker, reported_ticker
+    ):
+        report_call(
+            f"  [pipeline]  ✗ document ticker {reported_ticker!r} does not "
+            f"match expected ticker {ticker!r} — ticker mismatch"
+        )
+        logger.warning(
+            "Ticker cross-check failed for %s: document says %r",
+            ticker, reported_ticker,
+        )
+        return {
+            **state,
+            "status": "failed",
+            "error": (
+                f"Document ticker {reported_ticker!r} does not match "
+                f"{ticker!r} — ticker mismatch"
+            ),
+        }
     if reported_name and expected_name and not check_company_identity(
-        expected_name, reported_name
+        expected_name, reported_name, ticker=ticker, use_llm=True
     ):
         report_call(
             f"  [pipeline]  ✗ document company {reported_name!r} does not "

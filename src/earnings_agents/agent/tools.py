@@ -397,11 +397,17 @@ def build_pi_tools(
         pv = prior_values or {}
         for label, value in pv.items():
             if label.lower() == desc_lower:
-                return f"Prior period '{label}': {value:,.0f}"
+                return (
+                    f"Prior period '{label}': {value:,.0f} (stored in full raw units; "
+                    f"report current-period values in the filing's table scale, do NOT pre-multiply)"
+                )
         for label, value in pv.items():
             label_lower = label.lower()
             if desc_lower in label_lower or label_lower in desc_lower:
-                return f"Prior period '{label}': {value:,.0f}"
+                return (
+                    f"Prior period '{label}': {value:,.0f} (stored in full raw units; "
+                    f"report current-period values in the filing's table scale, do NOT pre-multiply)"
+                )
         if pv:
             available = ", ".join(list(pv.keys())[:10])
             return f"No prior value for '{raw}'. Available: {available}"
@@ -584,11 +590,12 @@ def build_pi_tools(
         """Evaluate a simple arithmetic expression and return the result.
 
         Use this to compute derived metrics AFTER extracting raw values from
-        the document.  For example:
+        the document, keeping numbers in the statement's printed table scale
+        (never pre-multiply by thousands/millions/billions).  For example:
 
-          calculate("1006300000 - 509800000")        → Gross Profit
-          calculate("(753214000 - 272411000) / 753214000 * 100")  → margin %
-          calculate("33900000000 / 15700000000")     → EPS
+          calculate("1006.3 - 509.8")                → Gross Profit (in table units)
+          calculate("(753.2 - 272.4) / 753.2 * 100") → margin %
+          calculate("33900 / 15700")                 → EPS
 
         Supports: +, -, *, /, parentheses, decimal numbers.
         No variables, no functions, no imports — pure arithmetic only.

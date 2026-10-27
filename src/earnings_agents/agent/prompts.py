@@ -125,8 +125,10 @@ SEGMENT / BREAKDOWN REVENUE IN PROSE — CRITICAL:
     that appear in the concept list (e.g. search("TurboTax")).
   • Prose figures use MIXED units — "Consumer revenue of $5.3 billion" vs
     "Credit Karma revenue of $631 million".  Convert each to the statement's
-    dominant scale with calculate(): in a millions-scale statement,
-    "$5.3 billion" is calculate("5.3 * 1000").
+    dominant __scale__ with calculate():
+      - When __scale__ is "millions":  "$5.3 billion" → calculate("5.3 * 1000") = 5300; "$631 million" → 631
+      - When __scale__ is "thousands": "$5.3 billion" → calculate("5.3 * 1000000") = 5300000; "$631 million" → calculate("631 * 1000") = 631000
+      - When __scale__ is "billions":  "$631 million" → calculate("631 / 1000") = 0.631; "$5.3 billion" → 5.3
   • A line that only gives a growth rate ("grew 22%") has NO value — skip it;
     report it in __missing__ only if no dollar figure exists anywhere.
   • Match each dollar figure to its concept label by MEANING (brand/product
@@ -237,18 +239,20 @@ WORKFLOW
 
 
 COMPANY_IDENTITY_RULE = """\
-COMPANY IDENTITY — verify BEFORE extracting (applies to every source: EDGAR
-HTML, PDF shareholder letters, presentations):
-  • This task is for {company_name} ({ticker}).  The document MUST belong to
-    this company — a readable period header alone is NOT proof of identity.
-  • Verify identity early: call get_company_info(), search() for the
-    company's unique name and its well-known business terms, and sanity-check
-    the magnitude of headline figures against get_prior_value().
-  • If the document is clearly for a DIFFERENT company — the other company's
-    name appears throughout, its terminology does not match, or the figures
-    are inconsistent with this company's history — call finalize_extraction
-    with "__company_mismatch__": true and return NO metric values.
-  • NEVER extract one company's numbers under another company's ticker.
+COMPANY IDENTITY — verify SEMANTICALLY, never by literal string match (applies
+to every source: EDGAR HTML, PDF shareholder letters, presentations):
+  • This task is for {company_name} ({ticker}).
+  • Judge company identity SEMANTICALLY — do NOT do a literal string comparison:
+    database records and SEC legal titles frequently differ in formatting,
+    abbreviations, corporate suffixes, or holding vs brand names (for example,
+    "ABC CO" vs "ABC Company", "Corp" vs "Corporation", "Inc." vs
+    "Incorporated", "Alphabet Inc." vs "Google", "PDD Holdings" vs "Pinduoduo").
+    Treat all such abbreviations, legal-entity variations, parent/subsidiary
+    names, and ticker matches ({ticker}) as the SAME company.
+  • Only flag a mismatch when the document is semantically for a COMPLETELY
+    DIFFERENT, unrelated company (e.g. a Netflix release fed under ticker ORCL).
+    In that case only, call finalize_extraction with "__company_mismatch__": true
+    and return NO metric values.
 """
 
 
@@ -259,7 +263,7 @@ FINALIZE_DESCRIPTION = (
     "    USD presentation was used, otherwise the reported ISO code (EUR, TWD,\n"
     "    ...). No conversion is ever performed; values are stored as reported.\n"
     "  - __company_name__: the company name as printed in the document you\n"
-    "    extracted from (the pipeline cross-checks it against the target)\n"
+    "    extracted from (verified semantically against the target company/ticker)\n"
     "  - __evidence__: a JSON object mapping each metric key to its source\n"
     "    evidence: {\"lines\": [start, end]} — the line range you read the\n"
     "    value from (omit lines for values you computed).  Do NOT include\n"
@@ -287,8 +291,8 @@ FINALIZE_DESCRIPTION = (
     "    proposed new row uses the exact metric_key passed to\n"
     "    propose_new_concept() and must also have __evidence__ lines.\n"
     'Negative amounts ("(1,234)" in the filing) must carry the minus sign: -1234.\n'
-    "If the document does NOT belong to the target company, set "
-    '\"__company_mismatch__\": true and return NO metric values.\n'
+    "If the document is semantically for a completely different company, set "
+    '\"__company_mismatch__\": true and return NO metric values (never set this for abbreviations or name variations like "ABC CO" vs "ABC Company").\n'
     "OMIT any concept you cannot find."
 )
 

@@ -92,6 +92,134 @@ class TestBuildNoScaleKeys(unittest.TestCase):
         ]
         self.assertEqual(build_no_scale_keys(concepts), set())
 
+    def test_monetary_concepts_with_ration_rate_employee_margin_shares_labels_scale(self):
+        # Regression: words containing "ratio" ("operations", "administration",
+        # "integration", "separation", "consideration"), monetary "exchange rate",
+        # "employee benefits", "Gross margin" on us-gaap:GrossProfit, "Cost of
+        # production", and Balance Sheet "Common stock ... shares issued and
+        # outstanding" must NOT be added to no_scale_keys.
+        concepts = [
+            self._concept("Income from operations", "us-gaap:OperatingIncomeLoss"),
+            self._concept(
+                "Income from continuing operations before income taxes",
+                "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            ),
+            self._concept(
+                "Selling, general and administration",
+                "us-gaap:SellingGeneralAndAdministrativeExpense",
+            ),
+            self._concept("Acquisition and integration costs", "custom:AcquisitionAndIntegrationCosts"),
+            self._concept("Restructuring and separation", "custom:RestructuringAndSeparation"),
+            self._concept(
+                "Effect of exchange rate changes on cash and cash equivalents",
+                "us-gaap:EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            ),
+            self._concept(
+                "Employee benefits and share-based compensation",
+                "us-gaap:EmployeeBenefitsAndShareBasedCompensation",
+            ),
+            self._concept("Gross margin", "us-gaap:GrossProfit"),
+            self._concept("Cost of production", "us-gaap:CostOfGoodsAndServicesSold"),
+            self._concept(
+                "Common stock, $0.001 par value; 500,000 shares authorized; 120,000 shares issued and outstanding",
+                "us-gaap:CommonStockValue",
+            ),
+            self._concept("U.S. Operations", "us-gaap:Revenues|001.001"),
+            self._concept("Growth Markets", "us-gaap:Revenues|001.002"),
+        ]
+        self.assertEqual(build_no_scale_keys(concepts), set())
+
+        payload = (
+            '{"__scale__":"millions","__currency__":"USD",'
+            '"[us-gaap:OperatingIncomeLoss]": 4200,'
+            '"[us-gaap:SellingGeneralAndAdministrativeExpense]": 1800,'
+            '"[us-gaap:EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]": -45,'
+            '"[us-gaap:EmployeeBenefitsAndShareBasedCompensation]": 500,'
+            '"[us-gaap:GrossProfit]": 8602,'
+            '"[us-gaap:CommonStockValue]": 12}'
+        )
+        out = _parse_llm_response(payload, no_scale_keys=build_no_scale_keys(concepts))
+        self.assertEqual(out["[us-gaap:OperatingIncomeLoss]"], 4_200_000_000)
+        self.assertEqual(out["[us-gaap:SellingGeneralAndAdministrativeExpense]"], 1_800_000_000)
+        self.assertEqual(
+            out["[us-gaap:EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]"],
+            -45_000_000,
+        )
+        self.assertEqual(out["[us-gaap:EmployeeBenefitsAndShareBasedCompensation]"], 500_000_000)
+        self.assertEqual(out["[us-gaap:GrossProfit]"], 8_602_000_000)
+        self.assertEqual(out["[us-gaap:CommonStockValue]"], 12_000_000)
+
+    def test_llm_scale_not_downgraded_by_prescan_and_per_value_evidence_scale_honored(self):
+        # Agent confirmed table is in millions even though prescan saw "in thousands"
+        out = _parse_llm_response(
+            '{"__scale__":"millions","__currency__":"USD","[us-gaap:Revenues]": 1234}',
+            prescan_dollar_multiplier=1_000,
+        )
+        self.assertEqual(out["[us-gaap:Revenues]"], 1_234_000_000)
+
+        # Per-value evidence scale overrides when a narrative segment figure is in billions
+        out_ev = _parse_llm_response(
+            '{"__scale__":"thousands","__currency__":"USD",'
+            '"__evidence__":{"[us-gaap:Revenues|seg]":{"lines":[10,12],"scale":"millions"}},'
+            '"[us-gaap:Revenues]": 5931000,'
+            '"[us-gaap:Revenues|seg]": 631}'
+        )
+        self.assertEqual(out_ev["[us-gaap:Revenues]"], 5_931_000_000)
+        self.assertEqual(out_ev["[us-gaap:Revenues|seg]"], 631_000_000)
+
+    def test_fallback_scale_when_value_has_no_scale_given(self):
+        # Most values in __evidence__ have "scale": "millions", while some values
+        # have no scale in __evidence__ (or are absent from __evidence__, e.g.
+        # computed/derived rows) and __scale__ is omitted or "as-is".
+        payload = (
+            '{"__scale__":"as-is","__currency__":"USD",'
+            '"__evidence__":{'
+            '"[us-gaap:Revenues]":{"lines":[100,101],"scale":"millions"},'
+            '"[us-gaap:CostOfRevenue]":{"lines":[102,103],"scale":"millions"},'
+            '"[us-gaap:OperatingIncomeLoss]":{"lines":[110,111]},'
+            '"[us-gaap:NetIncomeLoss]":{"lines":[120,121],"scale":"none"}'
+            '},'
+            '"[us-gaap:Revenues]": 15400,'
+            '"[us-gaap:CostOfRevenue]": -6798,'
+            '"[us-gaap:GrossProfit]": 8602,'
+            '"[us-gaap:OperatingIncomeLoss]": 4200,'
+            '"[us-gaap:NetIncomeLoss]": 3100,'
+            '"[us-gaap:EarningsPerShareDiluted]": 2.45}'
+        )
+        out = _parse_llm_response(payload)
+        self.assertEqual(out["[us-gaap:Revenues]"], 15_400_000_000)
+        self.assertEqual(out["[us-gaap:CostOfRevenue]"], -6_798_000_000)
+        self.assertEqual(out["[us-gaap:GrossProfit]"], 8_602_000_000)
+        self.assertEqual(out["[us-gaap:OperatingIncomeLoss]"], 4_200_000_000)
+        self.assertEqual(out["[us-gaap:NetIncomeLoss]"], 3_100_000_000)
+        self.assertEqual(out["[us-gaap:EarningsPerShareDiluted]"], 2.45)
+
+    def test_statement_local_fallback_scale_from_nearby_lines(self):
+        # Income statement (lines 50-80) is in millions; Balance sheet (lines 300-340)
+        # is in thousands; a balance sheet row with no scale given at line 315
+        # inherits the nearby statement's "thousands" fallback scale.
+        payload = (
+            '{"__currency__":"USD",'
+            '"__evidence__":{'
+            '"[us-gaap:Revenues]":{"lines":[50,51],"scale":"millions"},'
+            '"[us-gaap:NetIncomeLoss]":{"lines":[70,71],"scale":"millions"},'
+            '"[us-gaap:Assets]":{"lines":[305,306],"scale":"thousands"},'
+            '"[us-gaap:Liabilities]":{"lines":[325,326],"scale":"thousands"},'
+            '"[us-gaap:StockholdersEquity]":{"lines":[315,316]}'
+            '},'
+            '"[us-gaap:Revenues]": 1200,'
+            '"[us-gaap:NetIncomeLoss]": 300,'
+            '"[us-gaap:Assets]": 950000,'
+            '"[us-gaap:Liabilities]": 450000,'
+            '"[us-gaap:StockholdersEquity]": 500000}'
+        )
+        out = _parse_llm_response(payload)
+        self.assertEqual(out["[us-gaap:Revenues]"], 1_200_000_000)
+        self.assertEqual(out["[us-gaap:NetIncomeLoss]"], 300_000_000)
+        self.assertEqual(out["[us-gaap:Assets]"], 950_000_000)
+        self.assertEqual(out["[us-gaap:Liabilities]"], 450_000_000)
+        self.assertEqual(out["[us-gaap:StockholdersEquity]"], 500_000_000)
+
 
 class TestSanitizeToolMessages(unittest.TestCase):
     def test_inserts_missing_tool_message(self):

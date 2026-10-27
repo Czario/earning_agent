@@ -342,6 +342,31 @@ def load_prior_quarter_ending_cash(
     return None
 
 
+def _infer_prior_scale_divisor(value: float, prior_values: list[float]) -> int:
+    """Detect when DB prior-quarter values are stored in full raw units
+    (1,000x / 1,000,000x / 1,000,000,000x) while *value* was passed in the
+    statement's printed table scale.
+
+    Returns the divisor (1,000 / 1,000,000 / 1,000,000,000) to convert the
+    DB priors into *value*'s table scale, or 1 when they are already in the
+    same scale.
+    """
+    non_zero = [abs(p) for p in prior_values if p != 0]
+    if value == 0 or not non_zero:
+        return 1
+    max_prior = max(non_zero)
+    ratio = max_prior / abs(value)
+    for mult in (1_000_000_000, 1_000_000, 1_000):
+        step = max(mult // 100, 1)
+        if (
+            mult * 0.02 <= ratio <= mult * 50
+            and max_prior >= mult
+            and all(round(p) % step == 0 for p in non_zero)
+        ):
+            return mult
+    return 1
+
+
 def deaccumulate_cashflow_value(
     *,
     cik: str | None,
@@ -359,6 +384,8 @@ def deaccumulate_cashflow_value(
     mutates state — the agent reports the returned quarterly value (and lists
     the key in ``__derived__``).
     """
+    from earnings_agents.agent.derive import format_value_for_llm
+
     if cik is None or fiscal_year is None or quarter is None:
         return (
             "Cannot de-accumulate: fiscal year/quarter context is unavailable. "
@@ -400,10 +427,13 @@ def deaccumulate_cashflow_value(
             target_concepts=target_concepts,
         )
         if prior_cash is not None:
+            divisor = _infer_prior_scale_divisor(value, [prior_cash])
+            aligned_cash = prior_cash / divisor if divisor > 1 else prior_cash
+            cash_str = format_value_for_llm(aligned_cash)
             return (
-                f"De-accumulated Q{quarter} = {prior_cash:,.0f} (taken as-is from prior quarter Q{prior_q} "
+                f"De-accumulated Q{quarter} = {cash_str} (taken as-is from prior quarter Q{prior_q} "
                 f"ending cash [us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]).\n"
-                f"Report {prior_cash:,.0f} under [{key}] and list [{key}] in __derived__ "
+                f"Report {cash_str} under [{key}] and list [{key}] in __derived__ "
                 f"(computed, not verbatim)."
             )
         return (
@@ -421,9 +451,10 @@ def deaccumulate_cashflow_value(
             f"[{key}]."
         )
     if kind == "ending":
+        val_str = format_value_for_llm(value)
         return (
             f"AS-IS — '{label}' is an end-of-period snapshot (the quarter-end "
-            f"balance). Report the printed value {value:,.0f} under [{key}] "
+            f"balance). Report the printed value {val_str} under [{key}] "
             f"without de-accumulating."
         )
 
@@ -443,13 +474,20 @@ def deaccumulate_cashflow_value(
             f"report it missing). Do NOT invent a prior-quarter value."
         )
 
-    prior_sum = sum(priors[q] for q in range(1, quarter))
-    quarterly = value - prior_sum
+    divisor = _infer_prior_scale_divisor(value, [priors[q] for q in range(1, quarter)])
+    aligned_priors = {
+        q: (priors[q] / divisor if divisor > 1 else priors[q])
+        for q in range(1, quarter)
+    }
+    prior_sum = sum(aligned_priors[q] for q in range(1, quarter))
+    quarterly = round(value - prior_sum, 6)
     breakdown = " + ".join(
-        f"Q{q} {priors[q]:,.0f}" for q in range(1, quarter)
+        f"Q{q} {format_value_for_llm(aligned_priors[q])}" for q in range(1, quarter)
     )
+    val_str = format_value_for_llm(value)
+    q_str = format_value_for_llm(quarterly)
     return (
-        f"De-accumulated Q{quarter} = {value:,.0f} − ({breakdown}) = {quarterly:,.0f}\n"
-        f"Report {quarterly:,.0f} under [{key}] and list [{key}] in __derived__ "
+        f"De-accumulated Q{quarter} = {val_str} − ({breakdown}) = {q_str}\n"
+        f"Report {q_str} under [{key}] and list [{key}] in __derived__ "
         f"(computed, not verbatim)."
     )

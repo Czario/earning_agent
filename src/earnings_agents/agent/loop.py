@@ -41,21 +41,29 @@ class AgentProviderError(RuntimeError):
 # ── Response parsing ────────────────────────────────────────────────────────
 
 _PCT_OR_PER_SHARE_PATTERNS = re.compile(
-    r"(%|percent|margin|yield|growth"
-    r"|\bratio\b|\bratios\b|\beps\b|per share|\byoy\b|\bpct\b|\brate\b"
-    r"|employee|headcount|basis points|percentage points"
-    r"|\bper\s+(?:basic|diluted|basic\s+and\s+diluted|common)\s+share\b"
-    r"|per\w*share"
-    r"|production|deliveries|delivered"
-    r"|(?:super)?charger.{0,12}(?:station|connector)"
-    r"|\bstations?\b|\bconnectors?\b"
+    r"(%|percent"
+    r"|(?:\bmargin\b|(?<=[a-z])Margin(?=[A-Z0-9_|]|$))(?!\s*(?:deposit|loan|borrowing|receivable|payable|account|call|requirement|collateral|debt|interest|revenue|income|cost|expense))"
+    r"|\byield\b|(?<=[a-z])Yield(?=[A-Z0-9_|]|$)"
+    r"|\bgrowth\b|(?<=[a-z])Growth(?:Rate|Pct|Percent)?(?=[A-Z0-9_|]|$)"
+    r"|\bratios?\b|(?<=[a-z])Ratios?(?=[A-Z0-9_|]|$)"
+    r"|\beps\b|per share|\byoy\b|\bpct\b"
+    r"|(?<!exchange\s)(?<!exchange)(?<!variable\s)(?<!fixed\s)(?<!floating\s)(?:\brate\b|(?<=[a-z])Rate(?=[A-Z0-9_|]|$))(?!\s*(?:changes?\b|impact\b|effect\b|fluctuation|translation|revaluation|swap|contract|derivative|agreement|cap\b|collar|lock|floor|debt|note|loan|borrow|hedg|loss|gain|adjust|regulat|OnCash))"
+    r"|\bemployees?\b(?!\s*(?:benefit|compensat|severanc|stock|share|option|plan|related|liabilit|payable|receivable|loan|advance|cost|expense|payroll|tax|retire|pension|trust|withhold|contrib|award|grant|bonus|salari|wage|insur|health|medical|welfare|defer|accru|leas|terminat))"
+    r"|\bheadcount\b|basis points|percentage points"
+    r"|\bper\s+(?:ordinary\s+|basic\s+|diluted\s+|basic\s+and\s+diluted\s+|common\s+)?(?:share|ads)\b"
+    r"|(?<!o)(?<!su)(?<!pro)(?<!pa)(?<!up)(?<!hy)(?<!develo)per(?:[\s_-]+|(?=[A-Z]))(?:(?:basic|diluted|common|ordinary|ads|class[ab]?|and)(?:[\s_-]+|(?=[A-Z])))*(?:share|ads)(?!holder|based)"
+    r"|\b(?:vehicle\s+|auto(?:motive)?\s+|total\s+)?(?:production|deliveries)\b(?!\s*(?:cost|expense|revenue|sales|income|loss|tax|credit|asset|liabilit))"
+    r"|(?:super)?charger.{0,12}(?:station|connector)s?"
     r"|\bdays.{0,5}supply\b|\blease count\b"
     r"|\bactive\b.{0,20}\bsubscriptions?\b|\bfsd subscriptions?\b)",
     re.IGNORECASE,
 )
 
 _SHARE_COUNT_PATTERN = re.compile(
-    r"\bnumber of shares\b|\bshares used\b|\bweighted.{0,15}average.{0,15}shares\b",
+    r"\bnumber of shares\b|\bshares used\b|\bweighted.{0,15}average.{0,15}shares\b"
+    r"|WeightedAverageNumberOf(?:Diluted|Basic)?Shares"
+    r"|(?:Common|Preferred|Treasury)StockShares(?:Outstanding|Issued|Authorized)"
+    r"|NumberOfShares(?:Outstanding|Issued|Used)?",
     re.IGNORECASE,
 )
 
@@ -146,17 +154,6 @@ def _parse_llm_response(
     except json.JSONDecodeError:
         return None
 
-    scale_str = str(parsed.pop("__scale__", "as-is")).lower()
-    llm_multiplier = SCALE_MULTIPLIERS.get(scale_str, 1)
-    if llm_multiplier > 1 and prescan_dollar_multiplier > 1:
-        multiplier = min(llm_multiplier, prescan_dollar_multiplier)
-    elif prescan_dollar_multiplier > 1:
-        multiplier = prescan_dollar_multiplier
-    else:
-        multiplier = llm_multiplier if llm_multiplier > 1 else 1
-
-    no_scale = no_scale_keys or set()
-
     # Per-value evidence block: {"metric_key": {"lines": [s, e], "scale": ...,
     # "currency": ...}}.  Preserved verbatim (never coerced/scaled) so the
     # pipeline can build value_metadata_by_id and the verifier can spot-check.
@@ -172,7 +169,68 @@ def _parse_llm_response(
         except json.JSONDecodeError:
             pass
 
-    table_raw_max = _IMPLAUSIBLE_ABS_USD // multiplier if multiplier > 1 else _TABLE_RAW_MAX
+    # Determine dominant scale across per-value __evidence__ entries so that if
+    # __scale__ is omitted or "as-is" (or a value lacks its own scale entry),
+    # we fall back to the scale followed by the statement / filing.
+    scale_counts: dict[str, int] = {}
+    for ev in evidence.values():
+        if isinstance(ev, dict):
+            s = str(ev.get("scale") or "").strip().lower()
+            if s in SCALE_MULTIPLIERS:
+                scale_counts[s] = scale_counts.get(s, 0) + 1
+    dominant_evidence_scale = (
+        max(scale_counts, key=lambda k: scale_counts[k])
+        if scale_counts
+        else ""
+    )
+    dominant_evidence_multiplier = SCALE_MULTIPLIERS.get(dominant_evidence_scale, 1)
+
+    raw_scale = parsed.pop("__scale__", None)
+    scale_str = str(raw_scale).strip().lower() if raw_scale is not None else ""
+    llm_multiplier = SCALE_MULTIPLIERS.get(scale_str, 1)
+    if llm_multiplier > 1:
+        multiplier = llm_multiplier
+    elif dominant_evidence_multiplier > 1:
+        multiplier = dominant_evidence_multiplier
+    elif prescan_dollar_multiplier > 1:
+        multiplier = prescan_dollar_multiplier
+    else:
+        multiplier = 1
+
+    no_scale = no_scale_keys or set()
+
+    def _nearby_statement_multiplier(ev_entry: Any) -> int:
+        """Infer fallback scale multiplier from nearby lines in __evidence__."""
+        if not isinstance(ev_entry, dict):
+            return 0
+        lines = ev_entry.get("lines")
+        if not (isinstance(lines, list) and len(lines) == 2):
+            return 0
+        try:
+            mid = (int(lines[0]) + int(lines[1])) / 2.0
+        except (TypeError, ValueError):
+            return 0
+        nearby_counts: dict[str, int] = {}
+        for other_ev in evidence.values():
+            if not isinstance(other_ev, dict):
+                continue
+            other_scale = str(other_ev.get("scale") or "").strip().lower()
+            if other_scale not in SCALE_MULTIPLIERS:
+                continue
+            other_lines = other_ev.get("lines")
+            if not (isinstance(other_lines, list) and len(other_lines) == 2):
+                continue
+            try:
+                other_mid = (int(other_lines[0]) + int(other_lines[1])) / 2.0
+            except (TypeError, ValueError):
+                continue
+            if abs(other_mid - mid) <= 120:
+                nearby_counts[other_scale] = nearby_counts.get(other_scale, 0) + 1
+        if not nearby_counts:
+            return 0
+        best_scale = max(nearby_counts, key=lambda k: nearby_counts[k])
+        return SCALE_MULTIPLIERS.get(best_scale, 0)
+
     # Deterministic sign guardrail — runs UNCONDITIONALLY (even with no
     # __scale__ multiplier): coerce SEC/IR-style strings ("(175,685)",
     # "-175,685", "$1,234", ...) to signed floats so signs are never lost,
@@ -187,7 +245,11 @@ def _parse_llm_response(
         if coerced is not None:
             parsed[k] = coerced
 
-    if multiplier > 1 or shares_multiplier > 1:
+    has_per_value_scale = any(
+        isinstance(ev, dict) and ev.get("scale")
+        for ev in evidence.values()
+    )
+    if multiplier > 1 or shares_multiplier > 1 or has_per_value_scale:
         for k, v in list(parsed.items()):
             # Metadata keys (__scale__, __currency__, __company_mismatch__,
             # __evidence__) must never be scaled or coerced.
@@ -196,25 +258,54 @@ def _parse_llm_response(
             # Label-derived as-is keys (per-share/percentage/ratio/share
             # counts) are never scaled — even when the key string itself does
             # not match the regex below (member-tagged EPS keys).
-            if k in no_scale:
+            if k in no_scale or k.strip("[]") in no_scale:
                 continue
             # Booleans must never be scaled (e.g. "__company_mismatch__": true
             # would otherwise become 1000 under a thousands multiplier).
             if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
                 continue
+
+            ev_entry = evidence.get(k) or evidence.get(k.strip("[]"))
+            ev_scale = (
+                str(ev_entry.get("scale") or "").strip().lower()
+                if isinstance(ev_entry, dict)
+                else ""
+            )
+            nearby_mult = _nearby_statement_multiplier(ev_entry)
+            fallback_mult = nearby_mult if nearby_mult > 1 else multiplier
+
+            if ev_scale in SCALE_MULTIPLIERS:
+                ev_mult = SCALE_MULTIPLIERS[ev_scale]
+                if (
+                    fallback_mult == 1
+                    or ev_mult == nearby_mult
+                    or (ev_mult > fallback_mult and abs(v) < 10_000)
+                ):
+                    key_multiplier = ev_mult
+                else:
+                    key_multiplier = fallback_mult
+            else:
+                # No valid scaling given for this value — always apply the
+                # statement / filing fallback scaling to monetary metrics.
+                key_multiplier = fallback_mult
+
+            key_raw_max = (
+                _IMPLAUSIBLE_ABS_USD // key_multiplier
+                if key_multiplier > 1
+                else _TABLE_RAW_MAX
+            )
             is_share_count = bool(_SHARE_COUNT_PATTERN.search(k))
+            is_gross_margin_dollars = "gross margin" in k.lower() and abs(v) > 100
             if is_share_count and shares_multiplier > 1:
                 if abs(v) < _SHARE_COUNT_RAW_MAX:
                     parsed[k] = v * shares_multiplier
             elif (
                 not is_share_count
-                and not _PCT_OR_PER_SHARE_PATTERNS.search(k)
-                and multiplier > 1
-                and abs(v) < table_raw_max
+                and (is_gross_margin_dollars or not _PCT_OR_PER_SHARE_PATTERNS.search(k))
+                and key_multiplier > 1
+                and abs(v) < key_raw_max
             ):
-                if "gross margin" in k.lower() and abs(v) <= 100:
-                    continue
-                parsed[k] = v * multiplier
+                parsed[k] = v * key_multiplier
 
     if evidence:
         parsed["__evidence__"] = evidence

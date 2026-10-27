@@ -210,6 +210,14 @@ class TestDeaccumulateValue(unittest.TestCase):
         self.assertIn("32,000", out)  # 60000 - 28000
         self.assertIn("__derived__", out)
 
+    def test_q2_flow_aligns_scaled_db_priors_to_table_scale(self):
+        # DB stores Q1 already scaled in full dollars (28,000,000,000), while the
+        # agent passes the printed table value in millions (60,000).
+        out = self._run(60000, "[us-gaap:NetCashProvidedByUsedInOperatingActivities]",
+                        quarter=2, ytd_months=6, priors={1: 28_000_000_000.0})
+        self.assertIn("32,000", out)
+        self.assertIn("__derived__", out)
+
     def test_q3_flow_deaccumulates(self):
         out = self._run(116996, "[us-gaap:NetCashProvidedByUsedInOperatingActivities]",
                         quarter=3, ytd_months=9, priors={1: 41000.0, 2: 34000.0})
