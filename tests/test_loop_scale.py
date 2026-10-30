@@ -25,6 +25,20 @@ class TestParseLlmResponse(unittest.TestCase):
         self.assertEqual(out["[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]"], 1_772_000_000)
         self.assertEqual(out["[us-gaap:EarningsPerShareDiluted]"], 1.5)
 
+    def test_weighted_avg_shares_scaled_even_when_in_no_scale_keys(self):
+        # Regression (ABBV): label-derived no-scale set contains share-count
+        # labels, which blocked scaling of weighted-average diluted shares.
+        k = "[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]"
+        out = _parse_llm_response(
+            '{"__scale__":"millions","%s":1772}' % k, no_scale_keys={k, k.strip("[]")}
+        )
+        self.assertEqual(out[k], 1_772_000_000)
+
+    def test_balance_sheet_share_caption_not_scaled(self):
+        k = "[us-gaap:CommonStockSharesAuthorized]"
+        out = _parse_llm_response('{"__scale__":"millions","%s":500000}' % k)
+        self.assertEqual(out[k], 500000)
+
     def test_prescan_shares_in_thousands_overrides_dollar_scale(self):
         out = _parse_llm_response(
             '{"__scale__":"millions","[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]":1772000}',

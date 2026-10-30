@@ -67,6 +67,15 @@ _SHARE_COUNT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Weighted-average share rows sit in the income statement and share its
+# declared table unit; other share counts (balance-sheet captions such as
+# "500,000 shares authorized") are printed in actual units and stay as-is.
+_WA_SHARES_PATTERN = re.compile(
+    r"\bweighted.{0,15}average.{0,15}shares\b"
+    r"|WeightedAverageNumberOf(?:Diluted|Basic)?Shares",
+    re.IGNORECASE,
+)
+
 _SHARE_COUNT_RAW_MAX = 100_000_000
 _TABLE_RAW_MAX = 10_000_000
 _IMPLAUSIBLE_ABS_USD = _TABLE_RAW_MAX * 1_000_000
@@ -258,7 +267,7 @@ def _parse_llm_response(
             # Label-derived as-is keys (per-share/percentage/ratio/share
             # counts) are never scaled — even when the key string itself does
             # not match the regex below (member-tagged EPS keys).
-            if k in no_scale or k.strip("[]") in no_scale:
+            if (k in no_scale or k.strip("[]") in no_scale) and not _WA_SHARES_PATTERN.search(k):
                 continue
             # Booleans must never be scaled (e.g. "__company_mismatch__": true
             # would otherwise become 1000 under a thousands multiplier).
@@ -304,7 +313,11 @@ def _parse_llm_response(
                     share_mult = shares_multiplier
                 else:
                     share_mult = key_multiplier
-                if share_mult > 1 and abs(v) < _SHARE_COUNT_RAW_MAX:
+                if (
+                    share_mult > 1
+                    and (shares_multiplier > 1 or _WA_SHARES_PATTERN.search(k))
+                    and abs(v) < _SHARE_COUNT_RAW_MAX
+                ):
                     parsed[k] = v * share_mult
             elif (
                 not is_share_count
