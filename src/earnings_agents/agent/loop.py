@@ -42,12 +42,12 @@ class AgentProviderError(RuntimeError):
 
 _PCT_OR_PER_SHARE_PATTERNS = re.compile(
     r"(%|percent"
-    r"|(?:\bmargin\b|(?<=[a-z])Margin(?=[A-Z0-9_|]|$))(?!\s*(?:deposit|loan|borrowing|receivable|payable|account|call|requirement|collateral|debt|interest|revenue|income|cost|expense))"
-    r"|\byield\b|(?<=[a-z])Yield(?=[A-Z0-9_|]|$)"
-    r"|\bgrowth\b|(?<=[a-z])Growth(?:Rate|Pct|Percent)?(?=[A-Z0-9_|]|$)"
-    r"|\bratios?\b|(?<=[a-z])Ratios?(?=[A-Z0-9_|]|$)"
+    r"|(?:\bmargin\b|(?-i:(?<=[a-z])Margin(?=[A-Z0-9_|]|$)))(?!\s*(?:deposit|loan|borrowing|receivable|payable|account|call|requirement|collateral|debt|interest|revenue|income|cost|expense))"
+    r"|\byield\b|(?-i:(?<=[a-z])Yield(?=[A-Z0-9_|]|$))"
+    r"|\bgrowth\b|(?-i:(?<=[a-z])Growth(?:Rate|Pct|Percent)?(?=[A-Z0-9_|]|$))"
+    r"|\bratios?\b|(?-i:(?<=[a-z])Ratios?(?=[A-Z0-9_|]|$))"
     r"|\beps\b|per share|\byoy\b|\bpct\b"
-    r"|(?<!exchange\s)(?<!exchange)(?<!variable\s)(?<!fixed\s)(?<!floating\s)(?:\brate\b|(?<=[a-z])Rate(?=[A-Z0-9_|]|$))(?!\s*(?:changes?\b|impact\b|effect\b|fluctuation|translation|revaluation|swap|contract|derivative|agreement|cap\b|collar|lock|floor|debt|note|loan|borrow|hedg|loss|gain|adjust|regulat|OnCash))"
+    r"|(?<!exchange\s)(?<!exchange)(?<!variable\s)(?<!fixed\s)(?<!floating\s)(?:\brate\b|(?-i:(?<=[a-z])Rate(?=[A-Z0-9_|]|$)))(?!\s*(?:changes?\b|impact\b|effect\b|fluctuation|translation|revaluation|swap|contract|derivative|agreement|cap\b|collar|lock|floor|debt|note|loan|borrow|hedg|loss|gain|adjust|regulat|OnCash))"
     r"|\bemployees?\b(?!\s*(?:benefit|compensat|severanc|stock|share|option|plan|related|liabilit|payable|receivable|loan|advance|cost|expense|payroll|tax|retire|pension|trust|withhold|contrib|award|grant|bonus|salari|wage|insur|health|medical|welfare|defer|accru|leas|terminat))"
     r"|\bheadcount\b|basis points|percentage points"
     r"|\bper\s+(?:ordinary\s+|basic\s+|diluted\s+|basic\s+and\s+diluted\s+|common\s+)?(?:share|ads)\b"
@@ -293,9 +293,19 @@ def _parse_llm_response(
             )
             is_share_count = bool(_SHARE_COUNT_PATTERN.search(k))
             is_gross_margin_dollars = "gross margin" in k.lower() and abs(v) > 100
-            if is_share_count and shares_multiplier > 1:
-                if abs(v) < _SHARE_COUNT_RAW_MAX:
-                    parsed[k] = v * shares_multiplier
+            if is_share_count:
+                # Share counts follow the table's declared unit: per-value
+                # evidence scale, else the prescan "shares in thousands"
+                # hint, else the statement/filing scale ("in millions,
+                # except per share data" covers the share rows too).
+                if ev_scale in SCALE_MULTIPLIERS:
+                    share_mult = SCALE_MULTIPLIERS[ev_scale]
+                elif shares_multiplier > 1:
+                    share_mult = shares_multiplier
+                else:
+                    share_mult = key_multiplier
+                if share_mult > 1 and abs(v) < _SHARE_COUNT_RAW_MAX:
+                    parsed[k] = v * share_mult
             elif (
                 not is_share_count
                 and (is_gross_margin_dollars or not _PCT_OR_PER_SHARE_PATTERNS.search(k))
@@ -367,6 +377,7 @@ def run_agent_loop(
     *,
     ticker: str = "?",
     dollar_multiplier: int = 1,
+    shares_multiplier: int = 1,
     max_steps: int | None = None,
     finalize_name: str = "finalize_extraction",
     finalize_description: str = FINALIZE_DESCRIPTION,
@@ -404,7 +415,7 @@ def run_agent_loop(
     """
     if parse_final_result is None:
         parse_final_result = lambda s: _parse_llm_response(  # noqa: E731
-            s, 1, dollar_multiplier, no_scale_keys
+            s, shares_multiplier, dollar_multiplier, no_scale_keys
         )
     if recovery_regex is None:
         recovery_regex = re.compile(r'\{[^{}]*"__scale__"[^{}]*\}', re.DOTALL)

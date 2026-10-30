@@ -311,7 +311,7 @@ def _run_extraction_pass(
     # ── 1. Document pre-scan (scale + statement routing) — deterministic ──
     # Currency is NOT decided here: the tool-calling agent inspects each
     # table/section with detect_currency() and reports __currency__ itself.
-    doc_scale, _, is_hints = prescan_document(
+    doc_scale, doc_shares_scale, is_hints = prescan_document(
         plain_text, document_map=state.get("document_map"),
     )
     n_lines = plain_text.count("\n") + 1
@@ -840,6 +840,7 @@ def _run_extraction_pass(
         tools=tools,
         ticker=ticker,
         dollar_multiplier=dollar_multiplier,
+        shares_multiplier=SCALE_MULTIPLIERS.get(doc_shares_scale or "", 1),
         # Per-share/percentage/share-count concepts must never be scaled even
         # when their member-tagged keys carry no "per share" text (the as-is
         # signal lives in the concept LABEL — see build_no_scale_keys).

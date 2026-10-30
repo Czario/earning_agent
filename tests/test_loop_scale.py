@@ -8,6 +8,30 @@ from earnings_agents.agent.loop import _parse_llm_response
 
 
 class TestParseLlmResponse(unittest.TestCase):
+    def test_operations_and_share_count_keys_scale_in_millions(self):
+        # Regression (ABBV Q3 2026): "...ContinuingOperations..." falsely matched
+        # the case-insensitive camelCase "Ratio" guard, and diluted share counts
+        # were never scaled at all.
+        out = _parse_llm_response(
+            '{"__scale__":"millions",'
+            '"[us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest]":4829,'
+            '"[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]":1772,'
+            '"[us-gaap:EarningsPerShareDiluted]":1.5}'
+        )
+        self.assertEqual(
+            out["[us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest]"],
+            4_829_000_000,
+        )
+        self.assertEqual(out["[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]"], 1_772_000_000)
+        self.assertEqual(out["[us-gaap:EarningsPerShareDiluted]"], 1.5)
+
+    def test_prescan_shares_in_thousands_overrides_dollar_scale(self):
+        out = _parse_llm_response(
+            '{"__scale__":"millions","[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]":1772000}',
+            shares_multiplier=1_000,
+        )
+        self.assertEqual(out["[us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]"], 1_772_000_000)
+
     def test_per_value_evidence_scale_is_authoritative(self):
         import json
         ev = {f"a{i}": {"lines": [100 + i, 100 + i], "scale": "thousands"} for i in range(5)}
