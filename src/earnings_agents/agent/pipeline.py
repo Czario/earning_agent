@@ -1389,12 +1389,37 @@ def _run_extraction_pass(
             value_metadata_by_id[cid]["scale"] = raw_ev_scale
         if ev.get("evidence"):
             value_metadata_by_id[cid]["source_snippet"] = str(ev["evidence"])[:500]
+    # Observability: monetary values saved with no scale source at all
+    # (no per-value evidence, no statement/filing fallback) were stored
+    # as-printed — flag them so a wrong number of zeros is never silent.
+    unscaled_labels = [
+        str(concept_by_id.get(cid, {}).get("label") or cid)
+        for cid, meta in value_metadata_by_id.items()
+        if not meta.get("scale")
+        and not meta.get("calculated")
+        and not (
+            (concept_by_id.get(cid, {}).get("taxonomy_key") or "").strip() in no_scale_keys
+            or f"[{(concept_by_id.get(cid, {}).get('taxonomy_key') or '').strip()}]" in no_scale_keys
+        )
+    ]
+    scale_findings: list[dict] = []
+    if unscaled_labels:
+        scale_findings.append({
+            "type": "scale_unconfirmed",
+            "severity": "medium",
+            "message": (
+                f"{len(unscaled_labels)} value(s) saved with no scale evidence "
+                "(stored as printed — verify units)"
+            ),
+            "evidence": {"labels": unscaled_labels[:20]},
+        })
     findings = _build_completeness_findings(
         currency_meta, state.get("document_map"), agent_missing
     )
     findings.extend(ambiguity_findings)
     findings.extend(cf_deaccum_findings)
     findings.extend(currency_findings)
+    findings.extend(scale_findings)
 
     # Semantic company-identity cross-check: first checks normalized corporate
     # tokens/acronyms ("ABC CO" == "ABC Company", "IBM" == "International

@@ -8,6 +8,16 @@ from earnings_agents.agent.loop import _parse_llm_response
 
 
 class TestParseLlmResponse(unittest.TestCase):
+    def test_per_value_evidence_scale_is_authoritative(self):
+        import json
+        ev = {f"a{i}": {"lines": [100 + i, 100 + i], "scale": "thousands"} for i in range(5)}
+        ev["seg"] = {"lines": [110, 110], "scale": "millions"}
+        d = {f"a{i}": 1000.0 for i in range(5)}
+        d.update({"seg": 12500.0, "__scale__": "thousands", "__evidence__": ev})
+        out = _parse_llm_response(json.dumps(d))
+        self.assertEqual(out["seg"], 12_500_000_000)
+        self.assertEqual(out["a0"], 1_000_000)
+
     def test_scales_values_and_preserves_currency(self):
         out = _parse_llm_response(
             '{"__scale__":"millions","__currency__":"USD","[us-gaap:Revenues]": 1234}'

@@ -275,15 +275,12 @@ def _parse_llm_response(
             fallback_mult = nearby_mult if nearby_mult > 1 else multiplier
 
             if ev_scale in SCALE_MULTIPLIERS:
-                ev_mult = SCALE_MULTIPLIERS[ev_scale]
-                if (
-                    fallback_mult == 1
-                    or ev_mult == nearby_mult
-                    or (ev_mult > fallback_mult and abs(v) < 10_000)
-                ):
-                    key_multiplier = ev_mult
-                else:
-                    key_multiplier = fallback_mult
+                # The agent's per-value scale evidence is authoritative — it
+                # was read from this value's own table/sentence.  Nearby or
+                # filing-level scales are only fallbacks for values with no
+                # valid scale (mixed-unit narratives, e.g. "$12,500 million"
+                # beside a thousands table, must not be re-scaled).
+                key_multiplier = SCALE_MULTIPLIERS[ev_scale]
             else:
                 # No valid scaling given for this value — always apply the
                 # statement / filing fallback scaling to monetary metrics.
