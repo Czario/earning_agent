@@ -163,61 +163,6 @@ class TestSaveGate(unittest.TestCase):
             out = mongodb_save_node(_state(findings=[]))
         self.assertEqual(out["status"], "saved")
 
-    def test_new_concept_is_materialized_only_after_gates_then_value_is_saved(self):
-        _config.STRICT_ACCURACY = True
-        cid = "5072e8e0c9d3f4a1b2c3d4e5"
-        candidate = {
-            "metric_key": "Revenue from new product",
-            "value": 25.0,
-            "label": "Revenue from new product",
-            "statement_type": "income",
-            "parent_concept": "us-gaap:Revenues",
-            "parent_concept_id": "5072e8e0c9d3f4a1b2c3d4e6",
-            "parent_path": "001",
-            "dimension_concept": False,
-            "source_lines": [10, 11],
-            "scale": "millions",
-            "currency": "USD",
-        }
-        persisted = {
-            "concept_id": cid,
-            "concept": {"concept": "custom:RevenueFromNewProduct_hash"},
-            "created": True,
-        }
-        with patch(
-            "earnings_agents.nodes.save.require_detected_period",
-            return_value=self._period(),
-        ), patch(
-            "earnings_agents.integrations.normalize.persist_new_concept_candidates",
-            return_value=({candidate["metric_key"]: persisted}, []),
-        ) as create_concepts, patch(
-            "earnings_agents.integrations.normalize.upsert_concept_values",
-            return_value=1,
-        ) as upsert:
-            out = mongodb_save_node(_state(
-                findings=[],
-                concept_metrics={},
-                value_metadata_by_id={},
-                new_concept_candidates=[candidate],
-            ))
-
-        create_concepts.assert_called_once()
-        saved_metrics = upsert.call_args.kwargs["concept_metrics"]
-        self.assertEqual(saved_metrics, {cid: 25.0})
-        saved_meta = upsert.call_args.kwargs["value_metadata_by_id"][cid]
-        self.assertEqual(saved_meta["scale"], "millions")
-        self.assertEqual(saved_meta["source_lines"], [10, 11])
-        self.assertEqual(out["status"], "saved")
-
-    def test_strict_gate_prevents_new_concept_creation(self):
-        _config.STRICT_ACCURACY = True
-        with patch(
-            "earnings_agents.integrations.normalize.persist_new_concept_candidates"
-        ) as create_concepts:
-            out = mongodb_save_node(_state(new_concept_candidates=[{"label": "New row"}]))
-        self.assertEqual(out["status"], "failed")
-        create_concepts.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

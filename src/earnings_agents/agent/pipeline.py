@@ -599,7 +599,6 @@ def _run_extraction_pass(
     # The section map built by the period pass (find_sections) rides in state;
     # find_sections in THIS loop returns it instantly and the initial message
     # points the agent straight at the income-statement range.
-    new_concept_proposals: list[dict] = []
     tools = build_pi_tools(
         plain_text, cik=state.get("cik"),
         company_name=state["company_name"],
@@ -611,7 +610,6 @@ def _run_extraction_pass(
         fiscal_year=getattr(period, "fiscal_year", None),
         quarter=getattr(period, "quarter", None),
         period=period,
-        new_concept_candidates=new_concept_proposals,
         allowed_statements=target_statements,
     )
     for t in memory_tools:
@@ -1008,32 +1006,6 @@ def _run_extraction_pass(
     mapped_keys.update(semantic_mapped_keys)
     _reverse_map.update(semantic_reverse)
 
-    # A new concept may be created only for an agent-proposed printed row that
-    # remains unmapped after both exact and high-confidence semantic matching.
-    # Candidate values remain outside concept_metrics until the save node has
-    # passed the normal accuracy/currency gates and materialized the concept.
-    from earnings_agents.agent.new_concepts import prepare_new_concept_candidates
-    prepared_new_concepts, new_concept_issues = prepare_new_concept_candidates(
-        new_concept_proposals,
-        metrics=metrics,
-        target_concepts=target_concepts,
-        mapped_keys=mapped_keys,
-        derived_keys=derived_keys,
-        evidence_by_key=agent_evidence,
-        document_line_count=len(plain_text.split("\n")),
-        target_statements=target_statements,
-    )
-    if prepared_new_concepts:
-        report_call(
-            f"  [pipeline]  {len(prepared_new_concepts)} new concept candidate(s) "
-            "remain unmapped; defer concept creation to the gated save"
-        )
-    if new_concept_issues:
-        report_call(
-            f"  [pipeline]  ⚠ {len(new_concept_issues)} new concept proposal(s) "
-            "rejected or unresolved"
-        )
-
     # ── Derived (computed) concepts ────────────────────────────────────
     # CALC (system:/calculated) concepts are never verbatim in the filing, so
     # their presence in the mapped results means the agent computed them via
@@ -1080,28 +1052,6 @@ def _run_extraction_pass(
     if effective_cf_basis not in ("ytd_6m", "ytd_9m") and doc_basis in ("ytd_6m", "ytd_9m"):
         effective_cf_basis = doc_basis
         basis_source = "document"
-
-    # The de-accumulation tool is intentionally keyed to persisted concepts so
-    # it can load exact prior-quarter values. Until that tool supports a new
-    # concept ID, never save newly discovered cash-flow rows from a YTD-only
-    # Q2/Q3 table as if they were quarter values.
-    if effective_cf_basis in ("ytd_6m", "ytd_9m") and period.quarter in (2, 3):
-        kept_new_concepts: list[dict] = []
-        for candidate in prepared_new_concepts:
-            if candidate.get("statement_type") == "cashflow":
-                new_concept_issues.append(
-                    f"{candidate.get('label')}: new cash-flow concept omitted because "
-                    f"the filing is {effective_cf_basis} and prior-quarter de-accumulation "
-                    "is not yet supported for unpersisted concepts"
-                )
-            else:
-                kept_new_concepts.append(candidate)
-        prepared_new_concepts = kept_new_concepts
-        if new_concept_issues:
-            report_call(
-                "  [pipeline]  ⚠ new cash-flow concepts from a YTD statement "
-                "will not be saved as quarterly values"
-            )
 
     cf_deaccum_findings: list[dict] = []
     if (
@@ -1266,35 +1216,6 @@ def _run_extraction_pass(
         "currency": chosen_currency,
         "per_statement": currency_resolution["chosen_by_statement"],
     }
-
-    # New-concept candidates follow the same statement currency as the values
-    # already extracted for that statement; an unattributable candidate is not
-    # created (it would otherwise persist a currency-less number).
-    kept_new_concepts: list[dict] = []
-    for candidate in prepared_new_concepts:
-        stmt = str(candidate.get("statement_type") or "income").strip().lower()
-        candidate_currency = (
-            str(candidate.get("currency") or "").strip().upper()
-            or doc_currency_candidate
-        )
-        statement_currency = currency_resolution["chosen_by_statement"].get(stmt)
-        if statement_currency:
-            if candidate_currency == statement_currency:
-                candidate["currency"] = statement_currency
-                kept_new_concepts.append(candidate)
-            else:
-                new_concept_issues.append(
-                    f"{candidate.get('label')}: currency {candidate_currency or 'unknown'} "
-                    f"does not match the {stmt} statement currency {statement_currency}"
-                )
-        elif is_currency_code(candidate_currency):
-            candidate["currency"] = candidate_currency
-            kept_new_concepts.append(candidate)
-        else:
-            new_concept_issues.append(
-                f"{candidate.get('label')}: currency unknown — new concept not created"
-            )
-    prepared_new_concepts = kept_new_concepts
 
     # ── 6. Return state ──────────────────────────────────────────────────
     raw_text = plain_text[:EXTRACTION_MAX_CHARS]
@@ -1482,8 +1403,6 @@ def _run_extraction_pass(
         "raw_text": raw_text,
         "metrics": metrics,
         "concept_metrics": concept_metrics,
-        "new_concept_candidates": prepared_new_concepts,
-        "new_concept_issues": new_concept_issues,
         "guidance_records": guidance_records,
         "derived_concept_ids": list(derived_ids),
         "mapped_metric_keys": list(mapped_keys),

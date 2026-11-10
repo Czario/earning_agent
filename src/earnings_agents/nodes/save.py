@@ -87,56 +87,6 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
     # agent result.  Extraction metadata is never allowed to provide a period.
     period_str: str = period.period_label or ""
 
-    # Materialize only agent-proposed, grounded new rows, and only after the
-    # save/currency gates above pass. Existing concepts were already checked by
-    # the extraction pipeline; this save-time upsert is the idempotent backstop.
-    new_candidate_issues = list(state.get("new_concept_issues") or [])
-    candidates = state.get("new_concept_candidates") or []
-    if candidates and cik:
-        from earnings_agents.integrations.normalize import persist_new_concept_candidates
-        try:
-            persisted_new, persist_issues = persist_new_concept_candidates(
-                cik=cik,
-                period=period,
-                candidates=candidates,
-            )
-            new_candidate_issues.extend(persist_issues)
-            for candidate in candidates:
-                metric_key = str(candidate.get("metric_key") or "")
-                persisted = persisted_new.get(metric_key)
-                if not persisted:
-                    continue
-                concept_id = persisted["concept_id"]
-                concept_metrics[concept_id] = float(candidate["value"])
-                value_metadata_by_id[concept_id] = {
-                    "statement_type": candidate.get("statement_type") or "income",
-                    "dimension": False,
-                    "dimension_concept": bool(candidate.get("dimension_concept")),
-                    "dimension_member": (
-                        persisted["concept"].get("dimension_member") or ""
-                    ),
-                    "dimension_member_label": (
-                        candidate.get("dimension_member_label") or ""
-                    ),
-                    "dimension_axis": candidate.get("dimension_axis") or "",
-                    "calculated": False,
-                    "currency": candidate.get("currency") or currency or "",
-                    "scale": candidate.get("scale") or "as-is",
-                    "source_lines": candidate.get("source_lines") or [],
-                    "status": "new_concept",
-                }
-                if candidate.get("source_snippet"):
-                    value_metadata_by_id[concept_id]["source_snippet"] = candidate["source_snippet"]
-        except Exception as exc:  # noqa: BLE001 — new concepts must not lose mapped values
-            logger.exception("Could not persist new concept candidates for %s", ticker)
-            new_candidate_issues.append(f"new concept persistence failed: {exc}")
-
-        if new_candidate_issues:
-            report_call(
-                f"  [save]  ⚠ {len(new_candidate_issues)} new concept candidate(s) "
-                "not created; other mapped values continue"
-            )
-
     # ── Currency backstop (never persist an unconfirmed currency) ────────
     # The extraction pipeline already drops values that do not match their
     # statement's resolved currency.  This is the write-time guarantee: no FX
@@ -229,5 +179,4 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
         "findings": findings,
         "concept_metrics": concept_metrics,
         "value_metadata_by_id": value_metadata_by_id,
-        "new_concept_issues": new_candidate_issues,
     }

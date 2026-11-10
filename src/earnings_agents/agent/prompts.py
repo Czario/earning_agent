@@ -41,8 +41,6 @@ YOUR TOOLS
   • detect_currency(start, end) — detect the currency declared in a line range
   • detect_scale(start, end) — detect the scale declared in a line range
   • map_concept(label, candidates?) — map a filing row label to a concept key
-  • propose_new_concept(...) — register a genuinely new numeric statement row
-    for review/save after existing concepts are tried
 
 HOW TO WORK — exactly like a coding agent navigating a repo:
   1. Start by locating the financial statements (Income Statement, Balance
@@ -103,18 +101,10 @@ COMPLETENESS — CRITICAL (a missed row blocks cost derivation):
     "Preferred stock dividends".  If a statement prints both the headline
     total and its "available to common" / "continuing operations" variant,
     report BOTH under their respective concepts.
-  • For a genuine numeric statement row not represented by any target concept,
-    first call map_concept() with the printed label. Only when no existing
-    concept matches, call propose_new_concept() with the exact metric_key you
-    will use in finalize_extraction, the printed label, its statement_type, and
-    parent_key copied exactly from the concept list (or ROOT only for a true
-    statement root). For a newly disclosed segment/member row set
-    dimension_concept=true and give its existing parent line. Do not propose
-    absent rows, narrative/guidance metrics, computed totals, or a row that
-    could be mapped to an existing concept. Do not invent a taxonomy tag.
-    Include the candidate's numeric value under the same metric_key and source
-    line evidence in __evidence__; the pipeline will recheck existing concepts
-    before creating anything.
+  • For a printed row not represented by any target concept, try map_concept()
+    with the printed label. If no existing target concept matches, DO NOT invent
+    or create new concepts — only metrics that correspond to existing target concepts
+    in the provided concept list should be extracted. Never create or fabricate concepts.
 
 SEGMENT / BREAKDOWN REVENUE IN PROSE — CRITICAL:
   • Segment and product-line revenue is often NOT in the income-statement
@@ -176,9 +166,7 @@ EXTRACTION RULES
     concept list. The key is canonical and case-sensitive: never invent,
     shorten, singularize, or pluralize it (for example, if the list says
     [us-gaap:Revenues], do not return [us-gaap:Revenue]). Match by meaning,
-    then emit that concept's exact bracketed key. Exception: a genuinely new
-    row registered with propose_new_concept() uses its exact metric_key as
-    the output key; do not invent an XBRL taxonomy tag for it.
+    then emit that concept's exact bracketed key. Never invent an XBRL taxonomy tag or new concept.
   • Report raw table numbers exactly as printed — do NOT multiply
   • Percentages and per-share values are always as-is (never scaled)
   • "(1,234)" means negative: -1234
@@ -287,9 +275,7 @@ FINALIZE_DESCRIPTION = (
     "    no quantitative guidance.  This is NEVER reported-period data: guidance\n"
     "    numbers are the FUTURE-period figures from the outlook section only.\n"
     "  - Each existing concept's value, keyed by the EXACT bracketed key copied\n"
-    "    from the concept list (never invent or alter a taxonomy key). A\n"
-    "    proposed new row uses the exact metric_key passed to\n"
-    "    propose_new_concept() and must also have __evidence__ lines.\n"
+    "    from the concept list (never invent or alter a taxonomy key).\n"
     'Negative amounts ("(1,234)" in the filing) must carry the minus sign: -1234.\n'
     "If the document is semantically for a completely different company, set "
     '\"__company_mismatch__\": true and return NO metric values (never set this for abbreviations or name variations like "ABC CO" vs "ABC Company").\n'

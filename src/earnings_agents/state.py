@@ -40,11 +40,6 @@ class EarningsAgentState(TypedDict):
     recent_concept_ids: NotRequired[Optional[list[str]]]
     calculated_concepts: NotRequired[Optional[list]]  # system:/calculated concept dicts for derivation
     concept_metrics: NotRequired[Optional[dict]]    # concept_id → float for normalize_data upsert
-    # Agent-proposed new printed rows that remain unmapped after existing and
-    # semantic concept mapping; concept documents are created only after the
-    # save gate passes.
-    new_concept_candidates: NotRequired[Optional[list[dict]]]
-    new_concept_issues: NotRequired[Optional[list[str]]]
     derived_concept_ids: NotRequired[Optional[list[str]]]  # concept_ids filled by Tier-3 derivation
     fiscal_year_end_month: NotRequired[Optional[int]]
     fiscal_year_end_code: NotRequired[Optional[str]]  # raw MMDD string, e.g. "0130" or "1231"
