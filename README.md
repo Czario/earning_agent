@@ -1,130 +1,103 @@
-One filing: 8-K or 6-K
+# Earnings Extraction Pipeline
 
- ### Existing US issuer flow — 8-K is the default
+Agent-based pipeline that extracts quarterly and annual financial metrics (income statement, balance sheet, cash flow, forward guidance) from SEC 8-K and 6-K filings into MongoDB `normalize_data`.
 
- ```bash
-   uv run earnings --ticker MSFT
-   uv run earnings --ticker MSFT -s income
-   uv run earnings --ticker MSFT --dry-run
- ```
+---
 
- ### Foreign issuer: 6-K auto-discovery
+## Quick Command Reference
 
- ```bash
-   uv run earnings --ticker ASML --form 6-K --dry-run
-   uv run earnings --ticker ASML --form 6-K
- ```
+### 1. Setup & Testing
 
- ASML’s descriptive exhibit filenames let the conservative discovery filter identify earnings releases. TSM
- auto-discovery may find no candidate because its earnings exhibit names are opaque; use a pinned accession
- instead.
+```bash
+uv sync                                    # Install dependencies
+uv sync --extra dev                        # Install dev dependencies (pytest)
+uv run pytest tests/ -q                    # Run test suite
+```
 
- ### Pin the exact filing — recommended for TSM
+---
 
- These were the filings used in our read-only Phase 4 validation; choose the accession you actually want to
- process:
+### 2. Live Filing Extraction (`earnings`)
 
- ```bash
-   uv run earnings --ticker ASML --form 6-K \
-     --accession 0001628280-26-048235 --dry-run
+Extracts the latest earnings release (or a pinned accession/URL). By default, updates and overwrites existing records for that period.
 
-   uv run earnings --ticker ASML --form 6-K \
-     --accession 0001628280-26-048235
+```bash
+# US Issuers (Form 8-K is default)
+uv run earnings --ticker MSFT                               # Full extraction (income, balancesheet, cashflow)
+uv run earnings --ticker MSFT -s income                     # Specific statement only
+uv run earnings --ticker MSFT --dry-run                     # Test connectivity & fetch without LLM calls
+uv run earnings --ticker MSFT -v                            # Debug verbose logging
 
-   uv run earnings --ticker TSM --form 6-K \
-     --accession 0001046179-26-000451 --dry-run
+# Foreign Issuers (Form 6-K required)
+uv run earnings --ticker ASML --form 6-K                    # Discover & extract latest 6-K earnings
+uv run earnings --ticker ASML --form 6-K --quarterly-only   # Skip annual filing + skip Q4 derivation
 
-   uv run earnings --ticker TSM --form 6-K \
-     --accession 0001046179-26-000451
- ```
+# Pin Specific Filing Accession or Document URL
+uv run earnings --ticker ASML --accession 0001628280-26-048235
+uv run earnings --ticker TSM --form 6-K --accession 0001046179-26-000451
+uv run earnings --ticker MSFT --filing-url https://example.com/release.htm
+```
 
- A pinned accession resolves that filing’s exhibits directly; it does not scan for the latest filing. For a
- one-off URL:
+---
 
- ```bash
-   uv run earnings --ticker ASML --form 6-K \
-     --filing-url 'https://example.com/earnings-release.html' --dry-run
- ```
+### 3. Historical Backfills & Specific Quarters (`earnings-backfill`)
 
- ### Other useful options
+Discovers filings from EDGAR metadata. **Resumes by default** (skips already-saved accessions to conserve LLM tokens). Use `--reload` to force re-extraction.
 
- ```bash
-   # Process selected financial statements only
-   uv run earnings --ticker ASML --form 6-K -s income
+```bash
+# Specific Quarter & Year Selection
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --fiscal-quarter 1   # Q1 only
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --fiscal-quarter 2   # Q2 only
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --fiscal-quarter 3   # Q3 only
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --fiscal-quarter 4   # Q4 / Annual
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024                       # All periods in FY2024
 
-   # Use a CIK instead of a ticker
-   uv run earnings --cik 0000937966 --form 6-K --dry-run
+# Year Range
+uv run earnings-backfill --ticker ASML --form 6-K --from-year 2023 --to-year 2025
 
-   # DEBUG logging
-   uv run earnings --ticker ASML --form 6-K -v
- ```
+# Dry-run Manifests (preview matching filings without running extraction)
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --dry-run
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --dry-run --json
 
- If quarterly concepts don’t yet exist for the company, the first quarterly run bootstraps them from annual
- concepts. No annual values are copied; the values still come from the quarterly filing.
+# Resuming vs. Force Reload
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024                     # Resumes (skips saved accessions)
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --reload            # Force re-run & overwrite saved data
+uv run earnings-backfill --ticker MSFT --fiscal-year 2024 --no-resume         # Process all candidates ignoring saved state
 
- Historical backfill
+# Pinned Accession Backfill
+uv run earnings-backfill --ticker TSM --form 6-K --accession 0001046179-26-000451
+```
 
- ### Preview the candidate manifest first
+---
 
- ```bash
-   # ASML: historical 6-K candidates, no LLM calls or database writes
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --from-year 2025 --to-year 2026 --dry-run
+### 4. Background Redis Worker (`earnings-8k-worker`)
 
-   # Same preview as JSON
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --from-year 2025 --to-year 2026 --dry-run --json
+Runs the continuous queue-driven pipeline worker.
 
-   # TSM: review lower-confidence 6-K candidates too
-   uv run earnings-backfill --ticker TSM --form 6-K \
-     --from-year 2025 --to-year 2026 --include-unverified --dry-run --json
- ```
+```bash
+# Run worker locally
+uv run earnings-8k-worker
 
- The default manifest is conservative. For TSM, review the manifest and then run selected filings by pinned
- accession; don’t automatically process every unverified 6-K.
+# Run worker with attempt limit
+uv run earnings-8k-worker --max-attempts 3
 
- ### Run a historical range
+# Run worker via Docker Compose
+docker compose up -d --build              # Build and start background worker
+docker compose restart worker-8k          # Restart after code changes (src is volume-mounted)
+docker compose logs -f worker-8k          # Stream worker logs
+```
 
- After reviewing the dry run:
+---
 
- ```bash
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --from-year 2025 --to-year 2026
+### 5. Failure Inspection & Utilities
 
-   # 8-K historical range
-   uv run earnings-backfill --ticker MSFT --from-year 2024 --to-year 2025
+```bash
+# Browse failed or degraded runs in MongoDB
+uv run earnings-failures
 
-   # Multiple forms (repeat --form)
-   uv run earnings-backfill --ticker MSFT \
-     --form 8-K --form 6-K --from-year 2025 --to-year 2026
- ```
+# Backfill binary period_type on older guidance records
+uv run python scripts/backfill_guidance_period_type.py
 
- Backfills run oldest first within the selected candidates. This lets Q1–Q3 actuals be present before an
- annual filing triggers Q4 calculation.
-
- ### Target a period or control reruns
-
- ```bash
-   # Approximate selection from SEC reportDate; the period agent still decides period identity
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --fiscal-year 2026 --fiscal-quarter 2 --dry-run
-
-   # Only the newest matching candidate
-   uv run earnings-backfill --ticker ASML --form 6-K --latest --dry-run
-
-   # Limit candidates
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --from-year 2025 --limit 5 --dry-run
-
-   # Pin one or more accessions; use --form 6-K for these examples
-   uv run earnings-backfill --ticker TSM --form 6-K \
-     --accession 0001046179-26-000451 --dry-run
-
-   # Re-run accessions already marked completed in the backfill ledger
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --from-year 2025 --reload
-
-   # Ignore the resume ledger
-   uv run earnings-backfill --ticker ASML --form 6-K \
-     --from-year 2025 --no-resume
- ```
+# Read-only staging pilot preflight test for 6-K filings
+STAGING_MONGODB_URI=... STAGING_NORMALIZE_DB_NAME=normalize_data_staging \
+  scripts/phase6_6k_staging_pilot.sh
+```
