@@ -377,14 +377,17 @@ src/earnings_agents/
   `get_latest_earnings_url(cik)` is the legacy 8-K-only wrapper (Item 2.02 first, then any
   8-K) and returns `(url, supplemental, accession, exhibits)`. `get_latest_filing_url(cik, forms)`
   is the generalized discovery used for 6-K and returns the same tuple plus the resolved form.
-  **6-K candidate selection is metadata-only and layered** (never reads document content):
+  **6-K candidate selection is layered**:
   1. an EX-99 description/filename that looks like an earnings release
      (`earnings_exhibit_metadata`);
-  2. else, a **report-sized payload** (`large_6k_report_body`) — `submissions.size` from the
+  2. else, if an EX-99 exhibit is present with generic/opaque metadata (e.g. Sea Limited's
+     `EXHIBIT 99.1` / `d######dex991.htm`), an inspection of the exhibit opening text for
+     earnings release headers (`earnings_exhibit_content`);
+  3. else, a **report-sized payload** (`large_6k_report_body`) — `submissions.size` from the
      JSON we already fetch. Report-body filers (Ericsson: `d######d6k.htm`; TSM:
      `a2q26e_withguidancexfinal.htm`) carry the statements in the 6-K BODY with opaque names,
      so size is the only signal (§ below);
-  3. else, only with `--include-unverified`: 6-Ks with EX-99 exhibits, or a primary document,
+  4. else, only with `--include-unverified`: 6-Ks with EX-99 exhibits, or a primary document,
      that carry no earnings signal at all (low confidence, for review).
   The latest-filing scan caps index checks (5 in `get_latest_filing_url`); the historical
   manifest caps its exhibit verification at 60. If nothing qualifies, use a pinned

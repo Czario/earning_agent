@@ -205,6 +205,36 @@ class TestBuildEarningsManifest(unittest.TestCase):
         self.assertEqual([m["accession"] for m in manifest], ["E1"])
         self.assertEqual(manifest[0]["reason"], "earnings_exhibit_metadata")
 
+    def test_6k_with_opaque_metadata_resolves_via_exhibit_content(self):
+        filings = [
+            {"form": "6-K", "accession": "SE-Q2", "filing_date": "2026-08-11",
+             "report_date": "2026-08-11", "items": "", "primary_document": "d6k.htm"},
+            {"form": "6-K", "accession": "SE-AGM", "filing_date": "2026-08-25",
+             "report_date": "2026-08-25", "items": "", "primary_document": "d6k.htm"},
+        ]
+        exhibits = {
+            "SE-Q2": [{"exhibit": "EX-99.1", "description": "EXHIBIT 99.1",
+                       "url": "https://www.sec.gov/Archives/edgar/data/1/SE-Q2/d1.htm"}],
+            "SE-AGM": [{"exhibit": "EX-99.1", "description": "EXHIBIT 99.1",
+                        "url": "https://www.sec.gov/Archives/edgar/data/1/SE-AGM/d2.htm"}],
+        }
+        content_map = {
+            "https://www.sec.gov/Archives/edgar/data/1/SE-Q2/d1.htm": (
+                b"<html><body><h1>Sea Limited Reports Second Quarter 2026 Results</h1></body></html>"
+            ),
+            "https://www.sec.gov/Archives/edgar/data/1/SE-AGM/d2.htm": (
+                b"<html><body><h1>Sea Limited to Hold Annual General Meeting</h1></body></html>"
+            ),
+        }
+        def _mock_get(url, **kw):
+            return MagicMock(status_code=200, content=content_map.get(url, b""))
+
+        with patch("earnings_agents.integrations.edgar._edgar_get", side_effect=_mock_get):
+            manifest = self._manifest(filings, exhibits=exhibits, forms=("6-K",))
+        self.assertEqual([m["accession"] for m in manifest], ["SE-Q2"])
+        self.assertEqual(manifest[0]["confidence"], "high")
+        self.assertEqual(manifest[0]["reason"], "earnings_exhibit_content")
+
     def test_report_sized_6k_body_is_found_without_flags(self):
         """Ericsson/TSM put the report in the 6-K body with an opaque filename.
 

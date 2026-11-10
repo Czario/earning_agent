@@ -121,6 +121,53 @@ def _looks_like_earnings_6k(haystack: str) -> bool:
     )
 
 
+# Earnings phrases commonly found in the title / opening text of an exhibit:
+_6K_CONTENT_EARNINGS_RX = re.compile(
+    r"\breports\s+(?:[a-z0-9\-,\.\$€£¥]+\s+)*(?:quarter|quarterly|annual|interim|half[-\s]?year|full[-\s]?year|financial|[1-4]q|q[1-4]|first|second|third|fourth|fiscal)\b.*?\bresults\b"
+    r"|\breports\s+(?:[a-z0-9\-,\.\$€£¥]+\s+)*(?:quarter|quarterly|annual|interim|half[-\s]?year|full[-\s]?year|financial|[1-4]q|q[1-4]|first|second|third|fourth|fiscal)\b.*?\b(?:eps|earnings|revenue|net income|net sales)\b"
+    r"|\breports\s+.*?\b(?:net sales|net income|revenue|eps|operating income|operating profit)\b.*?\b(?:in|for)\s+(?:q[1-4]|[1-4]q|the\s+[a-z]+\s+quarter|fiscal)"
+    r"|\b(?:first|second|third|fourth|1st|2nd|3rd|4th|q[1-4]|[1-4]q|quarterly|interim|half[-\s]?year|full[-\s]?year|annual|fiscal\s+year)\s+(?:[a-z0-9\-]+\s+)*(?:financial\s+)?results\b"
+    r"|\bresults\s+for\s+(?:the\s+)?(?:first|second|third|fourth|1st|2nd|3rd|4th|q[1-4]|[1-4]q|quarter|six|nine|twelve|half|full|fiscal)"
+    r"|\bfinancial\s+results\s+for\b"
+    r"|\bearnings\s+(?:release|report)\b"
+    r"|\bunaudited\s+(?:condensed\s+)?(?:consolidated\s+)?(?:financial\s+statements|financial\s+results|interim\s+results)"
+    r"|\bcondensed\s+consolidated\s+(?:statements?\s+of\s+(?:operations|income)|financial\s+statements)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Obvious non-earnings tokens in exhibit metadata (AGM, buyback, etc.)
+_6K_NON_EARNINGS_METADATA_RX = re.compile(
+    r"\b(?:agm|annual\s+general\s+meeting|extraordinary\s+general\s+meeting|share\s*buyback|share\s*repurchase|voting\s+results?|proxy\s+statement)\b",
+    re.IGNORECASE,
+)
+
+
+def _exhibit_content_looks_like_earnings(url: str, haystack: str = "") -> bool:
+    """True when the opening text of an exhibit document looks like an earnings release.
+
+    Used as fallback when 6-K filing-index exhibit metadata is generic or opaque
+    (e.g. 'EXHIBIT 99.1' / 'd120948dex991.htm' for Sea Limited).
+    """
+    if not url:
+        return False
+    if haystack and _6K_NON_EARNINGS_METADATA_RX.search(haystack):
+        return False
+    # Avoid external network attempts on test stubs (e.g. https://x/...)
+    if not (url.startswith("https://www.sec.gov/") or url.startswith("http://www.sec.gov/") or "sec.gov" in url or "localhost" in url or "127.0.0.1" in url):
+        return False
+    try:
+        resp = _edgar_get(url, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            return False
+        chunk = resp.content[:32768]
+        soup = BeautifulSoup(chunk, "lxml")
+        text = soup.get_text()[:4000]
+        return bool(_6K_CONTENT_EARNINGS_RX.search(text))
+    except Exception as exc:
+        logger.debug("Exhibit content inspection failed for %s: %s", url, exc)
+        return False
+
+
 # Types EDGAR uses for a filing's PRIMARY document (``Type`` column).  The
 # pipeline previously recognized only "8-K", which left every 6-K without an
 # EX-99 exhibit (e.g. TSM's monthly-revenue 6-Ks) looking like an empty index.
@@ -584,6 +631,8 @@ def build_earnings_manifest(
                 )
                 if exhibits and _looks_like_earnings_6k(haystack):
                     confidence, reason = "high", "earnings_exhibit_metadata"
+                elif exhibits and _exhibit_content_looks_like_earnings(exhibits[0]["url"], haystack):
+                    confidence, reason = "high", "earnings_exhibit_content"
                 elif _looks_like_report_body_6k(filing.get("size")):
                     # Report-body-only filer (Ericsson): no EX-99 exhibit and an
                     # opaque primary filename, but the payload is a full periodic
@@ -773,16 +822,21 @@ def get_latest_filing_url(
                     f"{e.get('description') or ''} {e.get('url') or ''}"
                     for e in exhibits
                 )
-                if not _looks_like_earnings_6k(haystack):
+                if _looks_like_earnings_6k(haystack):
+                    reason = "earnings-like exhibit metadata"
+                elif _exhibit_content_looks_like_earnings(exhibits[0]["url"], haystack):
+                    reason = "earnings-like exhibit content"
+                else:
                     logger.info(
-                        "6-K %s for CIK %s has EX-99 exhibits but no earnings-like "
-                        "description/filename — skipping candidate",
+                        "6-K %s for CIK %s has EX-99 exhibits but neither metadata "
+                        "nor exhibit content looks like earnings — skipping candidate",
                         acc, cik_padded,
                     )
                     continue
             elif _looks_like_report_body_6k(
                 sizes[i] if i < len(sizes) else None
             ):
+                reason = "report-sized body"
                 logger.info(
                     "6-K %s for CIK %s has no EX-99 exhibit but a report-sized "
                     "payload — using its primary document",
@@ -791,8 +845,8 @@ def get_latest_filing_url(
             else:
                 continue
             logger.info(
-                "Selected 6-K %s for CIK %s (earnings-like exhibit metadata)",
-                acc, cik_padded,
+                "Selected 6-K %s for CIK %s (%s)",
+                acc, cik_padded, reason,
             )
             return _resolve(acc, primary_doc, "6-K")
         logger.warning(

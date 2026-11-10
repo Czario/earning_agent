@@ -165,6 +165,39 @@ class TestEarningsLikeMetadata(unittest.TestCase):
         self.assertFalse(_looks_like_earnings_6k("EX-99.1 Notice of annual general meeting"))
 
 
+class TestExhibitContentEarningsSignal(unittest.TestCase):
+    def test_earnings_headings_match(self):
+        from earnings_agents.integrations.edgar import _exhibit_content_looks_like_earnings
+
+        html_earnings = "<html><body><h1>Sea Limited Reports Second Quarter 2026 Results</h1></body></html>"
+        with patch("earnings_agents.integrations.edgar._edgar_get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, content=html_earnings.encode("utf-8"))
+            self.assertTrue(
+                _exhibit_content_looks_like_earnings("https://www.sec.gov/Archives/edgar/data/1703399/000119312526344596/d120948dex991.htm")
+            )
+
+    def test_non_earnings_headings_do_not_match(self):
+        from earnings_agents.integrations.edgar import _exhibit_content_looks_like_earnings
+
+        html_agm = "<html><body><h1>Sea Limited to Hold Annual General Meeting on September 16, 2026</h1></body></html>"
+        with patch("earnings_agents.integrations.edgar._edgar_get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, content=html_agm.encode("utf-8"))
+            self.assertFalse(
+                _exhibit_content_looks_like_earnings("https://www.sec.gov/Archives/edgar/data/1703399/000119312526364238/d416016dex991.htm")
+            )
+
+    def test_non_earnings_metadata_skips_fetch(self):
+        from earnings_agents.integrations.edgar import _exhibit_content_looks_like_earnings
+
+        with patch("earnings_agents.integrations.edgar._edgar_get") as mock_get:
+            res = _exhibit_content_looks_like_earnings(
+                "https://www.sec.gov/Archives/edgar/data/1703399/000119312526364238/d416016dex991.htm",
+                haystack="Notice of Annual General Meeting",
+            )
+            self.assertFalse(res)
+            mock_get.assert_not_called()
+
+
 _INDEX_6K_PRIMARY_ONLY = """
 <html><body><table class="tableFile">
 <tr><td>1</td><td>6-K</td><td><a href="/Archives/edgar/data/1046179/000104617926000459/tsm-monthend6kx20260724.htm">tsm-monthend6kx20260724.htm</a></td><td>6-K</td><td>42</td></tr>
